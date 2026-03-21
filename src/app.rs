@@ -707,13 +707,12 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     let st_s = state.clone();
     let cv_s = canvas_cell.clone();
-    scroll.connect_scroll(move |ec, _dx, dy| {
-        if !ec.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
-            return glib::Propagation::Proceed;
-        }
-        let Some((x, y)) = ec.current_event().and_then(|e| e.position()) else {
-            return glib::Propagation::Proceed;
-        };
+    let last_s = last.clone();
+    let cnv_s = canvas.clone();
+    scroll.connect_scroll(move |_ec, _dx, dy| {
+        let (x, y) = last_s
+            .borrow()
+            .unwrap_or((cnv_s.width() as f64 / 2.0, cnv_s.height() as f64 / 2.0));
         let mut st = st_s.borrow_mut();
         let factor = if dy > 0.0 { 1.0 / 1.1 } else { 1.1 };
         let old_z = st.zoom;
