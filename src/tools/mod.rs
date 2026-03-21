@@ -15,6 +15,40 @@ pub enum ToolKind {
     Hand,
 }
 
+impl ToolKind {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Brush => "Brush",
+            Self::Pixel => "Pixel",
+            Self::Eraser => "Eraser",
+            Self::Eyedropper => "Eyedropper",
+            Self::Fill => "Fill",
+            Self::Line => "Line",
+            Self::Rect => "Rectangle",
+            Self::Ellipse => "Ellipse",
+            Self::SelectRect => "Select",
+            Self::Move => "Move",
+            Self::Hand => "Hand",
+        }
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Brush => 0,
+            Self::Pixel => 1,
+            Self::Eraser => 2,
+            Self::Eyedropper => 3,
+            Self::Fill => 4,
+            Self::Line => 5,
+            Self::Rect => 6,
+            Self::Ellipse => 7,
+            Self::SelectRect => 8,
+            Self::Move => 9,
+            Self::Hand => 10,
+        }
+    }
+}
+
 fn straight_to_premul_rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     let a32 = a as u32;
     [

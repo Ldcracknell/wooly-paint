@@ -31,9 +31,26 @@ pub struct AppState {
     /// When dragging a floating selection: `(pointer_doc_x - float_x, pointer_doc_y - float_y)`.
     pub move_grab_doc: Option<(f64, f64)>,
     pub modified: bool,
+    pub tool_keybinds: Vec<(ToolKind, Option<char>)>,
 }
 
 impl AppState {
+    pub fn default_tool_keybinds() -> Vec<(ToolKind, Option<char>)> {
+        vec![
+            (ToolKind::Brush, Some('b')),
+            (ToolKind::Pixel, Some('p')),
+            (ToolKind::Eraser, Some('e')),
+            (ToolKind::Eyedropper, Some('k')),
+            (ToolKind::Fill, Some('f')),
+            (ToolKind::Line, Some('l')),
+            (ToolKind::Rect, None),
+            (ToolKind::Ellipse, None),
+            (ToolKind::SelectRect, Some('s')),
+            (ToolKind::Move, Some('m')),
+            (ToolKind::Hand, Some('h')),
+        ]
+    }
+
     pub fn new() -> Self {
         Self {
             doc: Document::new(800, 600),
@@ -55,6 +72,7 @@ impl AppState {
             drag_start_doc: None,
             move_grab_doc: None,
             modified: false,
+            tool_keybinds: Self::default_tool_keybinds(),
         }
     }
 

@@ -692,6 +692,9 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     let st_s = state.clone();
     let cv_s = canvas_cell.clone();
     scroll.connect_scroll(move |ec, _dx, dy| {
+        if !ec.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
         let Some((x, y)) = ec.current_event().and_then(|e| e.position()) else {
             return glib::Propagation::Proceed;
         };
@@ -705,7 +708,7 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
         st.pan_y = y - doc_y * st.zoom;
         drop(st);
         queue_canvas(&cv_s);
-        glib::Propagation::Proceed
+        glib::Propagation::Stop
     });
     canvas.add_controller(scroll);
 }
@@ -1091,6 +1094,182 @@ fn new_document_dialog(
     cancel.connect_clicked(move |_| {
         dw_cancel.close();
     });
+
+    d.present();
+}
+
+fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState) {
+    let d = libadwaita::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Keybinds")
+        .default_width(340)
+        .default_height(500)
+        .build();
+
+    let editing_idx: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
+    let buttons: Rc<RefCell<Vec<gtk::Button>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+
+    fn key_label(k: Option<char>) -> String {
+        k.map(|c| c.to_ascii_uppercase().to_string()).unwrap_or_else(|| "None".into())
+    }
+
+    let binds = state.borrow().tool_keybinds.clone();
+    for (i, (tool, key)) in binds.iter().enumerate() {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        let label = gtk::Label::builder()
+            .label(tool.display_name())
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let btn = gtk::Button::with_label(&key_label(*key));
+        btn.set_width_request(80);
+
+        let ei = editing_idx.clone();
+        let btns = buttons.clone();
+        btn.connect_clicked(move |b| {
+            if let Some(prev) = *ei.borrow() {
+                let bs = btns.borrow();
+                if let Some(pb) = bs.get(prev) {
+                    pb.remove_css_class("suggested-action");
+                }
+            }
+            *ei.borrow_mut() = Some(i);
+            b.set_label("…");
+            b.add_css_class("suggested-action");
+        });
+
+        row.append(&label);
+        row.append(&btn);
+        list.append(&row);
+        buttons.borrow_mut().push(btn);
+    }
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .build();
+    scroll.set_child(Some(&list));
+
+    let reset_btn = gtk::Button::with_label("Reset defaults");
+    let close_btn = gtk::Button::with_label("Close");
+    let btn_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .margin_top(8)
+        .build();
+    btn_row.append(&reset_btn);
+    btn_row.append(&close_btn);
+
+    let bx = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .spacing(8)
+        .build();
+    bx.append(&scroll);
+    bx.append(&btn_row);
+    d.set_content(Some(&bx));
+
+    let key_ctrl = gtk::EventControllerKey::new();
+    let st_key = state.clone();
+    let ei_key = editing_idx.clone();
+    let btns_key = buttons.clone();
+    key_ctrl.connect_key_pressed(move |_, keyval, _, modifier| {
+        let Some(idx) = *ei_key.borrow() else {
+            return glib::Propagation::Proceed;
+        };
+
+        if keyval == gdk::Key::Escape {
+            let st = st_key.borrow();
+            let text = key_label(st.tool_keybinds[idx].1);
+            drop(st);
+            let bs = btns_key.borrow();
+            if let Some(btn) = bs.get(idx) {
+                btn.set_label(&text);
+                btn.remove_css_class("suggested-action");
+            }
+            *ei_key.borrow_mut() = None;
+            return glib::Propagation::Stop;
+        }
+
+        if keyval == gdk::Key::Delete || keyval == gdk::Key::BackSpace {
+            st_key.borrow_mut().tool_keybinds[idx].1 = None;
+            let bs = btns_key.borrow();
+            if let Some(btn) = bs.get(idx) {
+                btn.set_label("None");
+                btn.remove_css_class("suggested-action");
+            }
+            *ei_key.borrow_mut() = None;
+            return glib::Propagation::Stop;
+        }
+
+        if modifier.contains(gdk::ModifierType::CONTROL_MASK)
+            || modifier.contains(gdk::ModifierType::ALT_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+
+        let Some(ch) = keyval.to_unicode().map(|c| c.to_ascii_lowercase()) else {
+            return glib::Propagation::Proceed;
+        };
+        if !ch.is_ascii_alphanumeric() {
+            return glib::Propagation::Proceed;
+        }
+
+        let mut st = st_key.borrow_mut();
+        let bs = btns_key.borrow();
+        for (j, (_, bind)) in st.tool_keybinds.iter_mut().enumerate() {
+            if *bind == Some(ch) {
+                *bind = None;
+                if let Some(btn) = bs.get(j) {
+                    btn.set_label("None");
+                }
+            }
+        }
+        st.tool_keybinds[idx].1 = Some(ch);
+        if let Some(btn) = bs.get(idx) {
+            btn.set_label(&ch.to_ascii_uppercase().to_string());
+            btn.remove_css_class("suggested-action");
+        }
+        *ei_key.borrow_mut() = None;
+        glib::Propagation::Stop
+    });
+    d.add_controller(key_ctrl);
+
+    let st_reset = state.clone();
+    let btns_reset = buttons.clone();
+    let ei_reset = editing_idx.clone();
+    reset_btn.connect_clicked(move |_| {
+        let defaults = AppState::default_tool_keybinds();
+        let mut st = st_reset.borrow_mut();
+        st.tool_keybinds = defaults.clone();
+        let bs = btns_reset.borrow();
+        for (i, (_, k)) in defaults.iter().enumerate() {
+            if let Some(btn) = bs.get(i) {
+                btn.set_label(&key_label(*k));
+                btn.remove_css_class("suggested-action");
+            }
+        }
+        *ei_reset.borrow_mut() = None;
+    });
+
+    let dw = d.clone();
+    close_btn.connect_clicked(move |_| dw.close());
 
     d.present();
 }
@@ -1529,7 +1708,25 @@ fn build_ui(app: &Application) {
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
             }
-            _ => glib::Propagation::Proceed,
+            _ => {
+                if !ctrl && !shift {
+                    if let Some(ch) = keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
+                        let st_ref = st_k.borrow();
+                        let tool = st_ref.tool_keybinds.iter()
+                            .find(|(_, bind)| *bind == Some(ch))
+                            .map(|(t, _)| *t);
+                        drop(st_ref);
+                        if let Some(tool) = tool {
+                            if let Some(ref dd) = *td_k.borrow() {
+                                dd.set_selected(tool.dropdown_index());
+                            }
+                            queue_canvas(&cv_k);
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+                glib::Propagation::Proceed
+            }
         }
     });
     window.add_controller(key);
@@ -1577,6 +1774,10 @@ fn build_menu(
     let image = gio::Menu::new();
     image.append(Some("Brightness / Contrast…"), Some("win.bc"));
     menu.append_submenu(Some("_Image"), &image);
+
+    let settings = gio::Menu::new();
+    settings.append(Some("Keybinds…"), Some("win.keybinds"));
+    menu.append_submenu(Some("_Settings"), &settings);
 
     let st = state.clone();
     let lc = layers_cell.clone();
@@ -1672,6 +1873,14 @@ fn build_menu(
         try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p);
     });
     app_add_action(window, &paste_act);
+
+    let st = state.clone();
+    let w_kb = window.clone();
+    let kb_act = gio::SimpleAction::new("keybinds", None);
+    kb_act.connect_activate(move |_, _| {
+        keybinds_dialog(&w_kb, &st);
+    });
+    app_add_action(window, &kb_act);
 
     let st = state.clone();
     let cv = canvas.clone();
