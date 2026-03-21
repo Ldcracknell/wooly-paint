@@ -21,6 +21,7 @@ type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
 type ColorBtnCell = Rc<RefCell<Option<gtk::ColorDialogButton>>>;
+type ToolDdCell = Rc<RefCell<Option<gtk::DropDown>>>;
 
 pub fn run() -> gtk::glib::ExitCode {
     libadwaita::init().expect("libadwaita init");
@@ -696,24 +697,24 @@ fn copy_selection(state: &SharedState) {
     st.clipboard = Some((sw, sh, data));
 }
 
-fn paste_clipboard_center(state: &SharedState) {
+fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
     let clip = state.borrow().clipboard.clone();
     let Some((sw, sh, data)) = clip else {
         return;
     };
     let mut st = state.borrow_mut();
-    let idx = st.doc.active_layer;
+    commit_floating(&mut st);
     let w = st.doc.width as i32;
     let h = st.doc.height as i32;
-    let Some(layer) = st.doc.layers.get_mut(idx) else {
-        return;
-    };
-    let before = layer.pixels.clone();
-    let x = (w - sw) / 2;
-    let y = (h - sh) / 2;
-    paste_rect(layer, x, y, sw, sh, &data);
-    st.history.commit_change(idx, before);
-    st.modified = true;
+    let x = ((w - sw) / 2) as f64;
+    let y = ((h - sh) / 2) as f64;
+    st.floating = Some(FloatingSelection { w: sw, h: sh, data, x, y });
+    st.selection = None;
+    st.tool = ToolKind::Move;
+    drop(st);
+    if let Some(ref dd) = *tool_dd_cell.borrow() {
+        dd.set_selected(9);
+    }
 }
 
 fn apply_brightness_contrast(state: &SharedState, brightness: f32, contrast: f32) {
@@ -958,6 +959,7 @@ fn build_ui(app: &Application) {
     let canvas_cell: CanvasCell = Rc::new(RefCell::new(None));
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
     let color_btn_cell: ColorBtnCell = Rc::new(RefCell::new(None));
+    let tool_dd_cell: ToolDdCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
     drawing_area.set_hexpand(true);
@@ -1045,6 +1047,7 @@ fn build_ui(app: &Application) {
         "Move",
     ]);
     let tool_dd = gtk::DropDown::new(Some(tool_strings), gtk::Expression::NONE);
+    *tool_dd_cell.borrow_mut() = Some(tool_dd.clone());
     tool_dd.set_hexpand(false);
     tool_dd.set_width_request(140);
 
@@ -1198,6 +1201,7 @@ fn build_ui(app: &Application) {
         &state,
         &layers_cell,
         &canvas_cell,
+        &tool_dd_cell,
     );
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
 
@@ -1215,6 +1219,7 @@ fn build_ui(app: &Application) {
     let lc_k = layers_cell.clone();
     let cv_k = canvas_cell.clone();
     let win_k = window.clone();
+    let td_k = tool_dd_cell.clone();
     key.connect_key_pressed(move |_c, keyval, _code, state_m| {
         let ctrl = state_m.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = state_m.contains(gdk::ModifierType::SHIFT_MASK);
@@ -1259,7 +1264,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::v | gdk::Key::V if ctrl => {
-                paste_clipboard_center(&st_k);
+                paste_clipboard_center(&st_k, &td_k);
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
             }
@@ -1276,6 +1281,7 @@ fn build_menu(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    tool_dd_cell: &ToolDdCell,
 ) -> gio::Menu {
     let menu = gio::Menu::new();
     let file = gio::Menu::new();
@@ -1384,9 +1390,10 @@ fn build_menu(
 
     let st = state.clone();
     let cv = canvas.clone();
+    let td_p = tool_dd_cell.clone();
     let paste_act = gio::SimpleAction::new("paste", None);
     paste_act.connect_activate(move |_, _| {
-        paste_clipboard_center(&st);
+        paste_clipboard_center(&st, &td_p);
         queue_canvas(&cv);
     });
     app_add_action(window, &paste_act);
