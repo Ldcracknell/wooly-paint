@@ -12,6 +12,7 @@ pub enum ToolKind {
     Ellipse,
     SelectRect,
     Move,
+    Hand,
 }
 
 fn straight_to_premul_rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {

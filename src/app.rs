@@ -449,6 +449,9 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse | ToolKind::SelectRect => {
                 st.drag_start_doc = Some((dx, dy));
             }
+            ToolKind::Hand => {
+                *bws.borrow_mut() = Some((st.pan_x, st.pan_y));
+            }
             ToolKind::Move => {
                 if let Some(ref f) = st.floating {
                     if dx < f.x || dy < f.y || dx >= f.x + f.w as f64 || dy >= f.y + f.h as f64 {
@@ -557,6 +560,12 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                 let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
                 st.selection = Some(AppState::normalize_rect(x0, y0, cx, cy));
             }
+            ToolKind::Hand => {
+                if let Some((px0, py0)) = *bws_up.borrow() {
+                    st.pan_x = px0 + ox;
+                    st.pan_y = py0 + oy;
+                }
+            }
             ToolKind::Move => {
                 let grab = st.move_grab_doc;
                 let wpress = *mws_u.borrow();
@@ -635,6 +644,9 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                     st.selection = Some(AppState::normalize_rect(sx, sy, cx, cy));
                 }
                 st.drag_start_doc = None;
+            }
+            ToolKind::Hand => {
+                *bws_end.borrow_mut() = None;
             }
             ToolKind::Move => {
                 st.move_grab_doc = None;
@@ -1239,6 +1251,7 @@ fn build_ui(app: &Application) {
         "Ellipse",
         "Select",
         "Move",
+        "Hand",
     ]);
     let tool_dd = gtk::DropDown::new(Some(tool_strings), gtk::Expression::NONE);
     *tool_dd_cell.borrow_mut() = Some(tool_dd.clone());
@@ -1262,6 +1275,7 @@ fn build_ui(app: &Application) {
             7 => ToolKind::Ellipse,
             8 => ToolKind::SelectRect,
             9 => ToolKind::Move,
+            10 => ToolKind::Hand,
             _ => ToolKind::Brush,
         };
         let cur = g.tool;
