@@ -41,6 +41,37 @@ fn queue_canvas(canvas: &CanvasCell) {
     }
 }
 
+fn zoom_to_fit(state: &SharedState, canvas_cell: &CanvasCell) {
+    let Some(ref da) = *canvas_cell.borrow() else { return };
+    let vw = da.width() as f64;
+    let vh = da.height() as f64;
+    if vw <= 0.0 || vh <= 0.0 { return; }
+    let mut st = state.borrow_mut();
+    let dw = st.doc.width as f64;
+    let dh = st.doc.height as f64;
+    if dw <= 0.0 || dh <= 0.0 { return; }
+    let pad = 16.0;
+    let z = ((vw - 2.0 * pad) / dw).min((vh - 2.0 * pad) / dh).clamp(0.05, 32.0);
+    st.zoom = z;
+    st.pan_x = (vw - dw * z) / 2.0;
+    st.pan_y = (vh - dh * z) / 2.0;
+}
+
+fn zoom_step(state: &SharedState, canvas_cell: &CanvasCell, factor: f64) {
+    let Some(ref da) = *canvas_cell.borrow() else { return };
+    let vw = da.width() as f64;
+    let vh = da.height() as f64;
+    let cx = vw / 2.0;
+    let cy = vh / 2.0;
+    let mut st = state.borrow_mut();
+    let old_z = st.zoom;
+    st.zoom = (st.zoom * factor).clamp(0.05, 32.0);
+    let doc_x = (cx - st.pan_x) / old_z;
+    let doc_y = (cy - st.pan_y) / old_z;
+    st.pan_x = cx - doc_x * st.zoom;
+    st.pan_y = cy - doc_y * st.zoom;
+}
+
 fn listbox_row_index(lb: &gtk::ListBox, target: &gtk::ListBoxRow) -> usize {
     let mut i = 0usize;
     let mut child = lb.first_child();
@@ -814,6 +845,7 @@ fn show_paste_oversize_dialog(
             s.history.clear();
         }
         paste_image_data(&st, &td, img_w, img_h, (*data).clone());
+        zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
         queue_canvas(&cv);
         dw.close();
@@ -1341,6 +1373,43 @@ fn build_ui(app: &Application) {
     toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     toolbar.append(&make_row("Fill tol", tol_spin.upcast_ref()));
     toolbar.append(&fill_check);
+    toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    let zoom_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .hexpand(false)
+        .build();
+    let zoom_out_btn = gtk::Button::from_icon_name("zoom-out-symbolic");
+    let zoom_fit_btn = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
+    let zoom_in_btn = gtk::Button::from_icon_name("zoom-in-symbolic");
+    zoom_out_btn.set_tooltip_text(Some("Zoom out (Ctrl+−)"));
+    zoom_fit_btn.set_tooltip_text(Some("Zoom to fit (Ctrl+0)"));
+    zoom_in_btn.set_tooltip_text(Some("Zoom in (Ctrl++)"));
+    zoom_row.append(&zoom_out_btn);
+    zoom_row.append(&zoom_fit_btn);
+    zoom_row.append(&zoom_in_btn);
+
+    let st_zo = state.clone();
+    let cv_zo = canvas_cell.clone();
+    zoom_out_btn.connect_clicked(move |_| {
+        zoom_step(&st_zo, &cv_zo, 1.0 / 1.25);
+        queue_canvas(&cv_zo);
+    });
+    let st_zf = state.clone();
+    let cv_zf = canvas_cell.clone();
+    zoom_fit_btn.connect_clicked(move |_| {
+        zoom_to_fit(&st_zf, &cv_zf);
+        queue_canvas(&cv_zf);
+    });
+    let st_zi = state.clone();
+    let cv_zi = canvas_cell.clone();
+    zoom_in_btn.connect_clicked(move |_| {
+        zoom_step(&st_zi, &cv_zi, 1.25);
+        queue_canvas(&cv_zi);
+    });
+
+    toolbar.append(&zoom_row);
 
     let editor = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1429,6 +1498,21 @@ fn build_ui(app: &Application) {
                 try_paste_system_clipboard(&win_k, &st_k, &td_k, &cv_k, &lc_k);
                 glib::Propagation::Stop
             }
+            gdk::Key::plus | gdk::Key::equal if ctrl => {
+                zoom_step(&st_k, &cv_k, 1.25);
+                queue_canvas(&cv_k);
+                glib::Propagation::Stop
+            }
+            gdk::Key::minus if ctrl => {
+                zoom_step(&st_k, &cv_k, 1.0 / 1.25);
+                queue_canvas(&cv_k);
+                glib::Propagation::Stop
+            }
+            gdk::Key::_0 if ctrl => {
+                zoom_to_fit(&st_k, &cv_k);
+                queue_canvas(&cv_k);
+                glib::Propagation::Stop
+            }
             _ => glib::Propagation::Proceed,
         }
     });
@@ -1460,6 +1544,12 @@ fn build_menu(
     edit.append(Some("Copy"), Some("win.copy"));
     edit.append(Some("Paste"), Some("win.paste"));
     menu.append_submenu(Some("_Edit"), &edit);
+
+    let view = gio::Menu::new();
+    view.append(Some("Zoom In"), Some("win.zoom_in"));
+    view.append(Some("Zoom Out"), Some("win.zoom_out"));
+    view.append(Some("Zoom to Fit"), Some("win.zoom_fit"));
+    menu.append_submenu(Some("_View"), &view);
 
     let image = gio::Menu::new();
     image.append(Some("Brightness / Contrast…"), Some("win.bc"));
@@ -1559,6 +1649,33 @@ fn build_menu(
         try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p);
     });
     app_add_action(window, &paste_act);
+
+    let st = state.clone();
+    let cv = canvas.clone();
+    let zi_act = gio::SimpleAction::new("zoom_in", None);
+    zi_act.connect_activate(move |_, _| {
+        zoom_step(&st, &cv, 1.25);
+        queue_canvas(&cv);
+    });
+    app_add_action(window, &zi_act);
+
+    let st = state.clone();
+    let cv = canvas.clone();
+    let zo_act = gio::SimpleAction::new("zoom_out", None);
+    zo_act.connect_activate(move |_, _| {
+        zoom_step(&st, &cv, 1.0 / 1.25);
+        queue_canvas(&cv);
+    });
+    app_add_action(window, &zo_act);
+
+    let st = state.clone();
+    let cv = canvas.clone();
+    let zf_act = gio::SimpleAction::new("zoom_fit", None);
+    zf_act.connect_activate(move |_, _| {
+        zoom_to_fit(&st, &cv);
+        queue_canvas(&cv);
+    });
+    app_add_action(window, &zf_act);
 
     let st = state.clone();
     let cv = canvas.clone();
