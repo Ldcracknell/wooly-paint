@@ -1188,8 +1188,10 @@ fn build_ui(app: &Application) {
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
     split.set_start_child(Some(&editor));
     split.set_end_child(Some(&layers_sidebar));
+    split.set_resize_start_child(true);
     split.set_resize_end_child(false);
-    split.set_position(780);
+    split.set_shrink_start_child(true);
+    split.set_shrink_end_child(false);
 
     let menu_model = build_menu(
         &window,
