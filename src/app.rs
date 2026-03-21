@@ -307,6 +307,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
     }
     cr.fill().unwrap();
     cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
+    cr.source().set_filter(gtk::cairo::Filter::Nearest);
     cr.paint().unwrap();
     cr.restore().unwrap();
 
@@ -328,6 +329,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.scale(st.zoom, st.zoom);
         cr.translate(f.x, f.y);
         cr.set_source_pixbuf(&pb, 0.0, 0.0);
+        cr.source().set_filter(gtk::cairo::Filter::Nearest);
         cr.paint().unwrap();
         cr.restore().unwrap();
     }
