@@ -961,6 +961,7 @@ fn open_file(
                         g.selection = None;
                         g.floating = None;
                         drop(g);
+                        zoom_to_fit(&st, &cv);
                         refresh_layers_list(&st, &lc, &cv);
                         queue_canvas(&cv);
                     }
@@ -1081,6 +1082,7 @@ fn new_document_dialog(
         g.floating = None;
         g.modified = false;
         drop(g);
+        zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
         queue_canvas(&cv);
         dw.close();
@@ -1533,6 +1535,13 @@ fn build_ui(app: &Application) {
     window.add_controller(key);
 
     window.present();
+
+    let st_fit = state.clone();
+    let cv_fit = canvas_cell.clone();
+    glib::idle_add_local_once(move || {
+        zoom_to_fit(&st_fit, &cv_fit);
+        queue_canvas(&cv_fit);
+    });
 }
 
 fn build_menu(
