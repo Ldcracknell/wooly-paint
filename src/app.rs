@@ -35,6 +35,22 @@ pub fn run() -> gtk::glib::ExitCode {
     app.run()
 }
 
+fn tool_label(tool: ToolKind, key: Option<char>) -> String {
+    match key {
+        Some(c) => format!("{} ({})", tool.display_name(), c.to_ascii_uppercase()),
+        None => tool.display_name().to_string(),
+    }
+}
+
+fn refresh_tool_labels(state: &SharedState, sl: &gtk::StringList) {
+    let labels: Vec<String> = {
+        let st = state.borrow();
+        st.tool_keybinds.iter().map(|(t, k)| tool_label(*t, *k)).collect()
+    };
+    let strs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    sl.splice(0, sl.n_items(), &strs);
+}
+
 fn queue_canvas(canvas: &CanvasCell) {
     if let Some(ref c) = *canvas.borrow() {
         c.queue_draw();
@@ -1098,7 +1114,7 @@ fn new_document_dialog(
     d.present();
 }
 
-fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState) {
+fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, tool_strings: &gtk::StringList) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
         .modal(true)
@@ -1107,6 +1123,8 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState) 
         .default_height(500)
         .build();
 
+    let original_binds = state.borrow().tool_keybinds.clone();
+    let saved: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let editing_idx: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
     let buttons: Rc<RefCell<Vec<gtk::Button>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -1163,7 +1181,9 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState) 
     scroll.set_child(Some(&list));
 
     let reset_btn = gtk::Button::with_label("Reset defaults");
-    let close_btn = gtk::Button::with_label("Close");
+    let discard_btn = gtk::Button::with_label("Don't save");
+    let save_btn = gtk::Button::with_label("Save");
+    save_btn.add_css_class("suggested-action");
     let btn_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -1171,7 +1191,8 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState) 
         .margin_top(8)
         .build();
     btn_row.append(&reset_btn);
-    btn_row.append(&close_btn);
+    btn_row.append(&discard_btn);
+    btn_row.append(&save_btn);
 
     let bx = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1268,8 +1289,32 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState) 
         *ei_reset.borrow_mut() = None;
     });
 
+    let saved_s = saved.clone();
     let dw = d.clone();
-    close_btn.connect_clicked(move |_| dw.close());
+    save_btn.connect_clicked(move |_| {
+        *saved_s.borrow_mut() = true;
+        dw.close();
+    });
+
+    let dw = d.clone();
+    let st_dis = state.clone();
+    let orig_dis = original_binds.clone();
+    discard_btn.connect_clicked(move |_| {
+        st_dis.borrow_mut().tool_keybinds = orig_dis.clone();
+        dw.close();
+    });
+
+    let st_close = state.clone();
+    let sl_close = tool_strings.clone();
+    let orig_close = original_binds.clone();
+    let saved_c = saved.clone();
+    d.connect_close_request(move |_| {
+        if !*saved_c.borrow() {
+            st_close.borrow_mut().tool_keybinds = orig_close.clone();
+        }
+        refresh_tool_labels(&st_close, &sl_close);
+        glib::Propagation::Proceed
+    });
 
     d.present();
 }
@@ -1421,23 +1466,14 @@ fn build_ui(app: &Application) {
         .build();
     layers_sidebar.append(&layers_scroll);
 
-    let tool_strings = gtk::StringList::new(&[
-        "Brush",
-        "Pixel",
-        "Eraser",
-        "Eyedropper",
-        "Fill",
-        "Line",
-        "Rectangle",
-        "Ellipse",
-        "Select",
-        "Move",
-        "Hand",
-    ]);
-    let tool_dd = gtk::DropDown::new(Some(tool_strings), gtk::Expression::NONE);
+    let labels: Vec<String> = state.borrow().tool_keybinds.iter()
+        .map(|(t, k)| tool_label(*t, *k)).collect();
+    let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let tool_strings = gtk::StringList::new(&label_refs);
+    let tool_dd = gtk::DropDown::new(Some(tool_strings.clone()), gtk::Expression::NONE);
     *tool_dd_cell.borrow_mut() = Some(tool_dd.clone());
     tool_dd.set_hexpand(false);
-    tool_dd.set_width_request(140);
+    tool_dd.set_width_request(160);
 
     let size_adj_cell: Rc<RefCell<Option<gtk::Adjustment>>> = Rc::new(RefCell::new(None));
     let st_dd = state.clone();
@@ -1628,6 +1664,7 @@ fn build_ui(app: &Application) {
         &layers_cell,
         &canvas_cell,
         &tool_dd_cell,
+        &tool_strings,
     );
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
 
@@ -1747,6 +1784,7 @@ fn build_menu(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
     tool_dd_cell: &ToolDdCell,
+    tool_strings: &gtk::StringList,
 ) -> gio::Menu {
     let menu = gio::Menu::new();
     let file = gio::Menu::new();
@@ -1876,9 +1914,10 @@ fn build_menu(
 
     let st = state.clone();
     let w_kb = window.clone();
+    let ts_kb = tool_strings.clone();
     let kb_act = gio::SimpleAction::new("keybinds", None);
     kb_act.connect_activate(move |_, _| {
-        keybinds_dialog(&w_kb, &st);
+        keybinds_dialog(&w_kb, &st, &ts_kb);
     });
     app_add_action(window, &kb_act);
 
