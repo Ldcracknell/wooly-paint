@@ -5,7 +5,7 @@ use crate::document::{
 use crate::state::{AppState, FloatingSelection};
 use crate::tools::{
     clear_rect, copy_rect, draw_ellipse, draw_rect_outline, flood_fill, paste_rect,
-    sample_composite_premul, stamp_circle, stroke_line, ToolKind,
+    sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_square, ToolKind,
 };
 use libadwaita::prelude::*;
 use libadwaita::Application;
@@ -123,10 +123,10 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             BlendMode::Multiply => 1,
             BlendMode::Add => 2,
         });
-        blend_dd.set_hexpand(true);
-        let up = gtk::Button::with_label("↑");
-        let down = gtk::Button::with_label("↓");
-        let del = gtk::Button::with_label("✕");
+        blend_dd.set_width_request(90);
+        let up = gtk::Button::from_icon_name("go-up-symbolic");
+        let down = gtk::Button::from_icon_name("go-down-symbolic");
+        let del = gtk::Button::from_icon_name("edit-delete-symbolic");
         bot_row.append(&op_spin);
         bot_row.append(&blend_dd);
         bot_row.append(&up);
@@ -212,6 +212,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         });
 
         let list_row = gtk::ListBoxRow::new();
+        list_row.set_overflow(gtk::Overflow::Hidden);
         list_row.set_child(Some(&outer));
         lb.append(&list_row);
     }
@@ -363,6 +364,19 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                 stamp_circle(layer, dx, dy, radius, hardness, color, eraser);
                 st.modified = true;
             }
+            ToolKind::Pixel => {
+                let color = st.fg;
+                let size = st.brush_size;
+                st.begin_stroke_undo();
+                st.last_doc_pos = Some((dx, dy));
+                *bws.borrow_mut() = Some((wx, wy));
+                let layer = match st.doc.active_layer_mut() {
+                    Some(l) => l,
+                    None => return,
+                };
+                stamp_square(layer, dx, dy, size, color, false);
+                st.modified = true;
+            }
             ToolKind::Fill => {
                 let fg = st.fg;
                 let tol = st.fill_tolerance;
@@ -477,17 +491,26 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                     Some(l) => l,
                     None => return,
                 };
-                stroke_line(
-                    layer,
-                    lx,
-                    ly,
-                    cx,
-                    cy,
-                    radius,
-                    hardness,
-                    color,
-                    eraser,
-                );
+                stroke_line(layer, lx, ly, cx, cy, radius, hardness, color, eraser);
+                st.last_doc_pos = Some((cx, cy));
+                st.modified = true;
+            }
+            ToolKind::Pixel => {
+                let Some((bx, by)) = *bws_up.borrow() else {
+                    return;
+                };
+                let (cx, cy) = st.widget_to_doc(bx + ox, by + oy);
+                let Some((lx, ly)) = st.last_doc_pos else {
+                    st.last_doc_pos = Some((cx, cy));
+                    return;
+                };
+                let color = st.fg;
+                let size = st.brush_size;
+                let layer = match st.doc.active_layer_mut() {
+                    Some(l) => l,
+                    None => return,
+                };
+                stroke_line_square(layer, lx, ly, cx, cy, size, color, false);
                 st.last_doc_pos = Some((cx, cy));
                 st.modified = true;
             }
@@ -531,7 +554,7 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     drag.connect_drag_end(move |_g, ox, oy| {
         let mut st = st_drag_end.borrow_mut();
         match st.tool {
-            ToolKind::Brush | ToolKind::Eraser => {
+            ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel => {
                 *bws_end.borrow_mut() = None;
                 st.commit_stroke_undo();
                 st.last_doc_pos = None;
@@ -964,6 +987,7 @@ fn build_ui(app: &Application) {
         .selection_mode(gtk::SelectionMode::Browse)
         .vexpand(true)
         .build();
+    layers_list.add_css_class("boxed-list");
     *layers_cell.borrow_mut() = Some(layers_list.clone());
 
     let st_sel = state.clone();
@@ -979,14 +1003,16 @@ fn build_ui(app: &Application) {
 
     let layers_sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(8)
-        .margin_end(8)
-        .width_request(280)
+        .spacing(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .width_request(320)
         .build();
-    layers_sidebar.append(&gtk::Label::new(Some("Layers")));
+    let layers_title = gtk::Label::new(Some("Layers"));
+    layers_title.add_css_class("heading");
+    layers_sidebar.append(&layers_title);
     let add_layer_btn = gtk::Button::with_label("Add layer");
     let st_al = state.clone();
     let lc_al = layers_cell.clone();
@@ -998,10 +1024,17 @@ fn build_ui(app: &Application) {
         queue_canvas(&cv_al);
     });
     layers_sidebar.append(&add_layer_btn);
-    layers_sidebar.append(&layers_list);
+    let layers_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&layers_list)
+        .build();
+    layers_sidebar.append(&layers_scroll);
 
     let tool_strings = gtk::StringList::new(&[
         "Brush",
+        "Pixel",
         "Eraser",
         "Eyedropper",
         "Fill",
@@ -1015,22 +1048,34 @@ fn build_ui(app: &Application) {
     tool_dd.set_hexpand(false);
     tool_dd.set_width_request(140);
 
+    let size_adj_cell: Rc<RefCell<Option<gtk::Adjustment>>> = Rc::new(RefCell::new(None));
     let st_dd = state.clone();
     let cv_dd = canvas_cell.clone();
+    let sa_dd = size_adj_cell.clone();
     tool_dd.connect_selected_item_notify(move |dd| {
         let mut g = st_dd.borrow_mut();
+        let prev = g.tool;
         g.tool = match dd.selected() {
-            1 => ToolKind::Eraser,
-            2 => ToolKind::Eyedropper,
-            3 => ToolKind::Fill,
-            4 => ToolKind::Line,
-            5 => ToolKind::Rect,
-            6 => ToolKind::Ellipse,
-            7 => ToolKind::SelectRect,
-            8 => ToolKind::Move,
+            1 => ToolKind::Pixel,
+            2 => ToolKind::Eraser,
+            3 => ToolKind::Eyedropper,
+            4 => ToolKind::Fill,
+            5 => ToolKind::Line,
+            6 => ToolKind::Rect,
+            7 => ToolKind::Ellipse,
+            8 => ToolKind::SelectRect,
+            9 => ToolKind::Move,
             _ => ToolKind::Brush,
         };
+        let cur = g.tool;
         drop(g);
+        if let Some(ref adj) = *sa_dd.borrow() {
+            if cur == ToolKind::Pixel && prev != ToolKind::Pixel {
+                adj.set_value(1.0);
+            } else if prev == ToolKind::Pixel && cur != ToolKind::Pixel {
+                adj.set_value(8.0);
+            }
+        }
         queue_canvas(&cv_dd);
     });
 
@@ -1062,6 +1107,7 @@ fn build_ui(app: &Application) {
     });
 
     let size_adj = gtk::Adjustment::new(8.0, 1.0, 256.0, 1.0, 8.0, 0.0);
+    *size_adj_cell.borrow_mut() = Some(size_adj.clone());
     let size_spin = gtk::SpinButton::new(Some(&size_adj), 1.0, 0);
     size_spin.set_width_request(72);
     let st_sz = state.clone();

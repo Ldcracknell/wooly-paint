@@ -3,6 +3,7 @@ use crate::document::Layer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     Brush,
+    Pixel,
     Eraser,
     Eyedropper,
     Fill,
@@ -127,6 +128,84 @@ pub fn stroke_line(
         let x = x0 + dx * t;
         let y = y0 + dy * t;
         stamp_circle(layer, x, y, radius, hardness, color, eraser);
+    }
+}
+
+pub fn stamp_square(
+    layer: &mut Layer,
+    cx: f64,
+    cy: f64,
+    size: f64,
+    color: [u8; 4],
+    eraser: bool,
+) {
+    if size <= 0.0 {
+        return;
+    }
+    let w = layer.width as i32;
+    let h = layer.height as i32;
+    let half = size * 0.5;
+    let base = straight_to_premul_rgba(color[0], color[1], color[2], color[3]);
+    let alpha = color[3] as f64 / 255.0;
+    if alpha <= 0.0 {
+        return;
+    }
+    let x0 = (cx - half).floor() as i32;
+    let y0 = (cy - half).floor() as i32;
+    let x1 = (cx + half).ceil() as i32;
+    let y1 = (cy + half).ceil() as i32;
+
+    for iy in y0.max(0)..y1.min(h) {
+        for ix in x0.max(0)..x1.min(w) {
+            let i = layer.idx(ix as u32, iy as u32);
+            if eraser {
+                let inv = (1.0 - alpha) as f32;
+                for c in 0..4 {
+                    layer.pixels[i + c] =
+                        (layer.pixels[i + c] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+                }
+            } else {
+                let src = [
+                    (base[0] as f64 * alpha).round() as u8,
+                    (base[1] as f64 * alpha).round() as u8,
+                    (base[2] as f64 * alpha).round() as u8,
+                    (base[3] as f64 * alpha).round() as u8,
+                ];
+                let mut p = [
+                    layer.pixels[i],
+                    layer.pixels[i + 1],
+                    layer.pixels[i + 2],
+                    layer.pixels[i + 3],
+                ];
+                blend_premul_pixel(&mut p, src);
+                layer.pixels[i..i + 4].copy_from_slice(&p);
+            }
+        }
+    }
+}
+
+pub fn stroke_line_square(
+    layer: &mut Layer,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    size: f64,
+    color: [u8; 4],
+    eraser: bool,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    let step = (size * 0.35).max(0.5);
+    let n = (len / step).ceil() as i32;
+    if n <= 0 {
+        stamp_square(layer, x0, y0, size, color, eraser);
+        return;
+    }
+    for i in 0..=n {
+        let t = i as f64 / n as f64;
+        stamp_square(layer, x0 + dx * t, y0 + dy * t, size, color, eraser);
     }
 }
 
