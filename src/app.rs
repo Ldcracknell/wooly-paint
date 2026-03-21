@@ -1092,27 +1092,47 @@ fn build_ui(app: &Application) {
     });
 
     let toolbar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
         .margin_top(6)
         .margin_bottom(6)
-        .margin_start(8)
-        .margin_end(8)
+        .margin_start(6)
+        .margin_end(6)
+        .hexpand(false)
         .build();
-    toolbar.append(&gtk::Label::new(Some("Tool")));
-    toolbar.append(&tool_dd);
-    toolbar.append(&gtk::Label::new(Some("Color")));
-    toolbar.append(&color_btn);
-    toolbar.append(&gtk::Label::new(Some("Size")));
-    toolbar.append(&size_spin);
-    toolbar.append(&gtk::Label::new(Some("Hard")));
-    toolbar.append(&hard_scale);
-    toolbar.append(&gtk::Label::new(Some("Fill tol")));
-    toolbar.append(&tol_spin);
+
+    let make_row = |label: &str, widget: &gtk::Widget| -> gtk::Box {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .hexpand(false)
+            .build();
+        let lbl = gtk::Label::builder()
+            .label(label)
+            .xalign(0.0)
+            .width_request(36)
+            .build();
+        lbl.add_css_class("dim-label");
+        row.append(&lbl);
+        row.append(widget);
+        row
+    };
+    tool_dd.set_width_request(100);
+    hard_scale.set_width_request(100);
+    size_spin.set_width_request(80);
+    tol_spin.set_width_request(80);
+
+    toolbar.append(&make_row("Tool", tool_dd.upcast_ref()));
+    toolbar.append(&make_row("Color", color_btn.upcast_ref()));
+    toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    toolbar.append(&make_row("Size", size_spin.upcast_ref()));
+    toolbar.append(&make_row("Hard", hard_scale.upcast_ref()));
+    toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    toolbar.append(&make_row("Fill tol", tol_spin.upcast_ref()));
     toolbar.append(&fill_check);
 
     let editor = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
+        .orientation(gtk::Orientation::Horizontal)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -1125,17 +1145,17 @@ fn build_ui(app: &Application) {
     split.set_resize_end_child(false);
     split.set_position(780);
 
-    let menu = gtk::MenuButton::new();
-    menu.set_icon_name("open-menu-symbolic");
-    menu.set_menu_model(Some(&build_menu(
+    let menu_model = build_menu(
         &window,
         &state,
         &layers_cell,
         &canvas_cell,
-    )));
+    );
+    let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
 
     let header = libadwaita::HeaderBar::new();
-    header.pack_end(&menu);
+    header.pack_start(&menubar);
+    header.set_title_widget(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
 
     let toolbar_view = libadwaita::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
