@@ -20,6 +20,7 @@ use std::rc::Rc;
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
+type ColorBtnCell = Rc<RefCell<Option<gtk::ColorDialogButton>>>;
 
 pub fn run() -> gtk::glib::ExitCode {
     libadwaita::init().expect("libadwaita init");
@@ -82,18 +83,39 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
     let active_layer = state.borrow().doc.active_layer;
 
     for (i, name, visible, opacity, blend) in layers_info {
-        let row = libadwaita::ActionRow::new();
-        row.set_title(&name);
-        row.set_subtitle(&format!("{} · {:.0}%", blend.as_str(), opacity * 100.0));
+        let outer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
 
+        let top_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        let name_label = gtk::Label::builder()
+            .label(&name)
+            .hexpand(true)
+            .xalign(0.0)
+            .build();
+        name_label.add_css_class("heading");
         let vis = gtk::Switch::builder()
             .active(visible)
             .valign(gtk::Align::Center)
             .build();
+        top_row.append(&name_label);
+        top_row.append(&vis);
+
+        let bot_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
         let op_adj = gtk::Adjustment::new(f64::from(opacity) * 100.0, 0.0, 100.0, 1.0, 5.0, 0.0);
         let op_spin = gtk::SpinButton::new(Some(&op_adj), 1.0, 0);
-        op_spin.set_width_request(64);
-
+        op_spin.set_width_request(56);
         let blend_strings = gtk::StringList::new(&["Normal", "Multiply", "Add"]);
         let blend_dd = gtk::DropDown::new(Some(blend_strings), gtk::Expression::NONE);
         blend_dd.set_selected(match blend {
@@ -101,26 +123,18 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             BlendMode::Multiply => 1,
             BlendMode::Add => 2,
         });
-        blend_dd.set_width_request(110);
-
+        blend_dd.set_hexpand(true);
         let up = gtk::Button::with_label("↑");
         let down = gtk::Button::with_label("↓");
         let del = gtk::Button::with_label("✕");
-        up.set_valign(gtk::Align::Center);
-        down.set_valign(gtk::Align::Center);
-        del.set_valign(gtk::Align::Center);
+        bot_row.append(&op_spin);
+        bot_row.append(&blend_dd);
+        bot_row.append(&up);
+        bot_row.append(&down);
+        bot_row.append(&del);
 
-        let bx = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .build();
-        bx.append(&vis);
-        bx.append(&op_spin);
-        bx.append(&blend_dd);
-        bx.append(&up);
-        bx.append(&down);
-        bx.append(&del);
-        row.add_suffix(&bx);
+        outer.append(&top_row);
+        outer.append(&bot_row);
 
         let st = state.clone();
         let cv = canvas.clone();
@@ -198,7 +212,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         });
 
         let list_row = gtk::ListBoxRow::new();
-        list_row.set_child(Some(&row));
+        list_row.set_child(Some(&outer));
         lb.append(&list_row);
     }
 
@@ -228,6 +242,21 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
     cr.save().unwrap();
     cr.translate(st.pan_x, st.pan_y);
     cr.scale(st.zoom, st.zoom);
+    cr.rectangle(0.0, 0.0, w as f64, h as f64);
+    cr.clip();
+    let cs = 8.0_f64;
+    cr.set_source_rgb(0.93, 0.93, 0.93);
+    cr.paint().unwrap();
+    cr.set_source_rgb(0.78, 0.78, 0.78);
+    for ry in 0..(h as f64 / cs).ceil() as i32 {
+        for rx in 0..(w as f64 / cs).ceil() as i32 {
+            if (rx + ry) % 2 == 0 {
+                continue;
+            }
+            cr.rectangle(rx as f64 * cs, ry as f64 * cs, cs, cs);
+        }
+    }
+    cr.fill().unwrap();
     cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
     cr.paint().unwrap();
     cr.restore().unwrap();
@@ -303,7 +332,7 @@ fn commit_floating(state: &mut AppState) {
     }
 }
 
-fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cell: &CanvasCell) {
+fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cell: &CanvasCell, color_btn_cell: &ColorBtnCell) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let move_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
 
@@ -313,9 +342,11 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     let cnv = canvas.clone();
     let bws = brush_widget_start.clone();
     let mws_b = move_widget_start.clone();
+    let cb_drag = color_btn_cell.clone();
     drag.connect_drag_begin(move |_g, wx, wy| {
         let mut st = st_drag_begin.borrow_mut();
         let (dx, dy) = st.widget_to_doc(wx, wy);
+        let mut eyedropped = None;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser => {
                 let color = st.fg;
@@ -331,6 +362,43 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                 };
                 stamp_circle(layer, dx, dy, radius, hardness, color, eraser);
                 st.modified = true;
+            }
+            ToolKind::Fill => {
+                let fg = st.fg;
+                let tol = st.fill_tolerance;
+                let dw = st.doc.width;
+                let dh = st.doc.height;
+                st.begin_stroke_undo();
+                if let Some(layer) = st.doc.active_layer_mut() {
+                    let pv = straight_to_premul(&[fg[0], fg[1], fg[2], fg[3]]);
+                    let fill = [pv[0], pv[1], pv[2], pv[3]];
+                    flood_fill(
+                        layer,
+                        dx.floor().clamp(0.0, dw as f64 - 1.0) as u32,
+                        dy.floor().clamp(0.0, dh as f64 - 1.0) as u32,
+                        fill,
+                        tol,
+                    );
+                    st.modified = true;
+                }
+                st.commit_stroke_undo();
+            }
+            ToolKind::Eyedropper => {
+                let comp = st.doc.composite();
+                let c = sample_composite_premul(
+                    &comp,
+                    st.doc.width,
+                    st.doc.height,
+                    dx.floor() as i32,
+                    dy.floor() as i32,
+                );
+                st.fg = c;
+                eyedropped = Some(gdk::RGBA::new(
+                    c[0] as f32 / 255.0,
+                    c[1] as f32 / 255.0,
+                    c[2] as f32 / 255.0,
+                    c[3] as f32 / 255.0,
+                ));
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse | ToolKind::SelectRect => {
                 st.drag_start_doc = Some((dx, dy));
@@ -371,9 +439,13 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                     *mws_b.borrow_mut() = Some((wx, wy));
                 }
             }
-            _ => {}
         }
         drop(st);
+        if let Some(rgba) = eyedropped {
+            if let Some(ref btn) = *cb_drag.borrow() {
+                btn.set_rgba(&rgba);
+            }
+        }
         queue_canvas(&cv_drag);
         cnv.queue_draw();
     });
@@ -522,51 +594,6 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     });
 
     canvas.add_controller(drag);
-
-    let click = gtk::GestureClick::new();
-    let st_click = state.clone();
-    let cv_click = canvas_cell.clone();
-    click.connect_pressed(move |_g, _n, wx, wy| {
-        let mut st = st_click.borrow_mut();
-        let (dx, dy) = st.widget_to_doc(wx, wy);
-        match st.tool {
-            ToolKind::Fill => {
-                let fg = st.fg;
-                let tol = st.fill_tolerance;
-                let dw = st.doc.width;
-                let dh = st.doc.height;
-                st.begin_stroke_undo();
-                if let Some(layer) = st.doc.active_layer_mut() {
-                    let pv = straight_to_premul(&[fg[0], fg[1], fg[2], fg[3]]);
-                    let fill = [pv[0], pv[1], pv[2], pv[3]];
-                    flood_fill(
-                        layer,
-                        dx.floor().clamp(0.0, dw as f64 - 1.0) as u32,
-                        dy.floor().clamp(0.0, dh as f64 - 1.0) as u32,
-                        fill,
-                        tol,
-                    );
-                    st.modified = true;
-                }
-                st.commit_stroke_undo();
-            }
-            ToolKind::Eyedropper => {
-                let comp = st.doc.composite();
-                let c = sample_composite_premul(
-                    &comp,
-                    st.doc.width,
-                    st.doc.height,
-                    dx.floor() as i32,
-                    dy.floor() as i32,
-                );
-                st.fg = c;
-            }
-            _ => {}
-        }
-        drop(st);
-        queue_canvas(&cv_click);
-    });
-    canvas.add_controller(click);
 
     let motion = gtk::EventControllerMotion::new();
     let st_m = state.clone();
@@ -907,6 +934,7 @@ fn build_ui(app: &Application) {
     let state: SharedState = Rc::new(RefCell::new(AppState::new()));
     let canvas_cell: CanvasCell = Rc::new(RefCell::new(None));
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
+    let color_btn_cell: ColorBtnCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
     drawing_area.set_hexpand(true);
@@ -930,7 +958,7 @@ fn build_ui(app: &Application) {
         glib::ControlFlow::Continue
     });
 
-    setup_canvas_input(&drawing_area, &state, &canvas_cell);
+    setup_canvas_input(&drawing_area, &state, &canvas_cell, &color_btn_cell);
 
     let layers_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Browse)
@@ -1006,7 +1034,8 @@ fn build_ui(app: &Application) {
         queue_canvas(&cv_dd);
     });
 
-    let color_btn = gtk::ColorDialogButton::default();
+    let color_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    *color_btn_cell.borrow_mut() = Some(color_btn.clone());
     {
         let g = state.borrow();
         let rgba = gdk::RGBA::new(

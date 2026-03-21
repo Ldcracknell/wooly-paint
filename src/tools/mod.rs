@@ -70,41 +70,25 @@ pub fn stamp_circle(
             if d > r {
                 continue;
             }
-            let edge = ((r - d) / (r - inner).max(1e-6)).clamp(0.0, 1.0);
-            let mut alpha: f64 = if d <= inner {
-                1.0
-            } else {
-                edge
-            };
-            alpha *= color[3] as f64 / 255.0;
+            let alpha: f64 = ((r - d) / (r - inner).max(1e-6)).clamp(0.0, 1.0)
+                * color[3] as f64 / 255.0;
             if alpha <= 0.0 {
                 continue;
             }
-            let mut src = base;
+            let i = layer.idx(ix as u32, iy as u32);
             if eraser {
-                src = [0, 0, 0, 0];
-            }
-            src[0] = (src[0] as f64 * alpha).round() as u8;
-            src[1] = (src[1] as f64 * alpha).round() as u8;
-            src[2] = (src[2] as f64 * alpha).round() as u8;
-            src[3] = (src[3] as f64 * alpha).round() as u8;
-            if eraser {
-                let i = layer.idx(ix as u32, iy as u32);
-                let mut p = [
-                    layer.pixels[i],
-                    layer.pixels[i + 1],
-                    layer.pixels[i + 2],
-                    layer.pixels[i + 3],
-                ];
-                let sa = src[3] as f32 / 255.0;
-                let inv = 1.0 - sa;
-                p[3] = (p[3] as f32 * inv).round() as u8;
-                for c in 0..3 {
-                    p[c] = (p[c] as f32 * inv).round() as u8;
+                let inv = (1.0 - alpha) as f32;
+                for c in 0..4 {
+                    layer.pixels[i + c] =
+                        (layer.pixels[i + c] as f32 * inv).round().clamp(0.0, 255.0) as u8;
                 }
-                layer.pixels[i..i + 4].copy_from_slice(&p);
             } else {
-                let i = layer.idx(ix as u32, iy as u32);
+                let src = [
+                    (base[0] as f64 * alpha).round() as u8,
+                    (base[1] as f64 * alpha).round() as u8,
+                    (base[2] as f64 * alpha).round() as u8,
+                    (base[3] as f64 * alpha).round() as u8,
+                ];
                 let mut p = [
                     layer.pixels[i],
                     layer.pixels[i + 1],

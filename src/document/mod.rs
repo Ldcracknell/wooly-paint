@@ -20,12 +20,12 @@ pub struct Document {
 
 impl Document {
     pub fn new(width: u32, height: u32) -> Self {
-        let mut layers = Vec::new();
-        layers.push(Layer::new(width, height, "Background"));
+        let mut bg = Layer::new(width, height, "Background");
+        bg.pixels.fill(255);
         Self {
             width,
             height,
-            layers,
+            layers: vec![bg],
             active_layer: 0,
             path: None,
         }
