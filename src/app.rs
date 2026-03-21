@@ -1,6 +1,5 @@
 use crate::document::{
-    adjust_brightness_contrast_straight, premul_to_straight_rgba, straight_to_premul, BlendMode,
-    Document,
+    adjust_brightness_contrast_straight, premul_to_straight_rgba, straight_to_premul, Document,
 };
 use crate::state::{AppState, FloatingSelection};
 use crate::tools::{
@@ -117,20 +116,12 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             .layers
             .iter()
             .enumerate()
-            .map(|(i, l)| {
-                (
-                    i,
-                    l.name.clone(),
-                    l.visible,
-                    l.opacity,
-                    l.blend,
-                )
-            })
+            .map(|(i, l)| (i, l.name.clone(), l.visible, l.opacity))
             .collect()
     };
     let active_layer = state.borrow().doc.active_layer;
 
-    for (i, name, visible, opacity, blend) in layers_info {
+    for (i, name, visible, opacity) in layers_info {
         let outer = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
@@ -162,23 +153,21 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             .spacing(4)
             .build();
         let op_adj = gtk::Adjustment::new(f64::from(opacity) * 100.0, 0.0, 100.0, 1.0, 5.0, 0.0);
-        let op_spin = gtk::SpinButton::new(Some(&op_adj), 1.0, 0);
-        op_spin.set_width_request(56);
-        let blend_strings = gtk::StringList::new(&["Normal", "Multiply", "Add"]);
-        let blend_dd = gtk::DropDown::new(Some(blend_strings), gtk::Expression::NONE);
-        blend_dd.set_selected(match blend {
-            BlendMode::Normal => 0,
-            BlendMode::Multiply => 1,
-            BlendMode::Add => 2,
-        });
-        blend_dd.set_width_request(90);
+        let op_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&op_adj));
+        op_scale.set_draw_value(true);
+        op_scale.set_value_pos(gtk::PositionType::Right);
+        op_scale.set_digits(0);
+        op_scale.set_hexpand(true);
         let up = gtk::Button::from_icon_name("go-up-symbolic");
         let down = gtk::Button::from_icon_name("go-down-symbolic");
+        let merge = gtk::Button::from_icon_name("object-flip-vertical-symbolic");
+        merge.set_tooltip_text(Some("Merge down"));
         let del = gtk::Button::from_icon_name("edit-delete-symbolic");
-        bot_row.append(&op_spin);
-        bot_row.append(&blend_dd);
+        del.set_tooltip_text(Some("Delete layer"));
+        bot_row.append(&op_scale);
         bot_row.append(&up);
         bot_row.append(&down);
+        bot_row.append(&merge);
         bot_row.append(&del);
 
         outer.append(&top_row);
@@ -186,13 +175,14 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
 
         let st = state.clone();
         let cv = canvas.clone();
-        vis.connect_active_notify(move |sw| {
+        vis.connect_state_set(move |_sw, active| {
             let mut g = st.borrow_mut();
             if let Some(l) = g.doc.layers.get_mut(i) {
-                l.visible = sw.is_active();
+                l.visible = active;
                 g.modified = true;
             }
             queue_canvas(&cv);
+            glib::Propagation::Proceed
         });
 
         let st = state.clone();
@@ -201,21 +191,6 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             let mut g = st.borrow_mut();
             if let Some(l) = g.doc.layers.get_mut(i) {
                 l.opacity = (a.value() / 100.0) as f32;
-                g.modified = true;
-            }
-            queue_canvas(&cv);
-        });
-
-        let st = state.clone();
-        let cv = canvas.clone();
-        blend_dd.connect_selected_item_notify(move |dd| {
-            let mut g = st.borrow_mut();
-            if let Some(l) = g.doc.layers.get_mut(i) {
-                l.blend = match dd.selected() {
-                    1 => BlendMode::Multiply,
-                    2 => BlendMode::Add,
-                    _ => BlendMode::Normal,
-                };
                 g.modified = true;
             }
             queue_canvas(&cv);
@@ -248,15 +223,77 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         let st = state.clone();
         let lc4 = layers_cell.clone();
         let cv4 = canvas.clone();
-        let idx_del = i;
-        del.connect_clicked(move |_| {
+        let idx_merge = i;
+        merge.connect_clicked(move |_| {
             let mut g = st.borrow_mut();
-            if g.doc.remove_layer(idx_del) {
+            if g.doc.merge_down(idx_merge) {
                 g.history.clear();
+                g.modified = true;
                 drop(g);
                 refresh_layers_list(&st, &lc4, &cv4);
                 queue_canvas(&cv4);
             }
+        });
+
+        let st = state.clone();
+        let lc5 = layers_cell.clone();
+        let cv5 = canvas.clone();
+        let idx_del = i;
+        del.connect_clicked(move |btn| {
+            if st.borrow().doc.layers.len() <= 1 {
+                return;
+            }
+            let win = btn.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+            let st2 = st.clone();
+            let lc = lc5.clone();
+            let cv = cv5.clone();
+            let d = libadwaita::Window::builder()
+                .modal(true)
+                .title("Delete layer")
+                .default_width(340)
+                .default_height(120)
+                .build();
+            if let Some(ref w) = win {
+                d.set_transient_for(Some(w));
+            }
+            let label = gtk::Label::new(Some("Delete this layer?"));
+            label.set_wrap(true);
+            let cancel = gtk::Button::with_label("Cancel");
+            let confirm = gtk::Button::with_label("Delete");
+            confirm.add_css_class("destructive-action");
+            let btn_row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .halign(gtk::Align::End)
+                .build();
+            btn_row.append(&cancel);
+            btn_row.append(&confirm);
+            let bx = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .margin_top(16)
+                .margin_bottom(16)
+                .margin_start(16)
+                .margin_end(16)
+                .spacing(16)
+                .build();
+            bx.append(&label);
+            bx.append(&btn_row);
+            d.set_content(Some(&bx));
+            let dc = d.clone();
+            cancel.connect_clicked(move |_| dc.close());
+            let dc2 = d.clone();
+            confirm.connect_clicked(move |_| {
+                let mut g = st2.borrow_mut();
+                if g.doc.remove_layer(idx_del) {
+                    g.history.clear();
+                    g.modified = true;
+                    drop(g);
+                    refresh_layers_list(&st2, &lc, &cv);
+                    queue_canvas(&cv);
+                }
+                dc2.close();
+            });
+            d.present();
         });
 
         let list_row = gtk::ListBoxRow::new();
@@ -1700,13 +1737,34 @@ fn build_ui(app: &Application) {
     editor.append(&toolbar);
     editor.append(&drawing_area);
 
-    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
-    split.set_start_child(Some(&editor));
-    split.set_end_child(Some(&layers_sidebar));
-    split.set_resize_start_child(true);
-    split.set_resize_end_child(false);
-    split.set_shrink_start_child(true);
-    split.set_shrink_end_child(false);
+    let revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideRight)
+        .reveal_child(true)
+        .child(&layers_sidebar)
+        .build();
+
+    let toggle_layers = gtk::Button::with_label("Layers");
+    toggle_layers.set_tooltip_text(Some("Toggle layers panel"));
+    toggle_layers.set_valign(gtk::Align::Center);
+    let rev_c = revealer.clone();
+    toggle_layers.connect_clicked(move |_| {
+        rev_c.set_reveal_child(!rev_c.reveals_child());
+    });
+
+    let st_tl = state.clone();
+    let cv_tl = canvas_cell.clone();
+    revealer.connect_child_revealed_notify(move |_| {
+        zoom_to_fit(&st_tl, &cv_tl);
+        queue_canvas(&cv_tl);
+    });
+
+    let split = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    split.append(&editor);
+    split.append(&revealer);
 
     let menu_model = build_menu(
         &window,
@@ -1720,6 +1778,7 @@ fn build_ui(app: &Application) {
 
     let header = libadwaita::HeaderBar::new();
     header.pack_start(&menubar);
+    header.pack_end(&toggle_layers);
     header.set_title_widget(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
 
     let toolbar_view = libadwaita::ToolbarView::new();

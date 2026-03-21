@@ -2,7 +2,7 @@ mod composite;
 mod history;
 pub mod layer;
 
-pub use composite::{composite_layers, premul_to_straight_rgba, straight_to_premul};
+pub use composite::{blend_layer_premul, composite_layers, premul_to_straight_rgba, straight_to_premul};
 pub use history::History;
 pub use layer::{BlendMode, Layer};
 
@@ -216,12 +216,27 @@ impl Document {
     }
 
     pub fn remove_layer(&mut self, index: usize) -> bool {
-        if self.layers.len() <= 1 {
+        if self.layers.len() <= 1 || index >= self.layers.len() {
             return false;
         }
-        if index >= self.layers.len() {
+        self.layers.remove(index);
+        if self.active_layer >= self.layers.len() {
+            self.active_layer = self.layers.len() - 1;
+        } else if self.active_layer > index {
+            self.active_layer -= 1;
+        }
+        true
+    }
+
+    /// Merge the layer at `index` into the layer below, then remove it.
+    /// Returns false if index is 0 (nothing below) or only one layer exists.
+    pub fn merge_down(&mut self, index: usize) -> bool {
+        if index == 0 || self.layers.len() <= 1 || index >= self.layers.len() {
             return false;
         }
+        let top = self.layers[index].clone();
+        let dst = &mut self.layers[index - 1];
+        blend_layer_premul(&mut dst.pixels, &top.pixels, top.opacity, top.blend);
         self.layers.remove(index);
         if self.active_layer >= self.layers.len() {
             self.active_layer = self.layers.len() - 1;

@@ -17,7 +17,7 @@ pub fn composite_layers(width: u32, height: u32, layers: &[Layer]) -> Vec<u8> {
     out
 }
 
-fn blend_layer_premul(dst: &mut [u8], src: &[u8], opacity: f32, mode: BlendMode) {
+pub fn blend_layer_premul(dst: &mut [u8], src: &[u8], opacity: f32, mode: BlendMode) {
     let op = opacity as f32;
     for i in (0..dst.len()).step_by(4) {
         let cb = dst[i] as f32;
