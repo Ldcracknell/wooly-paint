@@ -92,6 +92,26 @@ impl Document {
         true
     }
 
+    pub fn resize_canvas(&mut self, new_w: u32, new_h: u32) {
+        let copy_w = self.width.min(new_w);
+        let copy_h = self.height.min(new_h);
+        for layer in &mut self.layers {
+            let mut new_pixels = vec![0u8; (new_w * new_h * 4) as usize];
+            for y in 0..copy_h {
+                let old_start = (y * self.width * 4) as usize;
+                let new_start = (y * new_w * 4) as usize;
+                let len = (copy_w * 4) as usize;
+                new_pixels[new_start..new_start + len]
+                    .copy_from_slice(&layer.pixels[old_start..old_start + len]);
+            }
+            layer.pixels = new_pixels;
+            layer.width = new_w;
+            layer.height = new_h;
+        }
+        self.width = new_w;
+        self.height = new_h;
+    }
+
     pub fn move_layer(&mut self, from: usize, to: usize) {
         if from >= self.layers.len() || to >= self.layers.len() || from == to {
             return;

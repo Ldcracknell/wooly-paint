@@ -717,6 +717,168 @@ fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
     }
 }
 
+fn paste_image_data(state: &SharedState, tool_dd_cell: &ToolDdCell, w: u32, h: u32, premul_data: Vec<u8>) {
+    let mut st = state.borrow_mut();
+    commit_floating(&mut st);
+    let doc_w = st.doc.width as i32;
+    let doc_h = st.doc.height as i32;
+    let x = ((doc_w - w as i32) / 2).max(0) as f64;
+    let y = ((doc_h - h as i32) / 2).max(0) as f64;
+    st.floating = Some(FloatingSelection { w: w as i32, h: h as i32, data: premul_data, x, y });
+    st.selection = None;
+    st.tool = ToolKind::Move;
+    drop(st);
+    if let Some(ref dd) = *tool_dd_cell.borrow() {
+        dd.set_selected(9);
+    }
+}
+
+fn show_paste_oversize_dialog(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    tool_dd_cell: &ToolDdCell,
+    canvas_cell: &CanvasCell,
+    layers_cell: &LayersCell,
+    img_w: u32,
+    img_h: u32,
+    premul_data: Vec<u8>,
+) {
+    let doc_w = state.borrow().doc.width;
+    let doc_h = state.borrow().doc.height;
+    let data = Rc::new(premul_data);
+
+    let d = libadwaita::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Paste image")
+        .default_width(400)
+        .default_height(160)
+        .build();
+
+    let msg = gtk::Label::new(Some(&format!(
+        "Image ({img_w}×{img_h}) is larger than the canvas ({doc_w}×{doc_h})."
+    )));
+    msg.set_wrap(true);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let paste_anyway = gtk::Button::with_label("Paste anyway");
+    let expand = gtk::Button::with_label("Expand canvas");
+    expand.add_css_class("suggested-action");
+
+    let btn_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    btn_row.append(&cancel);
+    btn_row.append(&paste_anyway);
+    btn_row.append(&expand);
+
+    let bx = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
+        .spacing(16)
+        .build();
+    bx.append(&msg);
+    bx.append(&btn_row);
+    d.set_content(Some(&bx));
+
+    let dw = d.clone();
+    cancel.connect_clicked(move |_| dw.close());
+
+    let st = state.clone();
+    let td = tool_dd_cell.clone();
+    let cv = canvas_cell.clone();
+    let data_c = data.clone();
+    let dw = d.clone();
+    paste_anyway.connect_clicked(move |_| {
+        paste_image_data(&st, &td, img_w, img_h, (*data_c).clone());
+        queue_canvas(&cv);
+        dw.close();
+    });
+
+    let st = state.clone();
+    let td = tool_dd_cell.clone();
+    let cv = canvas_cell.clone();
+    let lc = layers_cell.clone();
+    let dw = d.clone();
+    expand.connect_clicked(move |_| {
+        {
+            let mut s = st.borrow_mut();
+            let new_w = s.doc.width.max(img_w);
+            let new_h = s.doc.height.max(img_h);
+            s.doc.resize_canvas(new_w, new_h);
+            s.history.clear();
+        }
+        paste_image_data(&st, &td, img_w, img_h, (*data).clone());
+        refresh_layers_list(&st, &lc, &cv);
+        queue_canvas(&cv);
+        dw.close();
+    });
+
+    d.present();
+}
+
+fn try_paste_system_clipboard(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    tool_dd_cell: &ToolDdCell,
+    canvas_cell: &CanvasCell,
+    layers_cell: &LayersCell,
+) {
+    let Some(display) = gdk::Display::default() else {
+        paste_clipboard_center(state, tool_dd_cell);
+        queue_canvas(canvas_cell);
+        return;
+    };
+    let clipboard = display.clipboard();
+
+    let win = window.clone();
+    let st = state.clone();
+    let td = tool_dd_cell.clone();
+    let cv = canvas_cell.clone();
+    let lc = layers_cell.clone();
+
+    clipboard.read_texture_async(
+        None::<&gio::Cancellable>,
+        move |result| {
+            match result {
+                Ok(Some(texture)) => {
+                    let png_bytes = texture.save_to_png_bytes();
+                    match image::load_from_memory(&png_bytes) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let (iw, ih) = rgba.dimensions();
+                            let premul = straight_to_premul(rgba.as_raw());
+
+                            let doc_w = st.borrow().doc.width;
+                            let doc_h = st.borrow().doc.height;
+
+                            if iw > doc_w || ih > doc_h {
+                                show_paste_oversize_dialog(&win, &st, &td, &cv, &lc, iw, ih, premul);
+                            } else {
+                                paste_image_data(&st, &td, iw, ih, premul);
+                                queue_canvas(&cv);
+                            }
+                        }
+                        Err(_) => {
+                            paste_clipboard_center(&st, &td);
+                            queue_canvas(&cv);
+                        }
+                    }
+                }
+                _ => {
+                    paste_clipboard_center(&st, &td);
+                    queue_canvas(&cv);
+                }
+            }
+        },
+    );
+}
+
 fn apply_brightness_contrast(state: &SharedState, brightness: f32, contrast: f32) {
     let mut st = state.borrow_mut();
     let idx = st.doc.active_layer;
@@ -1264,8 +1426,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::v | gdk::Key::V if ctrl => {
-                paste_clipboard_center(&st_k, &td_k);
-                queue_canvas(&cv_k);
+                try_paste_system_clipboard(&win_k, &st_k, &td_k, &cv_k, &lc_k);
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
@@ -1391,10 +1552,11 @@ fn build_menu(
     let st = state.clone();
     let cv = canvas.clone();
     let td_p = tool_dd_cell.clone();
+    let lc_p = layers_cell.clone();
+    let w_p = window.clone();
     let paste_act = gio::SimpleAction::new("paste", None);
     paste_act.connect_activate(move |_, _| {
-        paste_clipboard_center(&st, &td_p);
-        queue_canvas(&cv);
+        try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p);
     });
     app_add_action(window, &paste_act);
 
