@@ -963,14 +963,39 @@ fn open_file(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
 ) {
-    let dlg = gtk::FileDialog::new();
+    let all_filter = gtk::FileFilter::new();
+    all_filter.set_name(Some("All supported (*.png, *.ora)"));
+    all_filter.add_pattern("*.png");
+    all_filter.add_pattern("*.ora");
+    let png_filter = gtk::FileFilter::new();
+    png_filter.set_name(Some("PNG image (*.png)"));
+    png_filter.add_pattern("*.png");
+    let ora_filter = gtk::FileFilter::new();
+    ora_filter.set_name(Some("OpenRaster (*.ora)"));
+    ora_filter.add_pattern("*.ora");
+
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&all_filter);
+    filters.append(&png_filter);
+    filters.append(&ora_filter);
+
+    let dlg = gtk::FileDialog::builder()
+        .title("Open image")
+        .modal(true)
+        .filters(&filters)
+        .default_filter(&all_filter)
+        .build();
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
     dlg.open(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
             if let Some(path) = file.path() {
-                match Document::load_png(&path) {
+                let result = match path.extension().and_then(|e| e.to_str()) {
+                    Some("ora") => Document::load_ora(&path),
+                    _ => Document::load_png(&path),
+                };
+                match result {
                     Ok(doc) => {
                         let mut g = st.borrow_mut();
                         g.doc = doc;
@@ -999,18 +1024,38 @@ fn save_file_as(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
 ) {
+    let png_filter = gtk::FileFilter::new();
+    png_filter.set_name(Some("PNG image (*.png)"));
+    png_filter.add_pattern("*.png");
+    let ora_filter = gtk::FileFilter::new();
+    ora_filter.set_name(Some("OpenRaster (*.ora)"));
+    ora_filter.add_pattern("*.ora");
+
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&png_filter);
+    filters.append(&ora_filter);
+
     let dlg = gtk::FileDialog::builder()
         .title("Save image")
         .modal(true)
+        .filters(&filters)
+        .default_filter(&png_filter)
         .build();
     let st = state.clone();
     let cv = canvas.clone();
     let _lc = layers_cell.clone();
     dlg.save(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
-            if let Some(path) = file.path() {
+            if let Some(mut path) = file.path() {
+                if path.extension().is_none() {
+                    path.set_extension("png");
+                }
                 let mut g = st.borrow_mut();
-                if let Err(e) = g.doc.save_png(&path) {
+                let result = match path.extension().and_then(|e| e.to_str()) {
+                    Some("ora") => g.doc.save_ora(&path),
+                    _ => g.doc.save_png(&path),
+                };
+                if let Err(e) = result {
                     eprintln!("Save failed: {e}");
                 } else {
                     g.doc.path = Some(path);
@@ -1032,7 +1077,11 @@ fn save_file(
     let path_opt = state.borrow().doc.path.clone();
     if let Some(path) = path_opt {
         let mut g = state.borrow_mut();
-        if let Err(e) = g.doc.save_png(&path) {
+        let result = match path.extension().and_then(|e| e.to_str()) {
+            Some("ora") => g.doc.save_ora(&path),
+            _ => g.doc.save_png(&path),
+        };
+        if let Err(e) = result {
             eprintln!("Save failed: {e}");
         } else {
             g.modified = false;

@@ -9,3 +9,4 @@ libadwaita = { version = "0.9", features = ["v1_5"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 anyhow = "1.0"
 gdk-pixbuf = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }

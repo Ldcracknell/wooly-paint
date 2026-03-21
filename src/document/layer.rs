@@ -13,6 +13,22 @@ impl BlendMode {
             BlendMode::Add => "Add",
         }
     }
+
+    pub fn ora_composite_op(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "svg:src-over",
+            BlendMode::Multiply => "svg:multiply",
+            BlendMode::Add => "svg:plus",
+        }
+    }
+
+    pub fn from_ora(s: &str) -> Self {
+        match s {
+            "svg:multiply" => BlendMode::Multiply,
+            "svg:plus" => BlendMode::Add,
+            _ => BlendMode::Normal,
+        }
+    }
 }
 
 /// Premultiplied RGBA8, `width * height * 4` bytes.
