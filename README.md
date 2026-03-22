@@ -1,9 +1,10 @@
 # wooly-paint
-this was made entirely with 4.6 and cursor's composer 2 (i have not read a single line of code)
-
-![wooly-paint GUI](./src/assets/gui-example.png)
-
+this was made entirely with 4.6 and cursor's composer 2
+(i have not read a single line of code)
 this is also completely untested on anything but arch
+
+![wooly-paint GUI image](./src/assets/gui-example.png)
+icon made in its own app lmao
 
 # _
 
