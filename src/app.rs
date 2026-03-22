@@ -794,7 +794,19 @@ fn copy_selection(state: &SharedState) {
         return;
     };
     let data = copy_rect(layer, sx, sy, sw, sh);
-    st.clipboard = Some((sw, sh, data));
+    st.clipboard = Some((sw, sh, data.clone()));
+
+    let straight = premul_to_straight_rgba(&data);
+    let bytes = glib::Bytes::from_owned(straight);
+    let texture = gdk::MemoryTexture::new(
+        sw, sh,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        (sw * 4) as usize,
+    );
+    if let Some(display) = gdk::Display::default() {
+        display.clipboard().set_texture(&texture);
+    }
 }
 
 fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
