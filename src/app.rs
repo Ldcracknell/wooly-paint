@@ -11,9 +11,11 @@ use libadwaita::prelude::*;
 use libadwaita::{Application, ColorScheme};
 use gdk_pixbuf::Pixbuf;
 use gtk::gdk;
+use gtk::gdk::prelude::ToplevelExt;
 use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gio;
 use gtk::glib;
+use gtk::glib::prelude::Cast;
 #[allow(deprecated)]
 use gtk::prelude::ColorChooserExt;
 use gtk::gio::prelude::ApplicationExt as GioApplicationExt;
@@ -61,6 +63,26 @@ fn queue_canvas(canvas: &CanvasCell) {
     if let Some(ref c) = *canvas.borrow() {
         c.queue_draw();
     }
+}
+
+/// App icon from `src/assets/icon.png` (embedded at compile time).
+fn embedded_app_icon_texture() -> Option<gdk::Texture> {
+    static ICON_PNG: &[u8] = include_bytes!("assets/icon.png");
+    let bytes = glib::Bytes::from_static(ICON_PNG);
+    gdk::Texture::from_bytes(&bytes).ok()
+}
+
+fn apply_taskbar_icon(native: &impl gtk::prelude::IsA<gtk::Native>) {
+    let Some(texture) = embedded_app_icon_texture() else {
+        return;
+    };
+    let Some(surface) = native.surface() else {
+        return;
+    };
+    let Some(toplevel) = surface.dynamic_cast_ref::<gdk::Toplevel>() else {
+        return;
+    };
+    toplevel.set_icon_list(std::slice::from_ref(&texture));
 }
 
 /// Straight RGBA presets shown in the sidebar (black/white, then rainbow, then grays, brown).
@@ -1825,6 +1847,9 @@ fn build_ui(app: &Application) {
         .default_height(750)
         .build();
 
+    let win_for_icon = window.clone();
+    window.connect_realize(move |_| apply_taskbar_icon(&win_for_icon));
+
     let state: SharedState = Rc::new(RefCell::new(AppState::new()));
     let canvas_cell: CanvasCell = Rc::new(RefCell::new(None));
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
@@ -2241,7 +2266,21 @@ fn build_ui(app: &Application) {
     let header = libadwaita::HeaderBar::new();
     header.pack_start(&menubar);
     header.pack_end(&toggle_layers);
-    header.set_title_widget(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
+    let title_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .valign(gtk::Align::Center)
+        .build();
+    if let Some(tex) = embedded_app_icon_texture() {
+        let icon = gtk::Image::from_paintable(Some(&tex));
+        icon.set_pixel_size(24);
+        icon.set_valign(gtk::Align::Center);
+        title_row.append(&icon);
+    }
+    let window_title = libadwaita::WindowTitle::new("Wooly Paint", "");
+    window_title.set_valign(gtk::Align::Center);
+    title_row.append(&window_title);
+    header.set_title_widget(Some(&title_row));
 
     let toolbar_view = libadwaita::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
