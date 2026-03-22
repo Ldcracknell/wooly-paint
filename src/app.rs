@@ -16,6 +16,9 @@ use gtk::gio;
 use gtk::glib;
 #[allow(deprecated)]
 use gtk::prelude::ColorChooserExt;
+use gtk::gio::prelude::ApplicationExt as GioApplicationExt;
+use gtk::prelude::DrawingAreaExtManual;
+use gtk::prelude::WidgetExtManual;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -641,16 +644,20 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
     let len = (w * h * 4) as usize;
     let stride = (w * 4) as i32;
 
-    let bytes = {
+    let pixbuf = {
         let mut st = state.borrow_mut();
         let use_cache = !st.brush_stroke_in_progress
             && st.composite_cache_at_revision == st.document_visual_revision
-            && st.composite_cache_straight.len() == len;
+            && st.composite_cache_pixbuf.as_ref().is_some_and(|pb| {
+                pb.width() == w as i32 && pb.height() == h as i32
+            });
         if !use_cache {
+            st.composite_cache_pixbuf = None;
             let AppState {
                 ref doc,
                 ref mut composite_cache_premul,
                 ref mut composite_cache_straight,
+                ref mut composite_cache_pixbuf,
                 ref mut composite_cache_at_revision,
                 document_visual_revision,
                 ..
@@ -660,19 +667,23 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             composite_cache_straight.resize(len, 0);
             premul_to_straight_rgba_into(composite_cache_straight, composite_cache_premul);
             *composite_cache_at_revision = *document_visual_revision;
+            let straight = std::mem::take(composite_cache_straight);
+            let bytes = glib::Bytes::from_owned(straight);
+            *composite_cache_pixbuf = Some(Pixbuf::from_bytes(
+                &bytes,
+                gdk_pixbuf::Colorspace::Rgb,
+                true,
+                8,
+                w as i32,
+                h as i32,
+                stride,
+            ));
         }
-        glib::Bytes::from_owned(st.composite_cache_straight.clone())
+        st.composite_cache_pixbuf
+            .as_ref()
+            .expect("composite pixbuf after rebuild")
+            .clone()
     };
-
-    let pixbuf = Pixbuf::from_bytes(
-        &bytes,
-        gdk_pixbuf::Colorspace::Rgb,
-        true,
-        8,
-        w as i32,
-        h as i32,
-        stride,
-    );
 
     cr.save().unwrap();
     cr.translate(pan_x, pan_y);
@@ -1836,7 +1847,8 @@ fn build_ui(app: &Application) {
     let cv_tick = canvas_cell.clone();
     let last_march = Rc::new(RefCell::new(0i64));
     let lm = last_march.clone();
-    drawing_area.add_tick_callback(move |_w, _clock| {
+    let tick_slot = Rc::new(RefCell::new(None::<gtk::TickCallbackId>));
+    let tick_id = drawing_area.add_tick_callback(move |_w, _clock| {
         let st = st_tick.borrow();
         if st.selection.is_some() {
             let now = glib::monotonic_time();
@@ -1848,6 +1860,7 @@ fn build_ui(app: &Application) {
         }
         glib::ControlFlow::Continue
     });
+    *tick_slot.borrow_mut() = Some(tick_id);
 
     let recent_colors_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -2325,6 +2338,19 @@ fn build_ui(app: &Application) {
         }
     });
     window.add_controller(key);
+
+    let st_shutdown = state.clone();
+    let da_shutdown = drawing_area.clone();
+    let preview_shutdown = preview_da.clone();
+    let tick_shutdown = tick_slot.clone();
+    app.connect_shutdown(move |_app| {
+        if let Some(h) = tick_shutdown.borrow_mut().take() {
+            h.remove();
+        }
+        da_shutdown.unset_draw_func();
+        preview_shutdown.unset_draw_func();
+        st_shutdown.borrow_mut().release_drawing_caches();
+    });
 
     window.present();
 

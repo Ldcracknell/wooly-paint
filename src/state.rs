@@ -1,5 +1,6 @@
 use crate::document::{Document, History};
 use crate::tools::ToolKind;
+use gdk_pixbuf::Pixbuf;
 
 #[derive(Clone)]
 pub struct FloatingSelection {
@@ -40,7 +41,10 @@ pub struct AppState {
     pub document_visual_revision: u64,
     /// Cached full-document composite (premultiplied RGBA), valid when `composite_cache_at_revision == document_visual_revision`.
     pub composite_cache_premul: Vec<u8>,
+    /// Scratch for straight RGBA while rebuilding the composite; moved into `glib::Bytes` when the cache is refreshed (often empty while cache hit).
     pub composite_cache_straight: Vec<u8>,
+    /// Full-document composite for drawing; pixel data lives here between paints (not duplicated in `composite_cache_straight`).
+    pub composite_cache_pixbuf: Option<Pixbuf>,
     pub composite_cache_at_revision: u64,
     /// While true, composite cache is not used (pixels change every event during brush/pixel/eraser stroke).
     pub brush_stroke_in_progress: bool,
@@ -90,6 +94,7 @@ impl AppState {
             document_visual_revision: 0,
             composite_cache_premul: Vec::new(),
             composite_cache_straight: Vec::new(),
+            composite_cache_pixbuf: None,
             composite_cache_at_revision: u64::MAX,
             brush_stroke_in_progress: false,
         }
@@ -98,6 +103,16 @@ impl AppState {
     /// Invalidate composite cache (call after any change that affects flattened pixels or layer stack).
     pub fn bump_document_revision(&mut self) {
         self.document_visual_revision = self.document_visual_revision.wrapping_add(1);
+    }
+
+    /// Drop GPU-adjacent composite caches on application shutdown so heap blocks are freed before exit.
+    pub fn release_drawing_caches(&mut self) {
+        self.composite_cache_pixbuf = None;
+        self.composite_cache_premul.clear();
+        self.composite_cache_premul.shrink_to_fit();
+        self.composite_cache_straight.clear();
+        self.composite_cache_straight.shrink_to_fit();
+        self.composite_cache_at_revision = u64::MAX;
     }
 
     pub fn widget_to_doc(&self, wx: f64, wy: f64) -> (f64, f64) {
