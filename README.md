@@ -1,7 +1,5 @@
 # wooly-paint
-
-this was made entirely with 4.6 and cursor's composer 2
-(i have not read a single line of code)
+this was made entirely with 4.6 and cursor's composer 2 (i have not read a single line of code)
 
 # _
 
@@ -48,12 +46,6 @@ bash scripts/package-windows-release.sh
 ```bash
 cargo build --release
 ./target/release/wooly-paint
-```
-
-Or during development:
-
-```bash
-cargo run
 ```
 
 On non-Windows targets, the build writes `target/<profile>/wooly-paint.desktop` next to the binary so you can launch from a file manager with the correct working directory and icon.
