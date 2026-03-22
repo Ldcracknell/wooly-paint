@@ -7,6 +7,8 @@ this is also completely untested on anything but arch
 icon made in its own app lmao
 
 # _
+everything below here is ai generated, trust it as much as you like
+# _
 
 A small raster paint program for the desktop, built with [GTK 4](https://gtk.org/) and [libadwaita](https://gnome.pages.gitlab.gnome.org/libadwaita/). It supports layered documents, common drawing tools, and follows your system light/dark preference.
 
