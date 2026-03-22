@@ -2,7 +2,10 @@ mod composite;
 mod history;
 pub mod layer;
 
-pub use composite::{blend_layer_premul, composite_layers, premul_to_straight_rgba, straight_to_premul};
+pub use composite::{
+    blend_layer_premul, composite_layers, composite_layers_into, premul_to_straight_rgba,
+    premul_to_straight_rgba_into, straight_to_premul,
+};
 pub use history::History;
 pub use layer::{BlendMode, Layer};
 

@@ -34,6 +34,14 @@ pub struct AppState {
     pub tool_keybinds: Vec<(ToolKind, Option<char>)>,
     /// Most recently used foreground colors (straight RGBA), newest first; at most 4 kept.
     pub recent_colors: Vec<[u8; 4]>,
+    /// Bumped when layer pixels, stack, visibility, opacity, or canvas size change (not selection/pan/zoom).
+    pub document_visual_revision: u64,
+    /// Cached full-document composite (premultiplied RGBA), valid when `composite_cache_at_revision == document_visual_revision`.
+    pub composite_cache_premul: Vec<u8>,
+    pub composite_cache_straight: Vec<u8>,
+    pub composite_cache_at_revision: u64,
+    /// While true, composite cache is not used (pixels change every event during brush/pixel/eraser stroke).
+    pub brush_stroke_in_progress: bool,
 }
 
 impl AppState {
@@ -76,7 +84,17 @@ impl AppState {
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),
             recent_colors: Vec::new(),
+            document_visual_revision: 0,
+            composite_cache_premul: Vec::new(),
+            composite_cache_straight: Vec::new(),
+            composite_cache_at_revision: u64::MAX,
+            brush_stroke_in_progress: false,
         }
+    }
+
+    /// Invalidate composite cache (call after any change that affects flattened pixels or layer stack).
+    pub fn bump_document_revision(&mut self) {
+        self.document_visual_revision = self.document_visual_revision.wrapping_add(1);
     }
 
     pub fn widget_to_doc(&self, wx: f64, wy: f64) -> (f64, f64) {
@@ -95,6 +113,7 @@ impl AppState {
                 if layer.pixels != before {
                     self.history.commit_change(idx, before);
                     self.modified = true;
+                    self.bump_document_revision();
                 }
             }
         }
@@ -103,6 +122,7 @@ impl AppState {
     pub fn undo(&mut self) -> bool {
         if self.history.undo(&mut self.doc) {
             self.modified = true;
+            self.bump_document_revision();
             true
         } else {
             false
@@ -112,6 +132,7 @@ impl AppState {
     pub fn redo(&mut self) -> bool {
         if self.history.redo(&mut self.doc) {
             self.modified = true;
+            self.bump_document_revision();
             true
         } else {
             false

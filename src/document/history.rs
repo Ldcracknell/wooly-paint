@@ -1,5 +1,8 @@
 use super::Document;
 
+/// Maximum undo steps retained (oldest dropped). Bounds memory from unbounded layer buffer copies.
+const MAX_UNDO_ENTRIES: usize = 64;
+
 #[derive(Clone)]
 pub struct LayerUndoEntry {
     pub layer_index: usize,
@@ -27,6 +30,9 @@ impl History {
 
     /// `before` is the layer pixel buffer before the edit; call after the edit is applied.
     pub fn commit_change(&mut self, layer_index: usize, before: Vec<u8>) {
+        if self.undo.len() >= MAX_UNDO_ENTRIES {
+            self.undo.remove(0);
+        }
         self.undo.push(LayerUndoEntry {
             layer_index,
             pixels: before,

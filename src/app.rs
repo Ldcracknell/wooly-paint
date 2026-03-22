@@ -1,4 +1,7 @@
-use crate::document::{premul_to_straight_rgba, straight_to_premul, Document};
+use crate::document::{
+    composite_layers_into, premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul,
+    Document,
+};
 use crate::state::{AppState, FloatingSelection};
 use crate::tools::{
     clear_rect, copy_rect, draw_ellipse, draw_rect_outline, flood_fill, paste_rect,
@@ -13,6 +16,7 @@ use gtk::gio;
 use gtk::glib;
 #[allow(deprecated)]
 use gtk::prelude::ColorChooserExt;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -370,6 +374,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             if let Some(l) = g.doc.layers.get_mut(i) {
                 l.visible = active;
                 g.modified = true;
+                g.bump_document_revision();
             }
             queue_canvas(&cv);
             glib::Propagation::Proceed
@@ -382,6 +387,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             if let Some(l) = g.doc.layers.get_mut(i) {
                 l.opacity = (a.value() / 100.0) as f32;
                 g.modified = true;
+                g.bump_document_revision();
             }
             queue_canvas(&cv);
         });
@@ -392,8 +398,12 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         let idx = i;
         up.connect_clicked(move |_| {
             if idx > 0 {
-                st.borrow_mut().doc.move_layer(idx, idx - 1);
+                let mut g = st.borrow_mut();
+                g.doc.move_layer(idx, idx - 1);
+                g.bump_document_revision();
+                drop(g);
                 refresh_layers_list(&st, &lc2, &cv2);
+                queue_canvas(&cv2);
             }
         });
 
@@ -405,8 +415,10 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             let mut g = st.borrow_mut();
             if idx_d + 1 < g.doc.layers.len() {
                 g.doc.move_layer(idx_d, idx_d + 1);
+                g.bump_document_revision();
                 drop(g);
                 refresh_layers_list(&st, &lc3, &cv3);
+                queue_canvas(&cv3);
             }
         });
 
@@ -419,6 +431,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             if g.doc.merge_down(idx_merge) {
                 g.history.clear();
                 g.modified = true;
+                g.bump_document_revision();
                 drop(g);
                 refresh_layers_list(&st, &lc4, &cv4);
                 queue_canvas(&cv4);
@@ -477,6 +490,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
                 if g.doc.remove_layer(idx_del) {
                     g.history.clear();
                     g.modified = true;
+                    g.bump_document_revision();
                     drop(g);
                     refresh_layers_list(&st2, &lc, &cv);
                     queue_canvas(&cv);
@@ -497,14 +511,75 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
     }
 }
 
+thread_local! {
+    static TRANSPARENCY_CHECKER: RefCell<Option<gtk::cairo::SurfacePattern>> = const { RefCell::new(None) };
+}
+
+/// 16×16 tile (8px checker cells), repeated — avoids O((W/8)²) cairo rectangles per frame.
+fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)) {
+    TRANSPARENCY_CHECKER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let surf = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 16, 16).unwrap();
+            let crc = gtk::cairo::Context::new(&surf).unwrap();
+            crc.set_source_rgb(0.93, 0.93, 0.93);
+            crc.paint().unwrap();
+            crc.set_source_rgb(0.78, 0.78, 0.78);
+            for ry in 0..2i32 {
+                for rx in 0..2i32 {
+                    if (rx + ry) % 2 == 1 {
+                        crc.rectangle(rx as f64 * 8.0, ry as f64 * 8.0, 8.0, 8.0);
+                    }
+                }
+            }
+            crc.fill().unwrap();
+            let p = gtk::cairo::SurfacePattern::create(surf);
+            p.set_extend(gtk::cairo::Extend::Repeat);
+            *slot = Some(p);
+        }
+        f(slot.as_ref().unwrap());
+    });
+}
+
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
-    let st = state.borrow();
-    let w = st.doc.width;
-    let h = st.doc.height;
-    let comp = st.doc.composite();
-    let straight = premul_to_straight_rgba(&comp);
+    let (w, h, pan_x, pan_y, zoom, floating, selection) = {
+        let st = state.borrow();
+        (
+            st.doc.width,
+            st.doc.height,
+            st.pan_x,
+            st.pan_y,
+            st.zoom,
+            st.floating.clone(),
+            st.selection,
+        )
+    };
+    let len = (w * h * 4) as usize;
     let stride = (w * 4) as i32;
-    let bytes = glib::Bytes::from_owned(straight);
+
+    let bytes = {
+        let mut st = state.borrow_mut();
+        let use_cache = !st.brush_stroke_in_progress
+            && st.composite_cache_at_revision == st.document_visual_revision
+            && st.composite_cache_straight.len() == len;
+        if !use_cache {
+            let AppState {
+                ref doc,
+                ref mut composite_cache_premul,
+                ref mut composite_cache_straight,
+                ref mut composite_cache_at_revision,
+                document_visual_revision,
+                ..
+            } = &mut *st;
+            composite_cache_premul.resize(len, 0);
+            composite_layers_into(composite_cache_premul, doc.width, doc.height, &doc.layers);
+            composite_cache_straight.resize(len, 0);
+            premul_to_straight_rgba_into(composite_cache_straight, composite_cache_premul);
+            *composite_cache_at_revision = *document_visual_revision;
+        }
+        glib::Bytes::from_owned(st.composite_cache_straight.clone())
+    };
+
     let pixbuf = Pixbuf::from_bytes(
         &bytes,
         gdk_pixbuf::Colorspace::Rgb,
@@ -516,29 +591,20 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
     );
 
     cr.save().unwrap();
-    cr.translate(st.pan_x, st.pan_y);
-    cr.scale(st.zoom, st.zoom);
+    cr.translate(pan_x, pan_y);
+    cr.scale(zoom, zoom);
     cr.rectangle(0.0, 0.0, w as f64, h as f64);
     cr.clip();
-    let cs = 8.0_f64;
-    cr.set_source_rgb(0.93, 0.93, 0.93);
-    cr.paint().unwrap();
-    cr.set_source_rgb(0.78, 0.78, 0.78);
-    for ry in 0..(h as f64 / cs).ceil() as i32 {
-        for rx in 0..(w as f64 / cs).ceil() as i32 {
-            if (rx + ry) % 2 == 0 {
-                continue;
-            }
-            cr.rectangle(rx as f64 * cs, ry as f64 * cs, cs, cs);
-        }
-    }
-    cr.fill().unwrap();
+    with_transparency_checker_pattern(|pat| {
+        cr.set_source(pat).unwrap();
+        cr.paint().unwrap();
+    });
     cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
     cr.source().set_filter(gtk::cairo::Filter::Nearest);
     cr.paint().unwrap();
     cr.restore().unwrap();
 
-    if let Some(ref f) = st.floating {
+    if let Some(ref f) = floating {
         let fs = premul_to_straight_rgba(&f.data);
         let fw = f.w.max(1);
         let fh = f.h.max(1);
@@ -552,8 +618,8 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             fw * 4,
         );
         cr.save().unwrap();
-        cr.translate(st.pan_x, st.pan_y);
-        cr.scale(st.zoom, st.zoom);
+        cr.translate(pan_x, pan_y);
+        cr.scale(zoom, zoom);
         cr.translate(f.x, f.y);
         cr.set_source_pixbuf(&pb, 0.0, 0.0);
         cr.source().set_filter(gtk::cairo::Filter::Nearest);
@@ -561,13 +627,13 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.restore().unwrap();
     }
 
-    if let Some((sx, sy, sw, sh)) = st.selection {
+    if let Some((sx, sy, sw, sh)) = selection {
         cr.save().unwrap();
-        cr.translate(st.pan_x, st.pan_y);
-        cr.scale(st.zoom, st.zoom);
+        cr.translate(pan_x, pan_y);
+        cr.scale(zoom, zoom);
         let phase = (glib::monotonic_time() / 50000) % 20;
         cr.set_dash(&[6.0, 6.0], phase as f64);
-        cr.set_line_width(1.0 / st.zoom.max(0.001));
+        cr.set_line_width(1.0 / zoom.max(0.001));
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
         cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
         cr.stroke().unwrap();
@@ -607,6 +673,7 @@ fn commit_floating(state: &mut AppState) {
     if layer.pixels != before {
         state.history.commit_change(idx, before);
         state.modified = true;
+        state.bump_document_revision();
     }
 }
 
@@ -639,6 +706,7 @@ fn setup_canvas_input(
                 let eraser = st.tool == ToolKind::Eraser;
                 let radius = st.brush_size * 0.5;
                 let hardness = st.brush_hardness;
+                st.brush_stroke_in_progress = true;
                 st.begin_stroke_undo();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
@@ -652,6 +720,7 @@ fn setup_canvas_input(
             ToolKind::Pixel => {
                 let color = st.fg;
                 let size = st.brush_size;
+                st.brush_stroke_in_progress = true;
                 st.begin_stroke_undo();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
@@ -683,11 +752,21 @@ fn setup_canvas_input(
                 st.commit_stroke_undo();
             }
             ToolKind::Eyedropper => {
-                let comp = st.doc.composite();
+                let cw = st.doc.width;
+                let ch = st.doc.height;
+                let clen = (cw * ch * 4) as usize;
+                let premul: Cow<'_, [u8]> = if !st.brush_stroke_in_progress
+                    && st.composite_cache_at_revision == st.document_visual_revision
+                    && st.composite_cache_premul.len() == clen
+                {
+                    Cow::Borrowed(st.composite_cache_premul.as_slice())
+                } else {
+                    Cow::Owned(st.doc.composite())
+                };
                 let c = sample_composite_premul(
-                    &comp,
-                    st.doc.width,
-                    st.doc.height,
+                    premul.as_ref(),
+                    cw,
+                    ch,
                     dx.floor() as i32,
                     dy.floor() as i32,
                 );
@@ -720,6 +799,7 @@ fn setup_canvas_input(
                             clear_rect(layer, sx, sy, sw, sh);
                             let li = st.doc.active_layer;
                             st.history.commit_change(li, before);
+                            st.bump_document_revision();
                             st.floating = Some(FloatingSelection {
                                 w: sw,
                                 h: sh,
@@ -750,8 +830,9 @@ fn setup_canvas_input(
     });
 
     let st_drag_up = state.clone();
-    let cv_drag_up = canvas_cell.clone();
-    let cnv2 = canvas.clone();
+    let drag_coalesce = Rc::new(RefCell::new(false));
+    let cv_co = canvas_cell.clone();
+    let dco = drag_coalesce.clone();
     let bws_up = brush_widget_start.clone();
     let mws_u = move_widget_start.clone();
     drag.connect_drag_update(move |_g, ox, oy| {
@@ -833,8 +914,18 @@ fn setup_canvas_input(
             _ => {}
         }
         drop(st);
-        queue_canvas(&cv_drag_up);
-        cnv2.queue_draw();
+        if !*dco.borrow() {
+            *dco.borrow_mut() = true;
+            let cv = cv_co.clone();
+            let flg = dco.clone();
+            glib::idle_add_local_once(move || {
+                *flg.borrow_mut() = false;
+                queue_canvas(&cv);
+                if let Some(ref c) = *cv.borrow() {
+                    c.queue_draw();
+                }
+            });
+        }
     });
 
     let st_drag_end = state.clone();
@@ -848,6 +939,7 @@ fn setup_canvas_input(
             ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel => {
                 *bws_end.borrow_mut() = None;
                 st.commit_stroke_undo();
+                st.brush_stroke_in_progress = false;
                 st.last_doc_pos = None;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
@@ -978,6 +1070,7 @@ fn cut_selection(state: &SharedState) {
     st.history.commit_change(idx, before);
     st.selection = None;
     st.modified = true;
+    st.bump_document_revision();
 }
 
 fn copy_selection(state: &SharedState) {
@@ -1119,6 +1212,7 @@ fn show_paste_oversize_dialog(
             let new_h = s.doc.height.max(img_h);
             s.doc.resize_canvas(new_w, new_h);
             s.history.clear();
+            s.bump_document_revision();
         }
         paste_image_data(&st, &td, img_w, img_h, (*data).clone());
         zoom_to_fit(&st, &cv);
@@ -1234,6 +1328,7 @@ fn open_file(
                         g.modified = false;
                         g.selection = None;
                         g.floating = None;
+                        g.bump_document_revision();
                         drop(g);
                         zoom_to_fit(&st, &cv);
                         refresh_layers_list(&st, &lc, &cv);
@@ -1379,6 +1474,7 @@ fn new_document_dialog(
         g.selection = None;
         g.floating = None;
         g.modified = false;
+        g.bump_document_revision();
         drop(g);
         zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
@@ -1626,10 +1722,17 @@ fn build_ui(app: &Application) {
 
     let st_tick = state.clone();
     let cv_tick = canvas_cell.clone();
+    let last_march = Rc::new(RefCell::new(0i64));
+    let lm = last_march.clone();
     drawing_area.add_tick_callback(move |_w, _clock| {
         let st = st_tick.borrow();
-        if st.selection.is_some() || st.floating.is_some() {
-            queue_canvas(&cv_tick);
+        if st.selection.is_some() {
+            let now = glib::monotonic_time();
+            let mut last = lm.borrow_mut();
+            if now.saturating_sub(*last) >= 50_000 {
+                *last = now;
+                queue_canvas(&cv_tick);
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -1690,8 +1793,11 @@ fn build_ui(app: &Application) {
     let lc_al = layers_cell.clone();
     let cv_al = canvas_cell.clone();
     add_layer_btn.connect_clicked(move |_| {
-        st_al.borrow_mut().doc.add_layer();
-        st_al.borrow_mut().history.clear();
+        let mut g = st_al.borrow_mut();
+        g.doc.add_layer();
+        g.history.clear();
+        g.bump_document_revision();
+        drop(g);
         refresh_layers_list(&st_al, &lc_al, &cv_al);
         queue_canvas(&cv_al);
     });
