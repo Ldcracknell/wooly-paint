@@ -430,6 +430,7 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     let mws_b = move_widget_start.clone();
     let cb_drag = color_btn_cell.clone();
     drag.connect_drag_begin(move |_g, wx, wy| {
+        cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
         let (dx, dy) = st.widget_to_doc(wx, wy);
         let mut eyedropped = None;
@@ -1564,6 +1565,17 @@ fn build_ui(app: &Application) {
     size_adj.connect_value_changed(move |a| {
         st_sz.borrow_mut().brush_size = a.value();
     });
+    let cv_size = canvas_cell.clone();
+    let size_key = gtk::EventControllerKey::new();
+    size_key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    size_key.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            if let Some(ref da) = *cv_size.borrow() { da.grab_focus(); }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    size_spin.add_controller(size_key);
 
     let hard_adj = gtk::Adjustment::new(0.85, 0.0, 1.0, 0.01, 0.1, 0.0);
     let hard_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&hard_adj));
@@ -1580,6 +1592,17 @@ fn build_ui(app: &Application) {
     tol_adj.connect_value_changed(move |a| {
         st_t.borrow_mut().fill_tolerance = a.value() as u8;
     });
+    let cv_tol = canvas_cell.clone();
+    let tol_key = gtk::EventControllerKey::new();
+    tol_key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    tol_key.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            if let Some(ref da) = *cv_tol.borrow() { da.grab_focus(); }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    tol_spin.add_controller(tol_key);
 
     let fill_check = gtk::CheckButton::with_label("Filled shape");
     let st_f = state.clone();
@@ -1674,7 +1697,7 @@ fn build_ui(app: &Application) {
 
     let revealer = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideRight)
-        .reveal_child(true)
+        .reveal_child(false)
         .child(&layers_sidebar)
         .build();
 
