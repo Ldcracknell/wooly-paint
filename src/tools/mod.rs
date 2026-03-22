@@ -91,7 +91,7 @@ pub fn stamp_circle(
     let w = layer.width as i32;
     let h = layer.height as i32;
     let r = radius.max(0.5);
-    let inner = r * hardness.clamp(0.0, 1.0);
+    let hard = hardness.clamp(0.0, 1.0);
     let x0 = (cx - r - 1.0).floor() as i32;
     let y0 = (cy - r - 1.0).floor() as i32;
     let x1 = (cx + r + 1.0).ceil() as i32;
@@ -106,8 +106,16 @@ pub fn stamp_circle(
             if d > r {
                 continue;
             }
-            let alpha: f64 = ((r - d) / (r - inner).max(1e-6)).clamp(0.0, 1.0)
-                * color[3] as f64 / 255.0;
+            let u = (1.0 - d / r).clamp(0.0, 1.0);
+            if u <= 0.0 {
+                continue;
+            }
+            // Gamma ramps gently with hardness so mid-slider stays usable (no exponential 125^h).
+            let gamma = 0.42 + 19.5 * hard * hard;
+            let body = u.powf(gamma);
+            let lift = (1.0 - hard) * 0.22 * u;
+            let a_straight = (body + lift).min(1.0);
+            let alpha: f64 = a_straight * color[3] as f64 / 255.0;
             if alpha <= 0.0 {
                 continue;
             }
@@ -138,6 +146,13 @@ pub fn stamp_circle(
     }
 }
 
+fn brush_stroke_step(radius: f64, hardness: f64) -> f64 {
+    let h = hardness.clamp(0.0, 1.0);
+    let base = (radius * 0.35).max(0.5);
+    let tight = 0.04 + 0.96 * h * h;
+    (base * tight).max(0.05)
+}
+
 pub fn stroke_line(
     layer: &mut Layer,
     x0: f64,
@@ -152,9 +167,20 @@ pub fn stroke_line(
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len = (dx * dx + dy * dy).sqrt();
-    let step = (radius * 0.35).max(0.5);
-    let n = (len / step).ceil() as i32;
-    if n <= 0 {
+    if !len.is_finite() || len <= 1e-9 {
+        stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
+        return;
+    }
+    let r = radius.max(0.5);
+    let mut step = brush_stroke_step(radius, hardness);
+    step = step.min(r * 0.33).max(0.06);
+    let n_f = (len / step).ceil();
+    if !n_f.is_finite() || n_f <= 0.0 {
+        stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
+        return;
+    }
+    let n = (n_f as u64).min(2_000_000) as usize;
+    if n == 0 {
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
         return;
     }
@@ -424,11 +450,9 @@ fn ellipse_perimeter_approx(a: f64, b: f64) -> f64 {
 
 /// Number of angular steps for an outlined ellipse (`draw_ellipse` outline path).
 /// Matches perimeter-based spacing vs. brush radius so previews use the same polygon density.
-pub fn ellipse_outline_segment_count(rx: f64, ry: f64, brush_radius: f64) -> i32 {
+pub fn ellipse_outline_segment_count(rx: f64, ry: f64, brush_radius: f64, hardness: f64) -> i32 {
     let perim = ellipse_perimeter_approx(rx, ry);
-    // Same center-to-center spacing as `stroke_line` so stamps overlap → smooth outline
-    // (the old fixed max ~360 samples left large gaps on big ellipses).
-    let step = (brush_radius * 0.35).max(0.5);
+    let step = brush_stroke_step(brush_radius, hardness);
     ((perim / step).ceil() as i32).clamp(8, 48_000)
 }
 
@@ -470,7 +494,7 @@ pub fn draw_ellipse(
             }
         }
     } else {
-        let n = ellipse_outline_segment_count(rx, ry, radius);
+        let n = ellipse_outline_segment_count(rx, ry, radius, hardness);
         for i in 0..=n {
             let t = std::f64::consts::TAU * i as f64 / n as f64;
             let px = cx + rx * t.cos();

@@ -74,7 +74,7 @@ impl AppState {
             tool: ToolKind::Brush,
             fg: [0, 0, 0, 255],
             brush_size: 8.0,
-            brush_hardness: 0.85,
+            brush_hardness: 0.1,
             fill_tolerance: 32,
             shape_filled: false,
             zoom: 1.0,

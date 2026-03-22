@@ -17,10 +17,15 @@ use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gio;
 use gtk::glib;
 use gtk::glib::prelude::Cast;
+use gtk::glib::ControlFlow;
 #[allow(deprecated)]
 use gtk::prelude::ColorChooserExt;
 use gtk::gio::prelude::ApplicationExt as GioApplicationExt;
 use gtk::prelude::DrawingAreaExtManual;
+use gtk::prelude::EventControllerExt;
+use gtk::prelude::GestureDragExt;
+use gtk::prelude::RangeExt;
+use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -562,6 +567,7 @@ fn draw_shape_drag_preview(
     fg: [u8; 4],
     shape_filled: bool,
     brush_size: f64,
+    brush_hardness: f64,
 ) {
     let (r, g, b, a) = straight_fg_to_cairo(fg);
     let lw = brush_size.max(0.5);
@@ -601,7 +607,7 @@ fn draw_shape_drag_preview(
             if rx < 0.25 || ry < 0.25 {
                 return;
             }
-            let steps = ellipse_outline_segment_count(rx, ry, brush_size * 0.5);
+            let steps = ellipse_outline_segment_count(rx, ry, brush_size * 0.5, brush_hardness);
             cr.move_to(cx + rx, cy);
             for i in 1..=steps {
                 let t = std::f64::consts::TAU * i as f64 / steps as f64;
@@ -648,7 +654,7 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
 }
 
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
-    let (w, h, pan_x, pan_y, zoom, floating, selection, shape_preview, fg, shape_filled, brush_size) = {
+    let (w, h, pan_x, pan_y, zoom, floating, selection, shape_preview, fg, shape_filled, brush_size, brush_hardness) = {
         let st = state.borrow();
         (
             st.doc.width,
@@ -662,6 +668,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             st.fg,
             st.shape_filled,
             st.brush_size,
+            st.brush_hardness,
         )
     };
     let len = (w * h * 4) as usize;
@@ -766,7 +773,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        draw_shape_drag_preview(cr, tool, x0, y0, x1, y1, fg, shape_filled, brush_size);
+        draw_shape_drag_preview(cr, tool, x0, y0, x1, y1, fg, shape_filled, brush_size, brush_hardness);
         cr.restore().unwrap();
     }
 }
@@ -803,6 +810,110 @@ fn commit_floating(state: &mut AppState) {
     }
 }
 
+fn paint_brush_drag_sample(
+    st: &mut AppState,
+    wx: f64,
+    wy: f64,
+    last_sample: &RefCell<Option<(f64, f64)>>,
+) -> bool {
+    const EPS: f64 = 1e-4;
+    if last_sample.borrow().is_some_and(|(px, py)| {
+        (wx - px).abs() < EPS && (wy - py).abs() < EPS
+    }) {
+        return false;
+    }
+    let (cx, cy) = st.widget_to_doc(wx, wy);
+    let Some((lx, ly)) = st.last_doc_pos else {
+        st.last_doc_pos = Some((cx, cy));
+        *last_sample.borrow_mut() = Some((wx, wy));
+        return false;
+    };
+    let layer = match st.doc.active_layer_mut() {
+        Some(l) => l,
+        None => return false,
+    };
+    match st.tool {
+        ToolKind::Brush | ToolKind::Eraser => {
+            let radius = st.brush_size * 0.5;
+            stroke_line(
+                layer,
+                lx,
+                ly,
+                cx,
+                cy,
+                radius,
+                st.brush_hardness,
+                st.fg,
+                st.tool == ToolKind::Eraser,
+            );
+        }
+        ToolKind::Pixel => {
+            stroke_line_square(layer, lx, ly, cx, cy, st.brush_size, st.fg, false);
+        }
+        _ => return false,
+    }
+    st.last_doc_pos = Some((cx, cy));
+    *last_sample.borrow_mut() = Some((wx, wy));
+    st.modified = true;
+    true
+}
+
+fn remove_brush_paint_tick(slot: &RefCell<Option<gtk::TickCallbackId>>) {
+    if let Some(id) = slot.borrow_mut().take() {
+        id.remove();
+    }
+}
+
+/// While a brush stroke is active, GTK may deliver very few `GestureDrag::update` events (notably on
+/// Wayland). Sampling each frame keeps strokes dense. Coordinates **must** match `drag_update`
+/// (`press + offset`); using raw `device_position` + surface math disagrees with widget space and
+/// produces broken, “laddered” strokes.
+fn install_brush_paint_tick(
+    canvas: &gtk::DrawingArea,
+    gesture: &gtk::GestureDrag,
+    state: &SharedState,
+    canvas_cell: &CanvasCell,
+    last_brush_widget: &Rc<RefCell<Option<(f64, f64)>>>,
+    brush_widget_start: &Rc<RefCell<Option<(f64, f64)>>>,
+    tick_slot: &Rc<RefCell<Option<gtk::TickCallbackId>>>,
+) {
+    remove_brush_paint_tick(tick_slot.as_ref());
+    let st_c = state.clone();
+    let cv_c = canvas_cell.clone();
+    let lbs_c = last_brush_widget.clone();
+    let bws_c = brush_widget_start.clone();
+    let gesture_c = gesture.clone();
+    *tick_slot.borrow_mut() = Some(canvas.add_tick_callback(move |_w, _fc| {
+        {
+            let st = st_c.borrow();
+            if !st.brush_stroke_in_progress {
+                return ControlFlow::Continue;
+            }
+            if !matches!(
+                st.tool,
+                ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel
+            ) {
+                return ControlFlow::Continue;
+            }
+        }
+        let Some((ox, oy)) = gesture_c.offset() else {
+            return ControlFlow::Continue;
+        };
+        let Some((bx, by)) = *bws_c.borrow() else {
+            return ControlFlow::Continue;
+        };
+        let wx = bx + ox;
+        let wy = by + oy;
+        let mut st = st_c.borrow_mut();
+        let painted = paint_brush_drag_sample(&mut st, wx, wy, &lbs_c);
+        drop(st);
+        if painted {
+            queue_canvas(&cv_c);
+        }
+        ControlFlow::Continue
+    }));
+}
+
 fn setup_canvas_input(
     canvas: &gtk::DrawingArea,
     state: &SharedState,
@@ -811,13 +922,18 @@ fn setup_canvas_input(
     recent_swatches: &gtk::FlowBox,
 ) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+    let last_brush_widget: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+    let brush_paint_tick: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
     let move_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
 
     let drag = gtk::GestureDrag::new();
+    let drag_brush_tick = drag.clone();
     let st_drag_begin = state.clone();
     let cv_drag = canvas_cell.clone();
     let cnv = canvas.clone();
+    let bpt_begin = brush_paint_tick.clone();
     let bws = brush_widget_start.clone();
+    let lbs_begin = last_brush_widget.clone();
     let mws_b = move_widget_start.clone();
     let cb_drag = color_preview_da_cell.clone();
     let recent_drag = recent_swatches.clone();
@@ -826,6 +942,7 @@ fn setup_canvas_input(
         let mut st = st_drag_begin.borrow_mut();
         let (dx, dy) = st.widget_to_doc(wx, wy);
         let mut eyedrop_updated = false;
+        let mut start_brush_paint_tick = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser => {
                 let color = st.fg;
@@ -841,7 +958,9 @@ fn setup_canvas_input(
                     None => return,
                 };
                 stamp_circle(layer, dx, dy, radius, hardness, color, eraser);
+                *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
+                start_brush_paint_tick = true;
             }
             ToolKind::Pixel => {
                 let color = st.fg;
@@ -855,7 +974,9 @@ fn setup_canvas_input(
                     None => return,
                 };
                 stamp_square(layer, dx, dy, size, color, false);
+                *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
+                start_brush_paint_tick = true;
             }
             ToolKind::Fill => {
                 let fg = st.fg;
@@ -949,6 +1070,17 @@ fn setup_canvas_input(
             }
         }
         drop(st);
+        if start_brush_paint_tick {
+            install_brush_paint_tick(
+                &cnv,
+                &drag_brush_tick,
+                &st_drag_begin,
+                &cv_drag,
+                &lbs_begin,
+                &bws,
+                &bpt_begin,
+            );
+        }
         if eyedrop_updated {
             if let Some(ref da) = *cb_drag.borrow() {
                 da.queue_draw();
@@ -964,6 +1096,7 @@ fn setup_canvas_input(
     let cv_co = canvas_cell.clone();
     let dco = drag_coalesce.clone();
     let bws_up = brush_widget_start.clone();
+    let lbs_up = last_brush_widget.clone();
     let mws_u = move_widget_start.clone();
     drag.connect_drag_update(move |_g, ox, oy| {
         let mut st = st_drag_up.borrow_mut();
@@ -974,41 +1107,15 @@ fn setup_canvas_input(
                 };
                 let cur_wx = bx + ox;
                 let cur_wy = by + oy;
-                let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
-                let Some((lx, ly)) = st.last_doc_pos else {
-                    st.last_doc_pos = Some((cx, cy));
-                    return;
-                };
-                let color = st.fg;
-                let eraser = st.tool == ToolKind::Eraser;
-                let radius = st.brush_size * 0.5;
-                let hardness = st.brush_hardness;
-                let layer = match st.doc.active_layer_mut() {
-                    Some(l) => l,
-                    None => return,
-                };
-                stroke_line(layer, lx, ly, cx, cy, radius, hardness, color, eraser);
-                st.last_doc_pos = Some((cx, cy));
-                st.modified = true;
+                paint_brush_drag_sample(&mut st, cur_wx, cur_wy, &lbs_up);
             }
             ToolKind::Pixel => {
                 let Some((bx, by)) = *bws_up.borrow() else {
                     return;
                 };
-                let (cx, cy) = st.widget_to_doc(bx + ox, by + oy);
-                let Some((lx, ly)) = st.last_doc_pos else {
-                    st.last_doc_pos = Some((cx, cy));
-                    return;
-                };
-                let color = st.fg;
-                let size = st.brush_size;
-                let layer = match st.doc.active_layer_mut() {
-                    Some(l) => l,
-                    None => return,
-                };
-                stroke_line_square(layer, lx, ly, cx, cy, size, color, false);
-                st.last_doc_pos = Some((cx, cy));
-                st.modified = true;
+                let cur_wx = bx + ox;
+                let cur_wy = by + oy;
+                paint_brush_drag_sample(&mut st, cur_wx, cur_wy, &lbs_up);
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
                 let Some((x0, y0)) = st.drag_start_doc else {
@@ -1073,12 +1180,16 @@ fn setup_canvas_input(
     let cv_drag_end = canvas_cell.clone();
     let cnv3 = canvas.clone();
     let bws_end = brush_widget_start.clone();
+    let lbs_end = last_brush_widget.clone();
+    let bpt_end = brush_paint_tick.clone();
     let mws_e = move_widget_start.clone();
     drag.connect_drag_end(move |_g, ox, oy| {
         let mut st = st_drag_end.borrow_mut();
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel => {
+                remove_brush_paint_tick(bpt_end.as_ref());
                 *bws_end.borrow_mut() = None;
+                *lbs_end.borrow_mut() = None;
                 st.commit_stroke_undo();
                 st.brush_stroke_in_progress = false;
                 st.last_doc_pos = None;
@@ -1144,33 +1255,31 @@ fn setup_canvas_input(
         cnv3.queue_draw();
     });
 
-    canvas.add_controller(drag);
-
     let motion = gtk::EventControllerMotion::new();
+    motion.set_propagation_phase(gtk::PropagationPhase::Capture);
     let st_m = state.clone();
     let cv_m = canvas_cell.clone();
     let last = Rc::new(RefCell::new(None::<(f64, f64)>));
     let last_c = last.clone();
     motion.connect_motion(move |ec, x, y| {
-        if !ec
-            .current_event_state()
-            .contains(gdk::ModifierType::BUTTON2_MASK)
-        {
+        let mask = ec.current_event_state();
+        if mask.contains(gdk::ModifierType::BUTTON2_MASK) {
+            let Some((lx, ly)) = *last_c.borrow() else {
+                *last_c.borrow_mut() = Some((x, y));
+                return;
+            };
+            let mut st = st_m.borrow_mut();
+            st.pan_x += x - lx;
+            st.pan_y += y - ly;
             *last_c.borrow_mut() = Some((x, y));
+            drop(st);
+            queue_canvas(&cv_m);
             return;
         }
-        let Some((lx, ly)) = *last_c.borrow() else {
-            *last_c.borrow_mut() = Some((x, y));
-            return;
-        };
-        let mut st = st_m.borrow_mut();
-        st.pan_x += x - lx;
-        st.pan_y += y - ly;
         *last_c.borrow_mut() = Some((x, y));
-        drop(st);
-        queue_canvas(&cv_m);
     });
     canvas.add_controller(motion);
+    canvas.add_controller(drag);
 
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     let st_s = state.clone();
@@ -2022,13 +2131,19 @@ fn build_ui(app: &Application) {
     });
     size_spin.add_controller(size_key);
 
-    let hard_adj = gtk::Adjustment::new(0.85, 0.0, 1.0, 0.01, 0.1, 0.0);
+    // Gtk/Adwaita often maps the adjustment *maximum* to the visual left for horizontal scales.
+    // Invert the range (min on the right) and map `hardness = (min+max) - value` so **screen right**
+    // = 100% hard and **screen left** = 10%. Default value 1.0 → thumb on the left (10% hardness).
+    // LTR keeps left/right unmirrored for RTL desktops.
+    let hard_adj = gtk::Adjustment::new(1.0, 0.1, 1.0, 0.01, 0.1, 0.0);
     let hard_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&hard_adj));
+    hard_scale.set_direction(gtk::TextDirection::Ltr);
+    hard_scale.set_inverted(true);
     hard_scale.set_hexpand(true);
     hard_scale.set_width_request(120);
     let st_h = state.clone();
     hard_adj.connect_value_changed(move |a| {
-        st_h.borrow_mut().brush_hardness = a.value();
+        st_h.borrow_mut().brush_hardness = 1.1 - a.value();
     });
 
     let tol_adj = gtk::Adjustment::new(32.0, 0.0, 255.0, 1.0, 16.0, 0.0);
@@ -2089,7 +2204,7 @@ fn build_ui(app: &Application) {
     toolbar.append(&make_row("Tool", tool_dd.upcast_ref()));
     toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     toolbar.append(&make_row("Size", size_spin.upcast_ref()));
-    toolbar.append(&make_row("Hard", hard_scale.upcast_ref()));
+    toolbar.append(&make_row("Hardness", hard_scale.upcast_ref()));
     toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     toolbar.append(&make_row("Fill tol", tol_spin.upcast_ref()));
     toolbar.append(&fill_check);
