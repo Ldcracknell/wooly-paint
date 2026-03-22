@@ -286,22 +286,6 @@ impl Document {
     }
 }
 
-/// Apply brightness (delta -1..1) and contrast (factor around 1) to straight RGBA region.
-pub fn adjust_brightness_contrast_straight(buf: &mut [u8], brightness: f32, contrast: f32) {
-    let b = brightness.clamp(-1.0, 1.0);
-    let c = contrast.max(0.01);
-    for px in buf.chunks_exact_mut(4) {
-        let a = px[3];
-        if a == 0 {
-            continue;
-        }
-        for ch in &mut px[..3] {
-            let mut v = *ch as f32 / 255.0;
-            v = (v - 0.5) * c + 0.5 + b;
-            *ch = (v * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-}
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")

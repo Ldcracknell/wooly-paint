@@ -1,6 +1,4 @@
-use crate::document::{
-    adjust_brightness_contrast_straight, premul_to_straight_rgba, straight_to_premul, Document,
-};
+use crate::document::{premul_to_straight_rgba, straight_to_premul, Document};
 use crate::state::{AppState, FloatingSelection};
 use crate::tools::{
     clear_rect, copy_rect, draw_ellipse, draw_rect_outline, flood_fill, paste_rect,
@@ -992,21 +990,6 @@ fn try_paste_system_clipboard(
     );
 }
 
-fn apply_brightness_contrast(state: &SharedState, brightness: f32, contrast: f32) {
-    let mut st = state.borrow_mut();
-    let idx = st.doc.active_layer;
-    let Some(layer) = st.doc.layers.get_mut(idx) else {
-        return;
-    };
-    let before = layer.pixels.clone();
-    let straight = premul_to_straight_rgba(&layer.pixels);
-    let mut buf = straight;
-    adjust_brightness_contrast_straight(&mut buf, brightness, contrast);
-    layer.pixels = straight_to_premul(&buf);
-    st.history.commit_change(idx, before);
-    st.modified = true;
-}
-
 fn open_file(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
@@ -1413,66 +1396,6 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
         }
         refresh_tool_labels(&st_close, &sl_close);
         glib::Propagation::Proceed
-    });
-
-    d.present();
-}
-
-fn brightness_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, canvas: &CanvasCell) {
-    let d = libadwaita::Window::builder()
-        .transient_for(window)
-        .modal(true)
-        .title("Brightness / contrast")
-        .default_width(360)
-        .default_height(220)
-        .build();
-
-    let b_adj = gtk::Adjustment::new(0.0, -1.0, 1.0, 0.02, 0.1, 0.0);
-    let c_adj = gtk::Adjustment::new(1.0, 0.1, 3.0, 0.02, 0.1, 0.0);
-    let b_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&b_adj));
-    let c_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&c_adj));
-    b_scale.set_hexpand(true);
-    c_scale.set_hexpand(true);
-
-    let bx = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .spacing(12)
-        .build();
-    bx.append(&gtk::Label::new(Some("Brightness")));
-    bx.append(&b_scale);
-    bx.append(&gtk::Label::new(Some("Contrast")));
-    bx.append(&c_scale);
-
-    let apply = gtk::Button::with_label("Apply");
-    let close = gtk::Button::with_label("Close");
-    let btn_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
-    btn_row.append(&close);
-    btn_row.append(&apply);
-    bx.append(&btn_row);
-
-    d.set_content(Some(&bx));
-
-    let st = state.clone();
-    let cv = canvas.clone();
-    let dw = d.clone();
-    apply.connect_clicked(move |_| {
-        apply_brightness_contrast(
-            &st,
-            b_adj.value() as f32,
-            c_adj.value() as f32,
-        );
-        queue_canvas(&cv);
-    });
-    close.connect_clicked(move |_| {
-        dw.close();
     });
 
     d.present();
@@ -1916,24 +1839,6 @@ fn build_menu(
     file.append(Some("Quit"), Some("win.quit"));
     menu.append_submenu(Some("_File"), &file);
 
-    let edit = gio::Menu::new();
-    edit.append(Some("Undo"), Some("win.undo"));
-    edit.append(Some("Redo"), Some("win.redo"));
-    edit.append(Some("Cut"), Some("win.cut"));
-    edit.append(Some("Copy"), Some("win.copy"));
-    edit.append(Some("Paste"), Some("win.paste"));
-    menu.append_submenu(Some("_Edit"), &edit);
-
-    let view = gio::Menu::new();
-    view.append(Some("Zoom In"), Some("win.zoom_in"));
-    view.append(Some("Zoom Out"), Some("win.zoom_out"));
-    view.append(Some("Zoom to Fit"), Some("win.zoom_fit"));
-    menu.append_submenu(Some("_View"), &view);
-
-    let image = gio::Menu::new();
-    image.append(Some("Brightness / Contrast…"), Some("win.bc"));
-    menu.append_submenu(Some("_Image"), &image);
-
     let settings = gio::Menu::new();
     settings.append(Some("Keybinds…"), Some("win.keybinds"));
     menu.append_submenu(Some("_Settings"), &settings);
@@ -2068,15 +1973,6 @@ fn build_menu(
         queue_canvas(&cv);
     });
     app_add_action(window, &zf_act);
-
-    let st = state.clone();
-    let cv = canvas.clone();
-    let w = window.clone();
-    let bc_act = gio::SimpleAction::new("bc", None);
-    bc_act.connect_activate(move |_, _| {
-        brightness_dialog(&w, &st, &cv);
-    });
-    app_add_action(window, &bc_act);
 
     menu
 }
