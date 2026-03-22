@@ -1,0 +1,14 @@
+Wooly Paint — Windows x86_64 (MinGW64 / MSYS2 GTK)
+
+This zip was produced with the same MinGW64 libraries used to build the .exe.
+Unzip anywhere, then run run-wooly-paint.cmd (or wooly-paint.exe after setting
+environment variables as in that script).
+
+If the app fails to start (missing schemas, loaders, or DLLs), install GTK via
+MSYS2 instead and run from a MinGW64 environment:
+
+  pacman -S mingw-w64-x86_64-gtk4 mingw-w64-x86_64-libadwaita
+  export PATH="/mingw64/bin:$PATH"
+  ./wooly-paint.exe
+
+See the repository README for full build instructions.

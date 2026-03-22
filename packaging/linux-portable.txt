@@ -1,0 +1,20 @@
+Wooly Paint — Linux binary (built on Arch Linux x86_64)
+
+This build is linked against Arch’s glibc and GTK stack. It is intended for Arch
+Linux (and other rolling distros with compatible glibc) when you do not want to
+compile from source.
+
+Run
+  chmod +x wooly-paint
+  ./wooly-paint
+
+Dependencies on Arch
+  sudo pacman -S gtk4 libadwaita
+
+Other distributions need GTK 4 and libadwaita (and a recent enough glibc) from
+their package manager. If the binary fails to start, build from the repository
+instead: cargo build --release
+
+Optional menu entry: copy the repository’s scripts/install-desktop-user.sh and
+point it at this wooly-paint binary, or create a .desktop file with Exec= and
+Icon= set to the full paths of this folder’s wooly-paint and icon.png.

@@ -1,0 +1,85 @@
+name: Release build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-arch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and package (Arch Linux container)
+        run: |
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e "HOST_UID=$(id -u)" \
+            -e "HOST_GID=$(id -g)" \
+            -v "${{ github.workspace }}:/src:rw" \
+            -w /src \
+            archlinux:latest \
+            bash /src/scripts/ci-arch-container-build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wooly-paint-linux-arch
+          path: dist/*.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-rust
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gtk4
+            mingw-w64-x86_64-libadwaita
+            mingw-w64-x86_64-pkgconf
+            zip
+
+      - name: Build and package
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          cargo build --verbose --release
+          bash scripts/package-windows-release.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wooly-paint-windows-x86_64
+          path: dist/*.zip
+
+  release:
+    needs: [linux-arch, windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/wooly-paint-linux-arch/*.tar.gz
+            artifacts/wooly-paint-windows-x86_64/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
