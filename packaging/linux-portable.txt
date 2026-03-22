@@ -8,6 +8,48 @@ Run
   chmod +x wooly-paint
   ./wooly-paint
 
+Taskbar / dock icon (KDE, GNOME, etc.)
+  If you pin the raw binary, the icon often becomes a blank “document” when the app
+  is closed. Install a proper menu entry once, then pin “Wooly Paint” from the app
+  menu instead.
+
+  If install-portable-menu.sh is in this folder:
+
+    ./install-portable-menu.sh
+
+  Older archives without that script: cd to this folder, then paste this whole
+  block into bash (lines from DIR= through kbuildsycoca must stay flush left;
+  do not indent the [Desktop Entry] lines). KDE Plasma needs kbuildsycoca and an
+  absolute Icon= path so the pinned taskbar icon does not turn into a blank page
+  when the app is closed.
+
+DIR="$(pwd)"
+APP_ID="dev.woolymelon.WoolyPaint"
+ICON_DEST="${HOME}/.local/share/icons/hicolor/128x128/apps/${APP_ID}.png"
+chmod +x wooly-paint 2>/dev/null || true
+mkdir -p ~/.local/share/icons/hicolor/128x128/apps
+cp icon.png "$ICON_DEST"
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/${APP_ID}.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=Wooly Paint
+Comment=Raster paint
+Exec=$DIR/wooly-paint %F
+TryExec=$DIR/wooly-paint
+Icon=$ICON_DEST
+Path=$DIR
+Terminal=false
+Categories=Graphics;2DGraphics;
+StartupWMClass=$APP_ID
+EOF
+gtk-update-icon-cache -f ~/.local/share/icons/hicolor/ 2>/dev/null || true
+update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
+kbuildsycoca6 --noincremental 2>/dev/null || kbuildsycoca5 --noincremental 2>/dev/null || true
+
+  Then launch Wooly Paint from the app menu (or KRunner) and pin that entry.
+  On KDE, remove any old pinned shortcut first, then pin again from the menu.
+
 Dependencies on Arch
   sudo pacman -S gtk4 libadwaita
 
@@ -15,6 +57,5 @@ Other distributions need GTK 4 and libadwaita (and a recent enough glibc) from
 their package manager. If the binary fails to start, build from the repository
 instead: cargo build --release
 
-Optional menu entry: copy the repository’s scripts/install-desktop-user.sh and
-point it at this wooly-paint binary, or create a .desktop file with Exec= and
-Icon= set to the full paths of this folder’s wooly-paint and icon.png.
+From a git checkout you can instead run scripts/install-desktop-user.sh (pass the
+path to this binary if needed).

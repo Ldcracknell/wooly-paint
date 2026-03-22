@@ -4,7 +4,6 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_ID="dev.woolymelon.WoolyPaint"
-ICON_SRC="$ROOT/src/assets/icon.png"
 
 BIN="${1:-}"
 if [[ -z "$BIN" ]]; then
@@ -19,23 +18,40 @@ if [[ ! -f "$BIN" ]]; then
   echo "No binary found. Build first, or pass the path: $0 /path/to/wooly-paint" >&2
   exit 1
 fi
-if [[ ! -f "$ICON_SRC" ]]; then
-  echo "Missing $ICON_SRC" >&2
+
+BIN_DIR="$(cd "$(dirname "$BIN")" && pwd)"
+ICON_SRC=""
+if [[ -f "$ROOT/src/assets/icon.png" ]]; then
+  ICON_SRC="$ROOT/src/assets/icon.png"
+elif [[ -f "$BIN_DIR/icon.png" ]]; then
+  ICON_SRC="$BIN_DIR/icon.png"
+fi
+if [[ -z "$ICON_SRC" ]]; then
+  echo "No icon found (expected $ROOT/src/assets/icon.png or $BIN_DIR/icon.png)." >&2
   exit 1
 fi
 
-mkdir -p ~/.local/share/icons/hicolor/128x128/apps
-cp "$ICON_SRC" ~/.local/share/icons/hicolor/128x128/apps/${APP_ID}.png
+# Working directory: repo root when developing; extract folder for portable tarball layout.
+WORK_DIR="$ROOT"
+if [[ "$ICON_SRC" == "$BIN_DIR/icon.png" ]]; then
+  WORK_DIR="$BIN_DIR"
+fi
 
+ICON_DEST="${HOME}/.local/share/icons/hicolor/128x128/apps/${APP_ID}.png"
+mkdir -p ~/.local/share/icons/hicolor/128x128/apps
+cp "$ICON_SRC" "$ICON_DEST"
+
+DESKTOP="${HOME}/.local/share/applications/${APP_ID}.desktop"
 mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/${APP_ID}.desktop <<EOF
+cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Wooly Paint
 Comment=Raster paint
 Exec=$BIN %F
-Icon=$APP_ID
-Path=$ROOT
+TryExec=$BIN
+Icon=$ICON_DEST
+Path=$WORK_DIR
 Terminal=false
 Categories=Graphics;2DGraphics;
 StartupWMClass=$APP_ID
@@ -43,4 +59,5 @@ EOF
 
 gtk-update-icon-cache -f ~/.local/share/icons/hicolor/ 2>/dev/null || true
 update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
-echo "Installed ~/.local/share/applications/${APP_ID}.desktop (icon $APP_ID)."
+kbuildsycoca6 --noincremental 2>/dev/null || kbuildsycoca5 --noincremental 2>/dev/null || true
+echo "Installed $DESKTOP (KDE: re-pin from the app menu if the taskbar icon was wrong while closed)."

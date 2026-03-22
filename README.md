@@ -18,7 +18,7 @@ GitHub Actions builds installable bundles on every run of the **Release build** 
 1. Open the **Actions** tab in this repository and select **Release build**.
 2. Open the latest run and download the **artifacts** at the bottom (Linux `.tar.gz`, Windows `.zip`).
 
-**Linux (Arch-first):** The tarball is built in an [Arch Linux](https://archlinux.org/) container so the `wooly-paint` binary matches Arch’s glibc and GTK stack. Extract it, install `gtk4` and `libadwaita` from pacman if needed, then run `./wooly-paint`. See `README.txt` inside the archive.
+**Linux (Arch-first):** The tarball is built in an [Arch Linux](https://archlinux.org/) container so the `wooly-paint` binary matches Arch’s glibc and GTK stack. Extract it, install `gtk4` and `libadwaita` from pacman if needed, then run `./wooly-paint`. If pinning to the taskbar shows a blank icon when the app is closed, run `./install-portable-menu.sh` once if the archive includes it; otherwise use the manual commands in `README.txt`. Older release tarballs may not ship the script yet.
 
 **Windows:** Unzip and run `run-wooly-paint.cmd` (it sets `PATH` and GTK data dirs). If something is still missing, use [MSYS2](https://www.msys2.org/) MinGW64 with `gtk4` / `libadwaita` as described in the zip’s `README.txt`.
 
