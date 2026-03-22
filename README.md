@@ -3,6 +3,8 @@ this was made entirely with 4.6 and cursor's composer 2 (i have not read a singl
 
 ![wooly-paint GUI](./src/assets/gui-example.png)
 
+this is also completely untested on anything but arch
+
 # _
 
 A small raster paint program for the desktop, built with [GTK 4](https://gtk.org/) and [libadwaita](https://gnome.pages.gitlab.gnome.org/libadwaita/). It supports layered documents, common drawing tools, and follows your system light/dark preference.
