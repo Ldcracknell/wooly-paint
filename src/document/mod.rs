@@ -238,7 +238,9 @@ impl Document {
         let dst = &mut self.layers[index - 1];
         blend_layer_premul(&mut dst.pixels, &top.pixels, top.opacity, top.blend);
         self.layers.remove(index);
-        if self.active_layer >= self.layers.len() {
+        if self.active_layer == index {
+            self.active_layer = index - 1;
+        } else if self.active_layer >= self.layers.len() {
             self.active_layer = self.layers.len() - 1;
         } else if self.active_layer > index {
             self.active_layer -= 1;
