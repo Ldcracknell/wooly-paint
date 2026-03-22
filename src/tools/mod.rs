@@ -177,18 +177,23 @@ pub fn stamp_square(
     if size <= 0.0 {
         return;
     }
+    let mut s = size.floor() as i32;
+    if s < 1 {
+        s = 1;
+    }
     let w = layer.width as i32;
     let h = layer.height as i32;
-    let half = size * 0.5;
+    let ax = cx.floor() as i32;
+    let ay = cy.floor() as i32;
+    let x0 = ax - (s - 1) / 2;
+    let y0 = ay - (s - 1) / 2;
+    let x1 = x0 + s;
+    let y1 = y0 + s;
     let base = straight_to_premul_rgba(color[0], color[1], color[2], color[3]);
     let alpha = color[3] as f64 / 255.0;
     if alpha <= 0.0 {
         return;
     }
-    let x0 = (cx - half).floor() as i32;
-    let y0 = (cy - half).floor() as i32;
-    let x1 = (cx + half).ceil() as i32;
-    let y1 = (cy + half).ceil() as i32;
 
     for iy in y0.max(0)..y1.min(h) {
         for ix in x0.max(0)..x1.min(w) {
@@ -219,6 +224,29 @@ pub fn stamp_square(
     }
 }
 
+fn bresenham_visit(mut x0: i32, mut y0: i32, x1: i32, y1: i32, mut visit: impl FnMut(i32, i32)) {
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx - dy;
+    loop {
+        visit(x0, y0);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x0 += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
 pub fn stroke_line_square(
     layer: &mut Layer,
     x0: f64,
@@ -229,19 +257,20 @@ pub fn stroke_line_square(
     color: [u8; 4],
     eraser: bool,
 ) {
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-    let len = (dx * dx + dy * dy).sqrt();
-    let step = (size * 0.35).max(0.5);
-    let n = (len / step).ceil() as i32;
-    if n <= 0 {
-        stamp_square(layer, x0, y0, size, color, eraser);
-        return;
-    }
-    for i in 0..=n {
-        let t = i as f64 / n as f64;
-        stamp_square(layer, x0 + dx * t, y0 + dy * t, size, color, eraser);
-    }
+    let p0x = x0.floor() as i32;
+    let p0y = y0.floor() as i32;
+    let p1x = x1.floor() as i32;
+    let p1y = y1.floor() as i32;
+    bresenham_visit(p0x, p0y, p1x, p1y, |ix, iy| {
+        stamp_square(
+            layer,
+            ix as f64 + 0.5,
+            iy as f64 + 0.5,
+            size,
+            color,
+            eraser,
+        );
+    });
 }
 
 pub fn flood_fill(layer: &mut Layer, x: u32, y: u32, fill_premul: [u8; 4], tolerance: u8) {
