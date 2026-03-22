@@ -393,6 +393,16 @@ fn ellipse_perimeter_approx(a: f64, b: f64) -> f64 {
     std::f64::consts::PI * (maj + min) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt()))
 }
 
+/// Number of angular steps for an outlined ellipse (`draw_ellipse` outline path).
+/// Matches perimeter-based spacing vs. brush radius so previews use the same polygon density.
+pub fn ellipse_outline_segment_count(rx: f64, ry: f64, brush_radius: f64) -> i32 {
+    let perim = ellipse_perimeter_approx(rx, ry);
+    // Same center-to-center spacing as `stroke_line` so stamps overlap → smooth outline
+    // (the old fixed max ~360 samples left large gaps on big ellipses).
+    let step = (brush_radius * 0.35).max(0.5);
+    ((perim / step).ceil() as i32).clamp(8, 48_000)
+}
+
 pub fn draw_ellipse(
     layer: &mut Layer,
     x0: f64,
@@ -431,11 +441,7 @@ pub fn draw_ellipse(
             }
         }
     } else {
-        // Same center-to-center spacing as `stroke_line` so stamps overlap → smooth outline
-        // (the old fixed max ~360 samples left large gaps on big ellipses).
-        let perim = ellipse_perimeter_approx(rx, ry);
-        let step = (radius * 0.35).max(0.5);
-        let n = ((perim / step).ceil() as i32).clamp(8, 48_000);
+        let n = ellipse_outline_segment_count(rx, ry, radius);
         for i in 0..=n {
             let t = std::f64::consts::TAU * i as f64 / n as f64;
             let px = cx + rx * t.cos();

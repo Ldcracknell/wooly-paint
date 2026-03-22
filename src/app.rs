@@ -4,8 +4,9 @@ use crate::document::{
 };
 use crate::state::{AppState, FloatingSelection};
 use crate::tools::{
-    clear_rect, copy_rect, draw_ellipse, draw_rect_outline, flood_fill, paste_rect,
-    sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_square, ToolKind,
+    clear_rect, copy_rect, draw_ellipse, draw_rect_outline, ellipse_outline_segment_count,
+    flood_fill, paste_rect, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
+    stroke_line_square, ToolKind,
 };
 use libadwaita::prelude::*;
 use libadwaita::{Application, ColorScheme};
@@ -600,7 +601,7 @@ fn draw_shape_drag_preview(
             if rx < 0.25 || ry < 0.25 {
                 return;
             }
-            let steps = ((rx + ry) * 0.5).max(8.0).min(360.0) as i32;
+            let steps = ellipse_outline_segment_count(rx, ry, brush_size * 0.5);
             cr.move_to(cx + rx, cy);
             for i in 1..=steps {
                 let t = std::f64::consts::TAU * i as f64 / steps as f64;
