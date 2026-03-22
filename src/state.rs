@@ -32,6 +32,8 @@ pub struct AppState {
     pub move_grab_doc: Option<(f64, f64)>,
     pub modified: bool,
     pub tool_keybinds: Vec<(ToolKind, Option<char>)>,
+    /// Most recently used foreground colors (straight RGBA), newest first; at most 4 kept.
+    pub recent_colors: Vec<[u8; 4]>,
 }
 
 impl AppState {
@@ -73,6 +75,7 @@ impl AppState {
             move_grab_doc: None,
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),
+            recent_colors: Vec::new(),
         }
     }
 

@@ -5,19 +5,21 @@ use crate::tools::{
     sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_square, ToolKind,
 };
 use libadwaita::prelude::*;
-use libadwaita::Application;
+use libadwaita::{Application, ColorScheme};
 use gdk_pixbuf::Pixbuf;
 use gtk::gdk;
 use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gio;
 use gtk::glib;
+#[allow(deprecated)]
+use gtk::prelude::ColorChooserExt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
-type ColorBtnCell = Rc<RefCell<Option<gtk::ColorDialogButton>>>;
+type ColorPreviewDaCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type ToolDdCell = Rc<RefCell<Option<gtk::DropDown>>>;
 
 pub fn run() -> gtk::glib::ExitCode {
@@ -52,6 +54,196 @@ fn queue_canvas(canvas: &CanvasCell) {
     if let Some(ref c) = *canvas.borrow() {
         c.queue_draw();
     }
+}
+
+/// Straight RGBA presets shown in the sidebar (black/white, then rainbow, then grays, brown).
+const SIDEBAR_DEFAULT_COLORS: &[[u8; 4]] = &[
+    [0, 0, 0, 255],
+    [255, 255, 255, 255],
+    [255, 0, 0, 255],
+    [255, 128, 0, 255],
+    [255, 200, 0, 255],
+    [0, 160, 0, 255],
+    [0, 220, 220, 255],
+    [0, 100, 255, 255],
+    [160, 0, 255, 255],
+    [255, 0, 200, 255],
+    [64, 64, 64, 255],
+    [128, 128, 128, 255],
+    [192, 192, 192, 255],
+    [139, 90, 43, 255],
+];
+
+fn fg_to_rgba(fg: [u8; 4]) -> gdk::RGBA {
+    gdk::RGBA::new(
+        fg[0] as f32 / 255.0,
+        fg[1] as f32 / 255.0,
+        fg[2] as f32 / 255.0,
+        fg[3] as f32 / 255.0,
+    )
+}
+
+fn rgba_to_fg(c: &gdk::RGBA) -> [u8; 4] {
+    [
+        (c.red() * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c.green() * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c.blue() * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c.alpha() * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+fn push_recent_color(st: &mut AppState, fg: [u8; 4]) {
+    st.recent_colors.retain(|c| *c != fg);
+    st.recent_colors.insert(0, fg);
+    st.recent_colors.truncate(4);
+}
+
+fn swatch_button(fg: [u8; 4]) -> gtk::Button {
+    let da = gtk::DrawingArea::builder()
+        .width_request(24)
+        .height_request(24)
+        .build();
+    let r = fg[0] as f64 / 255.0;
+    let g = fg[1] as f64 / 255.0;
+    let b = fg[2] as f64 / 255.0;
+    let a = fg[3] as f64 / 255.0;
+    da.set_draw_func(move |_d, cr, w, h| {
+        cr.set_source_rgba(r, g, b, a);
+        cr.rectangle(0.0, 0.0, w as f64, h as f64);
+        let _ = cr.fill();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+        cr.set_line_width(1.0);
+        cr.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
+        let _ = cr.stroke();
+    });
+    let btn = gtk::Button::builder().child(&da).css_classes(["flat"]).build();
+    btn.set_tooltip_text(Some(&format!("RGB {}, {}, {}", fg[0], fg[1], fg[2])));
+    btn
+}
+
+fn make_color_preview_area(state: &SharedState) -> gtk::DrawingArea {
+    let da = gtk::DrawingArea::builder()
+        .width_request(44)
+        .height_request(44)
+        .build();
+    let st_draw = state.clone();
+    da.set_draw_func(move |_d, cr, w, h| {
+        let st = st_draw.borrow();
+        let fg = st.fg;
+        cr.set_source_rgba(
+            fg[0] as f64 / 255.0,
+            fg[1] as f64 / 255.0,
+            fg[2] as f64 / 255.0,
+            fg[3] as f64 / 255.0,
+        );
+        cr.rectangle(0.0, 0.0, w as f64, h as f64);
+        let _ = cr.fill();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.4);
+        cr.set_line_width(1.0);
+        cr.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
+        let _ = cr.stroke();
+    });
+    da
+}
+
+fn refresh_recent_swatch_row(
+    flow: &gtk::FlowBox,
+    state: &SharedState,
+    preview_da: &gtk::DrawingArea,
+    cv: &CanvasCell,
+) {
+    while let Some(c) = flow.first_child() {
+        flow.remove(&c);
+    }
+    let recents: Vec<[u8; 4]> = state.borrow().recent_colors.clone();
+    for fg in recents {
+        let btn = swatch_button(fg);
+        let st = state.clone();
+        let prev = preview_da.clone();
+        let cv2 = cv.clone();
+        let flow2 = flow.clone();
+        btn.connect_clicked(move |_| {
+            {
+                let mut g = st.borrow_mut();
+                g.fg = fg;
+                push_recent_color(&mut g, fg);
+            }
+            prev.queue_draw();
+            queue_canvas(&cv2);
+            refresh_recent_swatch_row(&flow2, &st, &prev, &cv2);
+        });
+        flow.append(&btn);
+    }
+}
+
+#[allow(deprecated)]
+fn present_custom_color_dialog(
+    parent: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    preview_da: &gtk::DrawingArea,
+    recent_flow: &gtk::FlowBox,
+    cv: &CanvasCell,
+) {
+    let win = libadwaita::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Custom color")
+        .default_width(420)
+        .default_height(460)
+        .resizable(true)
+        .build();
+
+    let chooser = gtk::ColorChooserWidget::new();
+    chooser.set_use_alpha(true);
+    chooser.set_show_editor(true);
+    chooser.set_rgba(&fg_to_rgba(state.borrow().fg));
+
+    let outer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    outer.append(&chooser);
+
+    let btn_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    let ok = gtk::Button::with_label("OK");
+    btn_row.append(&cancel);
+    btn_row.append(&ok);
+    outer.append(&btn_row);
+    win.set_content(Some(&outer));
+
+    let st_ok = state.clone();
+    let prev_ok = preview_da.clone();
+    let rf_ok = recent_flow.clone();
+    let cv_ok = cv.clone();
+    let w_ok = win.clone();
+    let ch_ok = chooser.clone();
+    ok.connect_clicked(move |_| {
+        let c = ch_ok.rgba();
+        let fg = rgba_to_fg(&c);
+        {
+            let mut g = st_ok.borrow_mut();
+            g.fg = fg;
+            push_recent_color(&mut g, fg);
+        }
+        prev_ok.queue_draw();
+        queue_canvas(&cv_ok);
+        refresh_recent_swatch_row(&rf_ok, &st_ok, &prev_ok, &cv_ok);
+        w_ok.close();
+    });
+
+    let w_cancel = win.clone();
+    cancel.connect_clicked(move |_| w_cancel.close());
+
+    win.present();
 }
 
 fn zoom_to_fit(state: &SharedState, canvas_cell: &CanvasCell) {
@@ -418,7 +610,13 @@ fn commit_floating(state: &mut AppState) {
     }
 }
 
-fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cell: &CanvasCell, color_btn_cell: &ColorBtnCell) {
+fn setup_canvas_input(
+    canvas: &gtk::DrawingArea,
+    state: &SharedState,
+    canvas_cell: &CanvasCell,
+    color_preview_da_cell: &ColorPreviewDaCell,
+    recent_swatches: &gtk::FlowBox,
+) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let move_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
 
@@ -428,12 +626,13 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
     let cnv = canvas.clone();
     let bws = brush_widget_start.clone();
     let mws_b = move_widget_start.clone();
-    let cb_drag = color_btn_cell.clone();
+    let cb_drag = color_preview_da_cell.clone();
+    let recent_drag = recent_swatches.clone();
     drag.connect_drag_begin(move |_g, wx, wy| {
         cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
         let (dx, dy) = st.widget_to_doc(wx, wy);
-        let mut eyedropped = None;
+        let mut eyedrop_updated = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser => {
                 let color = st.fg;
@@ -493,12 +692,8 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
                     dy.floor() as i32,
                 );
                 st.fg = c;
-                eyedropped = Some(gdk::RGBA::new(
-                    c[0] as f32 / 255.0,
-                    c[1] as f32 / 255.0,
-                    c[2] as f32 / 255.0,
-                    c[3] as f32 / 255.0,
-                ));
+                push_recent_color(&mut st, c);
+                eyedrop_updated = true;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse | ToolKind::SelectRect => {
                 st.drag_start_doc = Some((dx, dy));
@@ -544,9 +739,10 @@ fn setup_canvas_input(canvas: &gtk::DrawingArea, state: &SharedState, canvas_cel
             }
         }
         drop(st);
-        if let Some(rgba) = eyedropped {
-            if let Some(ref btn) = *cb_drag.borrow() {
-                btn.set_rgba(&rgba);
+        if eyedrop_updated {
+            if let Some(ref da) = *cb_drag.borrow() {
+                da.queue_draw();
+                refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &cv_drag);
             }
         }
         queue_canvas(&cv_drag);
@@ -1413,7 +1609,7 @@ fn build_ui(app: &Application) {
     let state: SharedState = Rc::new(RefCell::new(AppState::new()));
     let canvas_cell: CanvasCell = Rc::new(RefCell::new(None));
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
-    let color_btn_cell: ColorBtnCell = Rc::new(RefCell::new(None));
+    let color_preview_da_cell: ColorPreviewDaCell = Rc::new(RefCell::new(None));
     let tool_dd_cell: ToolDdCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
@@ -1438,7 +1634,26 @@ fn build_ui(app: &Application) {
         glib::ControlFlow::Continue
     });
 
-    setup_canvas_input(&drawing_area, &state, &canvas_cell, &color_btn_cell);
+    let recent_colors_flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .max_children_per_line(2)
+        .row_spacing(4)
+        .column_spacing(4)
+        .hexpand(false)
+        .halign(gtk::Align::Start)
+        .build();
+
+    let preview_da = make_color_preview_area(&state);
+    *color_preview_da_cell.borrow_mut() = Some(preview_da.clone());
+
+    setup_canvas_input(
+        &drawing_area,
+        &state,
+        &canvas_cell,
+        &color_preview_da_cell,
+        &recent_colors_flow,
+    );
 
     let layers_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Browse)
@@ -1530,33 +1745,6 @@ fn build_ui(app: &Application) {
         queue_canvas(&cv_dd);
     });
 
-    let color_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-    *color_btn_cell.borrow_mut() = Some(color_btn.clone());
-    {
-        let g = state.borrow();
-        let rgba = gdk::RGBA::new(
-            g.fg[0] as f32 / 255.0,
-            g.fg[1] as f32 / 255.0,
-            g.fg[2] as f32 / 255.0,
-            g.fg[3] as f32 / 255.0,
-        );
-        color_btn.set_rgba(&rgba);
-    }
-    let st_c = state.clone();
-    let cv_c = canvas_cell.clone();
-    color_btn.connect_rgba_notify(move |btn| {
-        let c = btn.rgba();
-        let mut g = st_c.borrow_mut();
-        g.fg = [
-            (c.red() * 255.0).round().clamp(0.0, 255.0) as u8,
-            (c.green() * 255.0).round().clamp(0.0, 255.0) as u8,
-            (c.blue() * 255.0).round().clamp(0.0, 255.0) as u8,
-            (c.alpha() * 255.0).round().clamp(0.0, 255.0) as u8,
-        ];
-        drop(g);
-        queue_canvas(&cv_c);
-    });
-
     let size_adj = gtk::Adjustment::new(8.0, 1.0, 256.0, 1.0, 8.0, 0.0);
     *size_adj_cell.borrow_mut() = Some(size_adj.clone());
     let size_spin = gtk::SpinButton::new(Some(&size_adj), 1.0, 0);
@@ -1642,7 +1830,6 @@ fn build_ui(app: &Application) {
     tol_spin.set_width_request(80);
 
     toolbar.append(&make_row("Tool", tool_dd.upcast_ref()));
-    toolbar.append(&make_row("Color", color_btn.upcast_ref()));
     toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     toolbar.append(&make_row("Size", size_spin.upcast_ref()));
     toolbar.append(&make_row("Hard", hard_scale.upcast_ref()));
@@ -1686,6 +1873,92 @@ fn build_ui(app: &Application) {
     });
 
     toolbar.append(&zoom_row);
+
+    let toolbar_spacer = gtk::Box::builder()
+        .vexpand(true)
+        .build();
+    toolbar.append(&toolbar_spacer);
+
+    let palette_label = gtk::Label::builder()
+        .label("Default colors")
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .hexpand(false)
+        .build();
+    palette_label.add_css_class("dim-label");
+    toolbar.append(&palette_label);
+
+    let palette_flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .max_children_per_line(2)
+        .row_spacing(4)
+        .column_spacing(4)
+        .hexpand(false)
+        .halign(gtk::Align::Start)
+        .build();
+    for &fg in SIDEBAR_DEFAULT_COLORS {
+        let btn = swatch_button(fg);
+        let st_pal = state.clone();
+        let prev_pal = preview_da.clone();
+        let cv_pal = canvas_cell.clone();
+        let rf_pal = recent_colors_flow.clone();
+        btn.connect_clicked(move |_| {
+            {
+                let mut g = st_pal.borrow_mut();
+                g.fg = fg;
+                push_recent_color(&mut g, fg);
+            }
+            prev_pal.queue_draw();
+            queue_canvas(&cv_pal);
+            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &cv_pal);
+        });
+        palette_flow.append(&btn);
+    }
+    toolbar.append(&palette_flow);
+
+    let recent_label = gtk::Label::builder()
+        .label("Last used")
+        .xalign(0.0)
+        .margin_top(6)
+        .halign(gtk::Align::Start)
+        .hexpand(false)
+        .build();
+    recent_label.add_css_class("dim-label");
+    toolbar.append(&recent_label);
+    toolbar.append(&recent_colors_flow);
+
+    let current_label = gtk::Label::builder()
+        .label("Custom color")
+        .xalign(0.0)
+        .margin_top(6)
+        .halign(gtk::Align::Start)
+        .hexpand(false)
+        .build();
+    current_label.add_css_class("dim-label");
+    toolbar.append(&current_label);
+
+    let preview_btn = gtk::Button::builder()
+        .child(&preview_da)
+        .halign(gtk::Align::Start)
+        .build();
+    preview_btn.set_tooltip_text(Some("Open color editor…"));
+    let w_col = window.clone();
+    let st_col = state.clone();
+    let prev_col = preview_da.clone();
+    let rf_col = recent_colors_flow.clone();
+    let cv_col = canvas_cell.clone();
+    preview_btn.connect_clicked(move |_| {
+        present_custom_color_dialog(&w_col, &st_col, &prev_col, &rf_col, &cv_col);
+    });
+    toolbar.append(&preview_btn);
+
+    refresh_recent_swatch_row(
+        &recent_colors_flow,
+        &state,
+        &preview_da,
+        &canvas_cell,
+    );
 
     let editor = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1845,6 +2118,23 @@ fn build_ui(app: &Application) {
     });
 }
 
+fn color_scheme_from_menu_value(s: &str) -> ColorScheme {
+    match s {
+        "light" => ColorScheme::ForceLight,
+        "dark" => ColorScheme::ForceDark,
+        _ => ColorScheme::Default,
+    }
+}
+
+fn menu_value_for_color_scheme(scheme: ColorScheme) -> &'static str {
+    match scheme {
+        ColorScheme::ForceLight | ColorScheme::PreferLight => "light",
+        ColorScheme::ForceDark | ColorScheme::PreferDark => "dark",
+        ColorScheme::Default => "default",
+        _ => "default",
+    }
+}
+
 fn build_menu(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
@@ -1864,6 +2154,11 @@ fn build_menu(
 
     let settings = gio::Menu::new();
     settings.append(Some("Keybinds…"), Some("win.keybinds"));
+    let theme = gio::Menu::new();
+    theme.append(Some("_Default"), Some("win.color_scheme('default')"));
+    theme.append(Some("_Light"), Some("win.color_scheme('light')"));
+    theme.append(Some("_Dark"), Some("win.color_scheme('dark')"));
+    settings.append_submenu(Some("Color _theme"), &theme);
     menu.append_submenu(Some("_Settings"), &settings);
 
     let st = state.clone();
@@ -1969,6 +2264,24 @@ fn build_menu(
         keybinds_dialog(&w_kb, &st, &ts_kb);
     });
     app_add_action(window, &kb_act);
+
+    let initial_theme = menu_value_for_color_scheme(libadwaita::StyleManager::default().color_scheme());
+    let theme_act = gio::SimpleAction::new_stateful(
+        "color_scheme",
+        Some(glib::VariantTy::STRING),
+        &initial_theme.to_variant(),
+    );
+    theme_act.connect_activate(move |act, param| {
+        let Some(p) = param else {
+            return;
+        };
+        let Some(s) = p.get::<String>() else {
+            return;
+        };
+        libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(s.as_str()));
+        act.set_state(p);
+    });
+    app_add_action(window, &theme_act);
 
     let st = state.clone();
     let cv = canvas.clone();
