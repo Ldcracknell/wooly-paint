@@ -28,6 +28,8 @@ pub struct AppState {
     pub undo_snapshot: Option<(usize, Vec<u8>)>,
     pub last_doc_pos: Option<(f64, f64)>,
     pub drag_start_doc: Option<(f64, f64)>,
+    /// Line / rectangle / ellipse drag: `(tool, x0, y0, x1, y1)` in document space (live preview).
+    pub shape_drag_preview: Option<(ToolKind, f64, f64, f64, f64)>,
     /// When dragging a floating selection: `(pointer_doc_x - float_x, pointer_doc_y - float_y)`.
     pub move_grab_doc: Option<(f64, f64)>,
     pub modified: bool,
@@ -80,6 +82,7 @@ impl AppState {
             undo_snapshot: None,
             last_doc_pos: None,
             drag_start_doc: None,
+            shape_drag_preview: None,
             move_grab_doc: None,
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),

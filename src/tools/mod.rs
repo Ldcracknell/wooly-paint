@@ -381,6 +381,18 @@ pub fn draw_rect_outline(
     }
 }
 
+/// Ramanujan's second approximation for ellipse circumference (a, b = semi-axes).
+fn ellipse_perimeter_approx(a: f64, b: f64) -> f64 {
+    let a = a.abs();
+    let b = b.abs();
+    if a < 1e-9 || b < 1e-9 {
+        return 0.0;
+    }
+    let (maj, min) = if a >= b { (a, b) } else { (b, a) };
+    let h = ((maj - min) / (maj + min)).powi(2);
+    std::f64::consts::PI * (maj + min) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt()))
+}
+
 pub fn draw_ellipse(
     layer: &mut Layer,
     x0: f64,
@@ -419,9 +431,13 @@ pub fn draw_ellipse(
             }
         }
     } else {
-        let steps = ((rx + ry) * 0.5).max(8.0).min(360.0) as i32;
-        for i in 0..=steps {
-            let t = std::f64::consts::TAU * i as f64 / steps as f64;
+        // Same center-to-center spacing as `stroke_line` so stamps overlap → smooth outline
+        // (the old fixed max ~360 samples left large gaps on big ellipses).
+        let perim = ellipse_perimeter_approx(rx, ry);
+        let step = (radius * 0.35).max(0.5);
+        let n = ((perim / step).ceil() as i32).clamp(8, 48_000);
+        for i in 0..=n {
+            let t = std::f64::consts::TAU * i as f64 / n as f64;
             let px = cx + rx * t.cos();
             let py = cy + ry * t.sin();
             stamp_circle(layer, px, py, radius, hardness, color, eraser);

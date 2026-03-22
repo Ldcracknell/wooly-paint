@@ -516,6 +516,86 @@ thread_local! {
 }
 
 /// 16×16 tile (8px checker cells), repeated — avoids O((W/8)²) cairo rectangles per frame.
+fn straight_fg_to_cairo(fg: [u8; 4]) -> (f64, f64, f64, f64) {
+    (
+        fg[0] as f64 / 255.0,
+        fg[1] as f64 / 255.0,
+        fg[2] as f64 / 255.0,
+        fg[3] as f64 / 255.0,
+    )
+}
+
+/// Document-space overlay while dragging line / rect / ellipse (matches final geometry; Cairo stroke width ≈ brush diameter).
+fn draw_shape_drag_preview(
+    cr: &gtk::cairo::Context,
+    tool: ToolKind,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    fg: [u8; 4],
+    shape_filled: bool,
+    brush_size: f64,
+) {
+    let (r, g, b, a) = straight_fg_to_cairo(fg);
+    let lw = brush_size.max(0.5);
+    cr.set_line_width(lw);
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+    match tool {
+        ToolKind::Line => {
+            cr.set_source_rgba(r, g, b, a);
+            cr.move_to(x0, y0);
+            cr.line_to(x1, y1);
+            cr.stroke().unwrap();
+        }
+        ToolKind::Rect => {
+            let min_x = x0.min(x1);
+            let max_x = x0.max(x1);
+            let min_y = y0.min(y1);
+            let max_y = y0.max(y1);
+            let rw = max_x - min_x;
+            let rh = max_y - min_y;
+            cr.rectangle(min_x, min_y, rw, rh);
+            if shape_filled && rw > 0.0 && rh > 0.0 {
+                cr.set_source_rgba(r, g, b, (a * 0.35).min(1.0));
+                cr.fill_preserve().unwrap();
+                cr.set_source_rgba(r, g, b, a);
+                cr.stroke().unwrap();
+            } else {
+                cr.set_source_rgba(r, g, b, a);
+                cr.stroke().unwrap();
+            }
+        }
+        ToolKind::Ellipse => {
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            let rx = (x1 - x0).abs() * 0.5;
+            let ry = (y1 - y0).abs() * 0.5;
+            if rx < 0.25 || ry < 0.25 {
+                return;
+            }
+            let steps = ((rx + ry) * 0.5).max(8.0).min(360.0) as i32;
+            cr.move_to(cx + rx, cy);
+            for i in 1..=steps {
+                let t = std::f64::consts::TAU * i as f64 / steps as f64;
+                cr.line_to(cx + rx * t.cos(), cy + ry * t.sin());
+            }
+            cr.close_path();
+            if shape_filled {
+                cr.set_source_rgba(r, g, b, (a * 0.35).min(1.0));
+                cr.fill_preserve().unwrap();
+                cr.set_source_rgba(r, g, b, a);
+                cr.stroke().unwrap();
+            } else {
+                cr.set_source_rgba(r, g, b, a);
+                cr.stroke().unwrap();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)) {
     TRANSPARENCY_CHECKER.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -542,7 +622,7 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
 }
 
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
-    let (w, h, pan_x, pan_y, zoom, floating, selection) = {
+    let (w, h, pan_x, pan_y, zoom, floating, selection, shape_preview, fg, shape_filled, brush_size) = {
         let st = state.borrow();
         (
             st.doc.width,
@@ -552,6 +632,10 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             st.zoom,
             st.floating.clone(),
             st.selection,
+            st.shape_drag_preview,
+            st.fg,
+            st.shape_filled,
+            st.brush_size,
         )
     };
     let len = (w * h * 4) as usize;
@@ -641,6 +725,14 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.set_dash(&[6.0, 6.0], (phase as f64) + 6.0);
         cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
         cr.stroke().unwrap();
+        cr.restore().unwrap();
+    }
+
+    if let Some((tool, x0, y0, x1, y1)) = shape_preview {
+        cr.save().unwrap();
+        cr.translate(pan_x, pan_y);
+        cr.scale(zoom, zoom);
+        draw_shape_drag_preview(cr, tool, x0, y0, x1, y1, fg, shape_filled, brush_size);
         cr.restore().unwrap();
     }
 }
@@ -774,7 +866,11 @@ fn setup_canvas_input(
                 push_recent_color(&mut st, c);
                 eyedrop_updated = true;
             }
-            ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse | ToolKind::SelectRect => {
+            ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
+                st.shape_drag_preview = None;
+                st.drag_start_doc = Some((dx, dy));
+            }
+            ToolKind::SelectRect => {
                 st.drag_start_doc = Some((dx, dy));
             }
             ToolKind::Hand => {
@@ -880,6 +976,17 @@ fn setup_canvas_input(
                 st.last_doc_pos = Some((cx, cy));
                 st.modified = true;
             }
+            ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
+                let Some((x0, y0)) = st.drag_start_doc else {
+                    return;
+                };
+                let start_wx = x0 * st.zoom + st.pan_x;
+                let start_wy = y0 * st.zoom + st.pan_y;
+                let cur_wx = start_wx + ox;
+                let cur_wy = start_wy + oy;
+                let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
+                st.shape_drag_preview = Some((st.tool, x0, y0, cx, cy));
+            }
             ToolKind::SelectRect => {
                 let Some((x0, y0)) = st.drag_start_doc else {
                     return;
@@ -943,6 +1050,7 @@ fn setup_canvas_input(
                 st.last_doc_pos = None;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
+                st.shape_drag_preview = None;
                 if let Some((sx, sy)) = st.drag_start_doc {
                     let start_wx = sx * st.zoom + st.pan_x;
                     let start_wy = sy * st.zoom + st.pan_y;
@@ -1328,6 +1436,8 @@ fn open_file(
                         g.modified = false;
                         g.selection = None;
                         g.floating = None;
+                        g.shape_drag_preview = None;
+                        g.drag_start_doc = None;
                         g.bump_document_revision();
                         drop(g);
                         zoom_to_fit(&st, &cv);
@@ -1473,6 +1583,8 @@ fn new_document_dialog(
         g.history.clear();
         g.selection = None;
         g.floating = None;
+        g.shape_drag_preview = None;
+        g.drag_start_doc = None;
         g.modified = false;
         g.bump_document_revision();
         drop(g);
