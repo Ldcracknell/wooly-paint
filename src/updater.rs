@@ -32,9 +32,11 @@ struct GhAsset {
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub version: Version,
+    #[allow(dead_code)]
     pub tag_name: String,
     pub release_page_url: String,
     pub download_url: String,
+    #[allow(dead_code)]
     pub asset_name: String,
 }
 
@@ -153,6 +155,7 @@ fn extract_linux_binary(tgz: &[u8], dest: &Path) -> Result<()> {
     bail!("no wooly-paint binary found in release tarball");
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn extract_windows_exe(zip_bytes: &[u8], dest: &Path) -> Result<()> {
     let reader = Cursor::new(zip_bytes);
     let mut archive =

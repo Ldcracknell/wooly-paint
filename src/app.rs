@@ -41,8 +41,6 @@ type FloatingPanelCell = Rc<RefCell<Option<FloatingPanel>>>;
 /// Sidebar controls for the floating clipboard / pasted image (scale, rotate, flip).
 struct FloatingPanel {
     revealer: gtk::Revealer,
-    #[allow(dead_code)]
-    frame: gtk::Frame,
     suppress: Rc<RefCell<bool>>,
     scale_w_adj: gtk::Adjustment,
     scale_h_adj: gtk::Adjustment,
@@ -146,7 +144,7 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
             fw * 4,
         );
         let m = floating_image_to_doc_matrix(f);
-        cr.translate(min_ix as f64, min_iy as f64);
+        cr.translate(-(min_ix as f64), -(min_iy as f64));
         cr.transform(m);
         cr.set_source_pixbuf(&pb, 0.0, 0.0);
         cr.source().set_filter(gtk::cairo::Filter::Nearest);
@@ -2643,7 +2641,6 @@ fn build_ui(app: &Application) {
 
     *floating_panel_cell.borrow_mut() = Some(FloatingPanel {
         revealer: fp_revealer.clone(),
-        frame: fp_frame.clone(),
         suppress: fp_suppress,
         scale_w_adj: scale_w_adj.clone(),
         scale_h_adj: scale_h_adj.clone(),
@@ -3051,7 +3048,12 @@ fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::up
                 });
             }
             "release" => {
-                gtk::show_uri(Some(&parent_for_uri), &release_url, gdk::CURRENT_TIME);
+                let launcher = gtk::UriLauncher::new(&release_url);
+                launcher.launch(Some(&parent_for_uri), None::<&gio::Cancellable>, |res| {
+                    if let Err(e) = res {
+                        eprintln!("Could not open release page: {e}");
+                    }
+                });
             }
             _ => {}
         }
@@ -3211,6 +3213,13 @@ fn build_menu(
         keybinds_dialog(&w_kb, &st, &ts_kb);
     });
     app_add_action(window, &kb_act);
+
+    let w_up = window.clone();
+    let check_act = gio::SimpleAction::new("check_updates", None);
+    check_act.connect_activate(move |_, _| {
+        run_manual_update_check(&w_up);
+    });
+    app_add_action(window, &check_act);
 
     let initial_theme = menu_value_for_color_scheme(libadwaita::StyleManager::default().color_scheme());
     let theme_act = gio::SimpleAction::new_stateful(
