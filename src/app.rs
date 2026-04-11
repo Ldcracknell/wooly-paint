@@ -5607,7 +5607,7 @@ fn run_manual_update_check(window: &libadwaita::ApplicationWindow) {
                     present_update_dialog(&w, info);
                 }
                 Ok(Some(crate::updater::UpdateCheckResult::UpToDate { version })) => {
-                    let body = format!("you are on the latest update ({version})");
+                    let body = format!("you are on the latest update (v{version})");
                     let dlg = libadwaita::AlertDialog::new(None, Some(&body));
                     dlg.add_response("ok", "OK");
                     dlg.set_default_response(Some("ok"));
