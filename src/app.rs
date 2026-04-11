@@ -1,13 +1,13 @@
 use crate::document::{
-    composite_layers_into, premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul,
-    Document,
+    composite_layers_from_below_into, composite_layers_into, premul_rgba_to_cairo_argb32,
+    premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul, Document,
 };
 use crate::palette::{self, PaletteBook};
 use crate::state::{AppState, ColorSlot, FloatingDrag, FloatingSelection, Selection};
 use crate::tool_cursors;
 use crate::tools::{
     clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse, draw_rect_outline,
-    ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect, region_tight_bbox,
+    ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect, region_tight_bbox_or_hint,
     sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_square, ToolKind,
 };
 use libadwaita::prelude::*;
@@ -31,7 +31,6 @@ use gtk::prelude::EditableExt;
 use gtk::prelude::ToggleButtonExt;
 use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
@@ -397,23 +396,26 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
         cr.set_operator(gtk::cairo::Operator::Clear);
         cr.paint().ok()?;
-        cr.set_operator(gtk::cairo::Operator::Over);
-        let fs = premul_to_straight_rgba(&f.data);
+               cr.set_operator(gtk::cairo::Operator::Over);
         let fw = f.w.max(1);
         let fh = f.h.max(1);
-        let pb = Pixbuf::from_bytes(
-            &glib::Bytes::from_owned(fs),
-            gdk_pixbuf::Colorspace::Rgb,
-            true,
-            8,
-            fw,
-            fh,
-            fw * 4,
-        );
+        let mut src_surf =
+            gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, fw, fh).ok()?;
+        {
+            let stride = src_surf.stride() as usize;
+            let mut data = src_surf.data().ok()?;
+            premul_rgba_to_cairo_argb32(
+                &mut data,
+                stride,
+                fw as u32,
+                fh as u32,
+                &f.data,
+            );
+        }
         let m = floating_image_to_doc_matrix(f);
         cr.translate(-(min_ix as f64), -(min_iy as f64));
         cr.transform(m);
-        cr.set_source_pixbuf(&pb, 0.0, 0.0);
+        cr.set_source_surface(&src_surf, 0.0, 0.0).ok()?;
         cr.source().set_filter(gtk::cairo::Filter::Nearest);
         cr.paint().ok()?;
     }
@@ -429,12 +431,25 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
 
 pub fn run() -> gtk::glib::ExitCode {
     libadwaita::init().expect("libadwaita init");
+    apply_libadwaita_theme_from_disk_early();
     let app = Application::builder()
         .application_id("dev.woolymelon.WoolyPaint")
         .build();
 
     app.connect_activate(build_ui);
     app.run()
+}
+
+/// Apply saved [`AdwStyleManager`](libadwaita::StyleManager) colors before `GtkApplication` exists,
+/// and clear GTK's legacy `gtk-application-prefer-dark-theme` for this process. User `settings.ini`
+/// often sets that flag; combining it with libadwaita triggers:
+/// "Using GtkSettings:gtk-application-prefer-dark-theme with libadwaita is unsupported".
+fn apply_libadwaita_theme_from_disk_early() {
+    let menu = crate::settings::saved_color_scheme_menu_value();
+    libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(menu));
+    if let Some(display) = gdk::Display::default() {
+        gtk::Settings::for_display(&display).set_gtk_application_prefer_dark_theme(false);
+    }
 }
 
 fn tool_label(tool: ToolKind, key: Option<char>) -> String {
@@ -2085,8 +2100,139 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
     });
 }
 
+/// Build the magic-wand / region marquee outline using merged axis-aligned segments (same geometry
+/// as per-pixel strokes, far fewer Cairo primitives on large selections).
+fn region_mask_outline_path(cr: &gtk::cairo::Context, mask: &[u8], rw: u32, rh: u32) {
+    let ww = rw as usize;
+    let h = rh as usize;
+    debug_assert_eq!(mask.len(), ww * h);
+
+    for y in 0..h {
+        let mut x = 0usize;
+        while x < ww {
+            let idx = y * ww + x;
+            if mask[idx] == 0 {
+                x += 1;
+                continue;
+            }
+            let top_clear = y == 0 || mask[idx - ww] == 0;
+            if !top_clear {
+                x += 1;
+                continue;
+            }
+            let x0 = x;
+            x += 1;
+            while x < ww {
+                let i2 = y * ww + x;
+                if mask[i2] == 0 {
+                    break;
+                }
+                if !(y == 0 || mask[i2 - ww] == 0) {
+                    break;
+                }
+                x += 1;
+            }
+            cr.move_to(x0 as f64, y as f64);
+            cr.line_to(x as f64, y as f64);
+        }
+    }
+
+    for y in 0..h {
+        let mut x = 0usize;
+        while x < ww {
+            let idx = y * ww + x;
+            if mask[idx] == 0 {
+                x += 1;
+                continue;
+            }
+            let bottom_clear = y + 1 == h || mask[idx + ww] == 0;
+            if !bottom_clear {
+                x += 1;
+                continue;
+            }
+            let x0 = x;
+            x += 1;
+            let y1 = (y + 1) as f64;
+            while x < ww {
+                let i2 = y * ww + x;
+                if mask[i2] == 0 {
+                    break;
+                }
+                if !(y + 1 == h || mask[i2 + ww] == 0) {
+                    break;
+                }
+                x += 1;
+            }
+            cr.move_to(x0 as f64, y1);
+            cr.line_to(x as f64, y1);
+        }
+    }
+
+    for x in 0..ww {
+        let mut y = 0usize;
+        while y < h {
+            let idx = y * ww + x;
+            if mask[idx] == 0 {
+                y += 1;
+                continue;
+            }
+            let left_clear = x == 0 || mask[idx - 1] == 0;
+            if !left_clear {
+                y += 1;
+                continue;
+            }
+            let y0 = y;
+            y += 1;
+            let xf = x as f64;
+            while y < h {
+                let i2 = y * ww + x;
+                if mask[i2] == 0 {
+                    break;
+                }
+                if !(x == 0 || mask[i2 - 1] == 0) {
+                    break;
+                }
+                y += 1;
+            }
+            cr.move_to(xf, y0 as f64);
+            cr.line_to(xf, y as f64);
+        }
+    }
+
+    for x in 0..ww {
+        let mut y = 0usize;
+        while y < h {
+            let idx = y * ww + x;
+            if mask[idx] == 0 {
+                y += 1;
+                continue;
+            }
+            let right_clear = x + 1 == ww || mask[idx + 1] == 0;
+            if !right_clear {
+                y += 1;
+                continue;
+            }
+            let y0 = y;
+            y += 1;
+            let xf = (x + 1) as f64;
+            while y < h {
+                let i2 = y * ww + x;
+                if mask[i2] == 0 {
+                    break;
+                }
+                if !(x + 1 == ww || mask[i2 + 1] == 0) {
+                    break;
+                }
+                y += 1;
+            }
+            cr.move_to(xf, y0 as f64);
+            cr.line_to(xf, y as f64);
+        }
+    }
+}
+
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
-    let (w, h, pan_x, pan_y, zoom, floating, selection, shape_preview, shape_preview_color, shape_filled, brush_size, brush_hardness) = {
+    let (w, h, pan_x, pan_y, zoom, shape_preview, shape_preview_color, shape_filled, brush_size, brush_hardness) = {
         let st = state.borrow();
         let preview_c = if st.shape_drag_preview.is_some() {
             st.active_paint_color()
@@ -2099,8 +2245,6 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             st.pan_x,
             st.pan_y,
             st.zoom,
-            st.floating.clone(),
-            st.selection.clone(),
             st.shape_drag_preview,
             preview_c,
             st.shape_filled,
@@ -2109,46 +2253,91 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         )
     };
     let len = (w * h * 4) as usize;
-    let stride = (w * 4) as i32;
+    let w_i = w as i32;
+    let h_i = h as i32;
 
-    let pixbuf = {
+    let composite_surface = {
         let mut st = state.borrow_mut();
         let use_cache = !st.brush_stroke_in_progress
             && st.composite_cache_at_revision == st.document_visual_revision
-            && st.composite_cache_pixbuf.as_ref().is_some_and(|pb| {
-                pb.width() == w as i32 && pb.height() == h as i32
+            && st.composite_cache_surface.as_ref().is_some_and(|s| {
+                s.width() == w_i && s.height() == h_i
             });
         if !use_cache {
-            st.composite_cache_pixbuf = None;
-            let AppState {
-                ref doc,
-                ref mut composite_cache_premul,
-                ref mut composite_cache_straight,
-                ref mut composite_cache_pixbuf,
-                ref mut composite_cache_at_revision,
-                document_visual_revision,
-                ..
-            } = &mut *st;
-            composite_cache_premul.resize(len, 0);
-            composite_layers_into(composite_cache_premul, doc.width, doc.height, &doc.layers);
-            composite_cache_straight.resize(len, 0);
-            premul_to_straight_rgba_into(composite_cache_straight, composite_cache_premul);
-            *composite_cache_at_revision = *document_visual_revision;
-            let straight = std::mem::take(composite_cache_straight);
-            let bytes = glib::Bytes::from_owned(straight);
-            *composite_cache_pixbuf = Some(Pixbuf::from_bytes(
-                &bytes,
-                gdk_pixbuf::Colorspace::Rgb,
-                true,
-                8,
-                w as i32,
-                h as i32,
-                stride,
-            ));
+            let stroke_active = st.stroke_composite_active_layer;
+            let below_temp = if st.brush_stroke_in_progress && st.stroke_composite_below_valid() {
+                st.stroke_composite_below.take()
+            } else {
+                None
+            };
+            st.composite_cache_surface = None;
+            {
+                let AppState {
+                    ref doc,
+                    ref mut composite_cache_premul,
+                    ..
+                } = *st;
+                composite_cache_premul.resize(len, 0);
+                if let Some(ref below) = below_temp {
+                    composite_layers_from_below_into(
+                        composite_cache_premul,
+                        doc.width,
+                        doc.height,
+                        &doc.layers,
+                        stroke_active,
+                        below,
+                    );
+                } else {
+                    composite_layers_into(
+                        composite_cache_premul,
+                        doc.width,
+                        doc.height,
+                        &doc.layers,
+                    );
+                }
+            }
+            st.stroke_composite_below = below_temp;
+            {
+                let AppState {
+                    ref composite_cache_premul,
+                    ref mut composite_cache_surface,
+                    ref mut composite_cache_at_revision,
+                    document_visual_revision,
+                    ..
+                } = *st;
+                let cairo_stride = gtk::cairo::Format::ARgb32
+                    .stride_for_width(w)
+                    .expect("cairo stride");
+                let need_new = composite_cache_surface.as_ref().map_or(true, |s| {
+                    s.width() != w_i || s.height() != h_i || s.stride() != cairo_stride
+                });
+                if need_new {
+                    *composite_cache_surface = Some(
+                        gtk::cairo::ImageSurface::create(
+                            gtk::cairo::Format::ARgb32,
+                            w_i,
+                            h_i,
+                        )
+                        .expect("composite ImageSurface"),
+                    );
+                }
+                let surf = composite_cache_surface.as_mut().expect("surface");
+                {
+                    let mut data = surf.data().expect("composite surface data");
+                    premul_rgba_to_cairo_argb32(
+                        &mut data,
+                        cairo_stride as usize,
+                        w,
+                        h,
+                        composite_cache_premul,
+                    );
+                }
+                *composite_cache_at_revision = document_visual_revision;
+            }
         }
-        st.composite_cache_pixbuf
+        st.composite_cache_surface
             .as_ref()
-            .expect("composite pixbuf after rebuild")
+            .expect("composite surface after rebuild")
             .clone()
     };
 
@@ -2161,66 +2350,105 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.set_source(pat).unwrap();
         cr.paint().unwrap();
     });
-    cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
+    cr.set_source_surface(composite_surface.as_ref(), 0.0, 0.0)
+        .expect("set_source_surface composite");
     cr.source().set_filter(gtk::cairo::Filter::Nearest);
     cr.paint().unwrap();
     cr.restore().unwrap();
 
-    if let Some(ref f) = floating {
-        let fs = premul_to_straight_rgba(&f.data);
-        let fw = f.w.max(1);
-        let fh = f.h.max(1);
-        let pb = Pixbuf::from_bytes(
-            &glib::Bytes::from_owned(fs),
-            gdk_pixbuf::Colorspace::Rgb,
-            true,
-            8,
-            fw,
-            fh,
-            fw * 4,
-        );
-        cr.save().unwrap();
-        cr.translate(pan_x, pan_y);
-        cr.scale(zoom, zoom);
-        let m = floating_image_to_doc_matrix(f);
-        cr.transform(m);
-        cr.set_source_pixbuf(&pb, 0.0, 0.0);
-        let filt = if (f.scale_x - 1.0).abs() < 1e-6
-            && (f.scale_y - 1.0).abs() < 1e-6
-            && f.angle_deg.rem_euclid(90.0).abs() < 1e-6
-        {
-            gtk::cairo::Filter::Nearest
+    let floating_pixbuf = {
+        let mut st = state.borrow_mut();
+        if st.floating.is_none() {
+            st.floating_pixbuf_cache = None;
+            st.floating_pixbuf_key = None;
+            None
         } else {
-            gtk::cairo::Filter::Good
-        };
-        cr.source().set_filter(filt);
-        cr.paint().unwrap();
-        cr.restore().unwrap();
+            let key = {
+                let f = st.floating.as_ref().unwrap();
+                let fw = f.w.max(1);
+                let fh = f.h.max(1);
+                (f.data.as_ptr() as usize, f.data.len(), fw, fh)
+            };
+            let hit = st.floating_pixbuf_key == Some(key) && st.floating_pixbuf_cache.is_some();
+            if hit {
+                st.floating_pixbuf_cache.clone()
+            } else {
+                let f = st.floating.take().unwrap();
+                let fw = f.w.max(1);
+                let fh = f.h.max(1);
+                let fl_len = (fw * fh * 4) as usize;
+                st.floating_straight_scratch.resize(fl_len, 0);
+                premul_to_straight_rgba_into(&mut st.floating_straight_scratch, &f.data);
+                let bytes = glib::Bytes::from_owned(std::mem::replace(
+                    &mut st.floating_straight_scratch,
+                    Vec::new(),
+                ));
+                let pb = Pixbuf::from_bytes(
+                    &bytes,
+                    gdk_pixbuf::Colorspace::Rgb,
+                    true,
+                    8,
+                    fw,
+                    fh,
+                    fw * 4,
+                );
+                st.floating_pixbuf_cache = Some(pb.clone());
+                st.floating_pixbuf_key = Some(key);
+                st.floating = Some(f);
+                Some(pb)
+            }
+        }
+    };
 
-        let quad = floating_quad_doc(f);
-        cr.save().unwrap();
-        cr.translate(pan_x, pan_y);
-        cr.scale(zoom, zoom);
-        cr.set_dash(&[6.0, 6.0], 0.0);
-        cr.set_line_width(1.0 / zoom.max(0.001));
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-        cr.move_to(quad[0].0, quad[0].1);
-        cr.line_to(quad[1].0, quad[1].1);
-        cr.line_to(quad[2].0, quad[2].1);
-        cr.line_to(quad[3].0, quad[3].1);
-        cr.close_path();
-        cr.stroke().unwrap();
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-        cr.set_dash(&[6.0, 6.0], 6.0);
-        cr.move_to(quad[0].0, quad[0].1);
-        cr.line_to(quad[1].0, quad[1].1);
-        cr.line_to(quad[2].0, quad[2].1);
-        cr.line_to(quad[3].0, quad[3].1);
-        cr.close_path();
-        cr.stroke().unwrap();
-        draw_floating_handles(cr, zoom, f);
-        cr.restore().unwrap();
+    if let Some(pb) = floating_pixbuf {
+        let st_fl = state.borrow();
+        if let Some(f) = st_fl.floating.as_ref() {
+            cr.save().unwrap();
+            cr.translate(pan_x, pan_y);
+            cr.scale(zoom, zoom);
+            let m = floating_image_to_doc_matrix(f);
+            cr.transform(m);
+            cr.set_source_pixbuf(&pb, 0.0, 0.0);
+            let filt = if (f.scale_x - 1.0).abs() < 1e-6
+                && (f.scale_y - 1.0).abs() < 1e-6
+                && f.angle_deg.rem_euclid(90.0).abs() < 1e-6
+            {
+                gtk::cairo::Filter::Nearest
+            } else {
+                gtk::cairo::Filter::Good
+            };
+            cr.source().set_filter(filt);
+            cr.paint().unwrap();
+            cr.restore().unwrap();
+
+            let quad = floating_quad_doc(f);
+            cr.save().unwrap();
+            cr.translate(pan_x, pan_y);
+            cr.scale(zoom, zoom);
+            cr.set_dash(&[6.0, 6.0], 0.0);
+            cr.set_line_width(1.0 / zoom.max(0.001));
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+            cr.move_to(quad[0].0, quad[0].1);
+            cr.line_to(quad[1].0, quad[1].1);
+            cr.line_to(quad[2].0, quad[2].1);
+            cr.line_to(quad[3].0, quad[3].1);
+            cr.close_path();
+            cr.stroke().unwrap();
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
+            cr.set_dash(&[6.0, 6.0], 6.0);
+            cr.move_to(quad[0].0, quad[0].1);
+            cr.line_to(quad[1].0, quad[1].1);
+            cr.line_to(quad[2].0, quad[2].1);
+            cr.line_to(quad[3].0, quad[3].1);
+            cr.close_path();
+            cr.stroke().unwrap();
+            draw_floating_handles(cr, zoom, f);
+            cr.restore().unwrap();
+        }
     }
+
+    let st_draw = state.borrow();
+    let selection = st_draw.selection.as_ref();
 
     if let Some(sel) = selection {
         cr.save().unwrap();
@@ -2232,47 +2460,22 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             Selection::Rect(sx, sy, sw, sh) => {
                 cr.set_dash(&[6.0, 6.0], 0.0);
                 cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-                cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
+                cr.rectangle(*sx as f64, *sy as f64, *sw as f64, *sh as f64);
                 cr.stroke().unwrap();
                 cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
                 cr.set_dash(&[6.0, 6.0], 6.0);
-                cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
+                cr.rectangle(*sx as f64, *sy as f64, *sw as f64, *sh as f64);
                 cr.stroke().unwrap();
             }
             Selection::Region {
                 width: rw,
                 height: rh,
                 mask,
+                ..
             } => {
-                if rw == w && rh == h && mask.len() == (w * h) as usize {
+                if *rw == w && *rh == h && mask.len() == (w * h) as usize {
                     cr.new_path();
-                    let ww = rw as usize;
-                    for yy in 0..rh {
-                        for xx in 0..rw {
-                            let idx = (yy * rw + xx) as usize;
-                            if mask[idx] == 0 {
-                                continue;
-                            }
-                            let xf = xx as f64;
-                            let yf = yy as f64;
-                            if yy == 0 || mask[idx - ww] == 0 {
-                                cr.move_to(xf, yf);
-                                cr.line_to(xf + 1.0, yf);
-                            }
-                            if yy + 1 == rh || mask[idx + ww] == 0 {
-                                cr.move_to(xf, yf + 1.0);
-                                cr.line_to(xf + 1.0, yf + 1.0);
-                            }
-                            if xx == 0 || mask[idx - 1] == 0 {
-                                cr.move_to(xf, yf);
-                                cr.line_to(xf, yf + 1.0);
-                            }
-                            if xx + 1 == rw || mask[idx + 1] == 0 {
-                                cr.move_to(xf + 1.0, yf);
-                                cr.line_to(xf + 1.0, yf + 1.0);
-                            }
-                        }
-                    }
+                    region_mask_outline_path(cr, mask, *rw, *rh);
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
                     cr.set_dash(&[6.0, 6.0], 0.0);
                     cr.stroke_preserve().unwrap();
@@ -2511,6 +2714,9 @@ fn setup_canvas_input(
         let mut start_brush_paint_tick = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser => {
+                if st.doc.active_layer_ref().is_none() {
+                    return;
+                }
                 let eraser = st.tool == ToolKind::Eraser;
                 let color = if eraser {
                     st.fg
@@ -2521,28 +2727,27 @@ fn setup_canvas_input(
                 let hardness = st.brush_hardness;
                 st.brush_stroke_in_progress = true;
                 st.begin_stroke_undo();
+                st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
-                let layer = match st.doc.active_layer_mut() {
-                    Some(l) => l,
-                    None => return,
-                };
+                let layer = st.doc.active_layer_mut().expect("checked");
                 stamp_circle(layer, dx, dy, radius, hardness, color, eraser);
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
                 start_brush_paint_tick = true;
             }
             ToolKind::Pixel => {
+                if st.doc.active_layer_ref().is_none() {
+                    return;
+                }
                 let color = st.active_paint_color();
                 let size = st.brush_size;
                 st.brush_stroke_in_progress = true;
                 st.begin_stroke_undo();
+                st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
-                let layer = match st.doc.active_layer_mut() {
-                    Some(l) => l,
-                    None => return,
-                };
+                let layer = st.doc.active_layer_mut().expect("checked");
                 stamp_square(layer, dx, dy, size, color, false);
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
@@ -2572,21 +2777,43 @@ fn setup_canvas_input(
                 let cw = st.doc.width;
                 let ch = st.doc.height;
                 let clen = (cw * ch * 4) as usize;
-                let premul: Cow<'_, [u8]> = if !st.brush_stroke_in_progress
+                let xi = dx.floor() as i32;
+                let yi = dy.floor() as i32;
+                let c = if st.brush_stroke_in_progress && st.stroke_composite_below_valid() {
+                    let AppState {
+                        ref doc,
+                        ref mut composite_cache_premul,
+                        ref mut stroke_composite_below,
+                        stroke_composite_active_layer,
+                        ..
+                    } = *st;
+                    let below = stroke_composite_below.take().expect("stroke below");
+                    composite_cache_premul.resize(clen, 0);
+                    composite_layers_from_below_into(
+                        composite_cache_premul,
+                        cw,
+                        ch,
+                        &doc.layers,
+                        stroke_composite_active_layer,
+                        &below,
+                    );
+                    *stroke_composite_below = Some(below);
+                    sample_composite_premul(composite_cache_premul, cw, ch, xi, yi)
+                } else if !st.brush_stroke_in_progress
                     && st.composite_cache_at_revision == st.document_visual_revision
                     && st.composite_cache_premul.len() == clen
                 {
-                    Cow::Borrowed(st.composite_cache_premul.as_slice())
+                    sample_composite_premul(st.composite_cache_premul.as_slice(), cw, ch, xi, yi)
                 } else {
-                    Cow::Owned(st.doc.composite())
+                    let AppState {
+                        ref doc,
+                        ref mut composite_cache_premul,
+                        ..
+                    } = *st;
+                    composite_cache_premul.resize(clen, 0);
+                    composite_layers_into(composite_cache_premul, cw, ch, &doc.layers);
+                    sample_composite_premul(composite_cache_premul.as_slice(), cw, ch, xi, yi)
                 };
-                let c = sample_composite_premul(
-                    premul.as_ref(),
-                    cw,
-                    ch,
-                    dx.floor() as i32,
-                    dy.floor() as i32,
-                );
                 if st.pointer_drag_button == gdk::BUTTON_SECONDARY {
                     st.bg = c;
                 } else {
@@ -2610,12 +2837,13 @@ fn setup_canvas_input(
                 if let Some(layer) = st.doc.active_layer_ref() {
                     let x = dx.floor().clamp(0.0, dw as f64 - 1.0) as u32;
                     let y = dy.floor().clamp(0.0, dh as f64 - 1.0) as u32;
-                    let mask = flood_select_mask(layer, x, y, st.fill_tolerance);
+                    let (mask, wand_bbox) = flood_select_mask(layer, x, y, st.fill_tolerance);
                     if mask.iter().any(|&v| v != 0) {
                         st.selection = Some(Selection::Region {
                             width: dw,
                             height: dh,
                             mask,
+                            tight_bbox: wand_bbox,
                         });
                     }
                 }
@@ -2697,7 +2925,12 @@ fn setup_canvas_input(
                                     st.selection = None;
                                     st.modified = true;
                                 }
-                                Selection::Region { width, height, mask } => {
+                                Selection::Region {
+                                    width,
+                                    height,
+                                    mask,
+                                    tight_bbox,
+                                } => {
                                     if width != st.doc.width
                                         || height != st.doc.height
                                         || mask.len() != (width * height) as usize
@@ -2705,7 +2938,7 @@ fn setup_canvas_input(
                                         return;
                                     }
                                     let Some((bx, by, bw, bh)) =
-                                        region_tight_bbox(&mask, width, height)
+                                        region_tight_bbox_or_hint(&mask, width, height, tight_bbox)
                                     else {
                                         return;
                                     };
@@ -2890,6 +3123,7 @@ fn setup_canvas_input(
                 *bws_end.borrow_mut() = None;
                 *lbs_end.borrow_mut() = None;
                 st.commit_stroke_undo();
+                st.clear_stroke_composite_below();
                 st.brush_stroke_in_progress = false;
                 st.last_doc_pos = None;
             }
@@ -3034,14 +3268,21 @@ fn cut_selection(state: &SharedState) {
             clear_rect(layer, sx, sy, sw, sh);
             st.clipboard = Some((sw, sh, data));
         }
-        Selection::Region { width, height, mask } => {
+        Selection::Region {
+            width,
+            height,
+            mask,
+            tight_bbox,
+        } => {
             if width != layer.width
                 || height != layer.height
                 || mask.len() != (width * height) as usize
             {
                 return;
             }
-            let Some((bx, by, bw, bh)) = region_tight_bbox(&mask, width, height) else {
+            let Some((bx, by, bw, bh)) =
+                region_tight_bbox_or_hint(&mask, width, height, tight_bbox)
+            else {
                 return;
             };
             let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
@@ -3069,7 +3310,12 @@ fn erase_selection(state: &SharedState) {
         Selection::Rect(sx, sy, sw, sh) => {
             clear_rect(layer, sx, sy, sw, sh);
         }
-        Selection::Region { width, height, mask } => {
+        Selection::Region {
+            width,
+            height,
+            mask,
+            ..
+        } => {
             if width != layer.width
                 || height != layer.height
                 || mask.len() != (width * height) as usize
@@ -3098,14 +3344,21 @@ fn copy_selection(state: &SharedState) {
             let data = copy_rect(layer, sx, sy, sw, sh);
             (sw, sh, data)
         }
-        Selection::Region { width, height, mask } => {
+        Selection::Region {
+            width,
+            height,
+            mask,
+            tight_bbox,
+        } => {
             if width != layer.width
                 || height != layer.height
                 || mask.len() != (width * height) as usize
             {
                 return;
             }
-            let Some((bx, by, bw, bh)) = region_tight_bbox(&mask, width, height) else {
+            let Some((bx, by, bw, bh)) =
+                region_tight_bbox_or_hint(&mask, width, height, tight_bbox)
+            else {
                 return;
             };
             let data = copy_region_masked(layer, &mask, bx, by, bw, bh);

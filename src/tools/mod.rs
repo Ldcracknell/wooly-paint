@@ -94,7 +94,16 @@ pub fn stamp_circle(
     let w = layer.width as i32;
     let h = layer.height as i32;
     let r = radius.max(0.5);
+    let r2 = r * r;
     let hard = hardness.clamp(0.0, 1.0);
+    let gamma = 0.42 + 19.5 * hard * hard;
+    let mut falloff_lut = [0f64; 256];
+    for (i, slot) in falloff_lut.iter_mut().enumerate() {
+        let u = i as f64 / 255.0;
+        *slot = u.powf(gamma);
+    }
+    let lift_scale = (1.0 - hard) * 0.22;
+    let inv_r = 1.0 / r;
     let x0 = (cx - r - 1.0).floor() as i32;
     let y0 = (cy - r - 1.0).floor() as i32;
     let x1 = (cx + r + 1.0).ceil() as i32;
@@ -105,18 +114,18 @@ pub fn stamp_circle(
         for ix in x0.max(0)..x1.min(w) {
             let dx = ix as f64 + 0.5 - cx;
             let dy = iy as f64 + 0.5 - cy;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d > r {
+            let d2 = dx * dx + dy * dy;
+            if d2 > r2 {
                 continue;
             }
-            let u = (1.0 - d / r).clamp(0.0, 1.0);
+            let d = d2.sqrt();
+            let u = (1.0 - d * inv_r).clamp(0.0, 1.0);
             if u <= 0.0 {
                 continue;
             }
-            // Gamma ramps gently with hardness so mid-slider stays usable (no exponential 125^h).
-            let gamma = 0.42 + 19.5 * hard * hard;
-            let body = u.powf(gamma);
-            let lift = (1.0 - hard) * 0.22 * u;
+            let ui = (u * 255.0 + 0.5).clamp(0.0, 255.0) as usize;
+            let body = falloff_lut[ui];
+            let lift = lift_scale * u;
             let a_straight = (body + lift).min(1.0);
             let alpha: f64 = a_straight * color[3] as f64 / 255.0;
             if alpha <= 0.0 {
@@ -156,6 +165,14 @@ fn brush_stroke_step(radius: f64, hardness: f64) -> f64 {
     (base * tight).max(0.05)
 }
 
+/// Minimum spacing between dab centers: softer brushes need denser dabs, but an absolute floor
+/// avoids pathological segment counts when the pointer jumps (fast moves, low event rate).
+fn brush_min_step(radius: f64, hardness: f64) -> f64 {
+    let h = hardness.clamp(0.0, 1.0);
+    let r = radius.max(0.5);
+    (r * (0.07 + 0.93 * h * h)).max(0.12)
+}
+
 pub fn stroke_line(
     layer: &mut Layer,
     x0: f64,
@@ -175,14 +192,17 @@ pub fn stroke_line(
         return;
     }
     let r = radius.max(0.5);
-    let mut step = brush_stroke_step(radius, hardness);
-    step = step.min(r * 0.33).max(0.06);
+    let h = hardness.clamp(0.0, 1.0);
+    let mut step = brush_stroke_step(radius, hardness).max(brush_min_step(radius, hardness));
+    step = step.min(r * 0.33).max(0.08);
     let n_f = (len / step).ceil();
     if !n_f.is_finite() || n_f <= 0.0 {
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
         return;
     }
-    let n = (n_f as u64).min(2_000_000) as usize;
+    // Cap dab count per segment so a single long chord cannot freeze the UI.
+    let max_n = (50_000.0 / (0.15 + 0.85 * h * h)) as u64;
+    let n = (n_f as u64).min(max_n).min(200_000) as usize;
     if n == 0 {
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
         return;
@@ -303,14 +323,26 @@ pub fn stroke_line_square(
 }
 
 /// Connected pixels matching `layer[(x,y)]` within `tolerance` (premul RGBA). Does not modify the layer.
-pub fn flood_select_mask(layer: &Layer, x: u32, y: u32, tolerance: u8) -> Vec<u8> {
+/// Second value is tight bounds of selected cells when any, same coordinate space as [`region_tight_bbox`].
+pub fn flood_select_mask(
+    layer: &Layer,
+    x: u32,
+    y: u32,
+    tolerance: u8,
+) -> (Vec<u8>, Option<(i32, i32, i32, i32)>) {
     let w = layer.width;
     let h = layer.height;
     let len = (w * h) as usize;
     let mut mask = vec![0u8; len];
     if x >= w || y >= h {
-        return mask;
+        return (mask, None);
     }
+    let wi = w as i32;
+    let hi = h as i32;
+    let mut min_x = wi;
+    let mut min_y = hi;
+    let mut max_x = -1i32;
+    let mut max_y = -1i32;
     let start = layer.pixel_premul(x, y);
     let tol = tolerance as i32;
     let match_start =
@@ -326,6 +358,12 @@ pub fn flood_select_mask(layer: &Layer, x: u32, y: u32, tolerance: u8) -> Vec<u8
             continue;
         }
         mask[idx] = 1;
+        let xi = cx as i32;
+        let yi = cy as i32;
+        min_x = min_x.min(xi);
+        min_y = min_y.min(yi);
+        max_x = max_x.max(xi);
+        max_y = max_y.max(yi);
         if cx > 0 {
             stack.push((cx - 1, cy));
         }
@@ -339,7 +377,25 @@ pub fn flood_select_mask(layer: &Layer, x: u32, y: u32, tolerance: u8) -> Vec<u8
             stack.push((cx, cy + 1));
         }
     }
-    mask
+    let bbox = if max_x < min_x {
+        None
+    } else {
+        Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+    };
+    (mask, bbox)
+}
+
+/// Uses `hint` when present (caller must guarantee it matches `mask`), else scans the mask.
+pub fn region_tight_bbox_or_hint(
+    mask: &[u8],
+    width: u32,
+    height: u32,
+    hint: Option<(i32, i32, i32, i32)>,
+) -> Option<(i32, i32, i32, i32)> {
+    if let Some(b) = hint {
+        return Some(b);
+    }
+    region_tight_bbox(mask, width, height)
 }
 
 /// Tight integer bounds `(x, y, w, h)` of all non-zero mask cells.
@@ -536,14 +592,28 @@ pub fn draw_rect_outline(
     let min_y = y0.min(y1);
     let max_y = y0.max(y1);
     if filled {
-        for iy in min_y.floor() as i32..=max_y.ceil() as i32 {
-            for ix in min_x.floor() as i32..=max_x.ceil() as i32 {
-                let px = ix as f64 + 0.5;
-                let py = iy as f64 + 0.5;
-                if px >= min_x && px <= max_x && py >= min_y && py <= max_y {
+        let step = brush_stroke_step(radius, hardness)
+            .max(brush_min_step(radius, hardness))
+            .max(radius * 0.22)
+            .max(0.75);
+        let mut y = min_y.floor();
+        let y1 = max_y.ceil();
+        let x0f = min_x;
+        let x1f = max_x;
+        let y0f = min_y;
+        let y1f = max_y;
+        while y <= y1 {
+            let mut x = min_x.floor();
+            let x1 = max_x.ceil();
+            while x <= x1 {
+                let px = x + 0.5;
+                let py = y + 0.5;
+                if px >= x0f && px <= x1f && py >= y0f && py <= y1f {
                     stamp_circle(layer, px, py, radius, hardness, color, eraser);
                 }
+                x += step;
             }
+            y += step;
         }
     } else {
         stroke_line(layer, min_x, min_y, max_x, min_y, radius, hardness, color, eraser);
@@ -599,16 +669,26 @@ pub fn draw_ellipse(
     let w = layer.width as i32;
     let h = layer.height as i32;
     if filled {
-        for iy in y_min.max(0)..y_max.min(h) {
-            for ix in x_min.max(0)..x_max.min(w) {
-                let px = ix as f64 + 0.5;
-                let py = iy as f64 + 0.5;
+        let step = brush_stroke_step(radius, hardness)
+            .max(brush_min_step(radius, hardness))
+            .max(radius * 0.18)
+            .max(0.75);
+        let y_end = y_max.min(h) as f64;
+        let x_end = x_max.min(w) as f64;
+        let mut y = y_min.max(0) as f64;
+        while y < y_end {
+            let mut x = x_min.max(0) as f64;
+            while x < x_end {
+                let px = x + 0.5;
+                let py = y + 0.5;
                 let nx = (px - cx) / rx;
                 let ny = (py - cy) / ry;
                 if nx * nx + ny * ny <= 1.0 {
                     stamp_circle(layer, px, py, radius, hardness, color, eraser);
                 }
+                x += step;
             }
+            y += step;
         }
     } else {
         let n = ellipse_outline_segment_count(rx, ry, radius, hardness);

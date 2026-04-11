@@ -1,7 +1,8 @@
-use crate::document::{Document, History};
+use crate::document::{composite_layers_prefix_into, Document, History};
 use crate::palette::PaletteBook;
 use crate::tools::ToolKind;
 use gdk_pixbuf::Pixbuf;
+use gtk::cairo::ImageSurface;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -45,6 +46,8 @@ pub enum Selection {
         width: u32,
         height: u32,
         mask: Vec<u8>,
+        /// When set (e.g. magic wand), tight bounds of `mask` to skip a full-mask scan.
+        tight_bbox: Option<(i32, i32, i32, i32)>,
     },
 }
 
@@ -56,7 +59,12 @@ impl Selection {
             Selection::Rect(sx, sy, sw, sh) => {
                 xi >= *sx && yi >= *sy && xi < sx + sw && yi < sy + sh
             }
-            Selection::Region { width, height, mask } => {
+            Selection::Region {
+                width,
+                height,
+                mask,
+                ..
+            } => {
                 if xi < 0 || yi < 0 || xi >= *width as i32 || yi >= *height as i32 {
                     return false;
                 }
@@ -141,13 +149,20 @@ pub struct AppState {
     pub document_visual_revision: u64,
     /// Cached full-document composite (premultiplied RGBA), valid when `composite_cache_at_revision == document_visual_revision`.
     pub composite_cache_premul: Vec<u8>,
-    /// Scratch for straight RGBA while rebuilding the composite; moved into `glib::Bytes` when the cache is refreshed (often empty while cache hit).
-    pub composite_cache_straight: Vec<u8>,
-    /// Full-document composite for drawing; pixel data lives here between paints (not duplicated in `composite_cache_straight`).
-    pub composite_cache_pixbuf: Option<Pixbuf>,
+    /// Cairo `ImageSurface` for painting the flattened document (BGRA premul); pixels updated from `composite_cache_premul`.
+    pub composite_cache_surface: Option<ImageSurface>,
     pub composite_cache_at_revision: u64,
+    /// Straight RGBA scratch for rebuilding [`Self::floating_pixbuf_cache`].
+    pub floating_straight_scratch: Vec<u8>,
+    pub floating_pixbuf_cache: Option<Pixbuf>,
+    pub floating_pixbuf_key: Option<(usize, usize, i32, i32)>,
     /// While true, composite cache is not used (pixels change every event during brush/pixel/eraser stroke).
     pub brush_stroke_in_progress: bool,
+    /// During brush/pixel/eraser stroke: flattened premul RGBA of layers strictly below
+    /// [`Document::active_layer`] at stroke start. Used to avoid recompositing the full stack each frame.
+    pub stroke_composite_below: Option<Vec<u8>>,
+    pub stroke_composite_active_layer: usize,
+    pub stroke_composite_doc_wh: (u32, u32),
 }
 
 impl AppState {
@@ -210,11 +225,47 @@ impl AppState {
             recent_files: Vec::new(),
             document_visual_revision: 0,
             composite_cache_premul: Vec::new(),
-            composite_cache_straight: Vec::new(),
-            composite_cache_pixbuf: None,
+            composite_cache_surface: None,
             composite_cache_at_revision: u64::MAX,
+            floating_straight_scratch: Vec::new(),
+            floating_pixbuf_cache: None,
+            floating_pixbuf_key: None,
             brush_stroke_in_progress: false,
+            stroke_composite_below: None,
+            stroke_composite_active_layer: 0,
+            stroke_composite_doc_wh: (0, 0),
         }
+    }
+
+    /// Call after [`Self::begin_stroke_undo`] on brush/pixel/eraser press, before mutating the active layer.
+    pub fn capture_stroke_composite_below(&mut self) {
+        let w = self.doc.width;
+        let h = self.doc.height;
+        let len = (w * h * 4) as usize;
+        let active = self.doc.active_layer;
+        let mut v = vec![0u8; len];
+        composite_layers_prefix_into(&mut v, w, h, &self.doc.layers, active);
+        self.stroke_composite_below = Some(v);
+        self.stroke_composite_active_layer = active;
+        self.stroke_composite_doc_wh = (w, h);
+    }
+
+    pub fn clear_stroke_composite_below(&mut self) {
+        self.stroke_composite_below = None;
+        self.stroke_composite_doc_wh = (0, 0);
+    }
+
+    /// True when incremental stroke compositing matches the current document and active layer.
+    pub fn stroke_composite_below_valid(&self) -> bool {
+        let (dw, dh) = (self.doc.width, self.doc.height);
+        let expected = (dw * dh * 4) as usize;
+        let Some(buf) = self.stroke_composite_below.as_ref() else {
+            return false;
+        };
+        !buf.is_empty()
+            && buf.len() == expected
+            && self.stroke_composite_doc_wh == (dw, dh)
+            && self.stroke_composite_active_layer == self.doc.active_layer
     }
 
     /// Invalidate composite cache (call after any change that affects flattened pixels or layer stack).
@@ -224,12 +275,15 @@ impl AppState {
 
     /// Drop GPU-adjacent composite caches on application shutdown so heap blocks are freed before exit.
     pub fn release_drawing_caches(&mut self) {
-        self.composite_cache_pixbuf = None;
+        self.clear_stroke_composite_below();
+        self.composite_cache_surface = None;
         self.composite_cache_premul.clear();
         self.composite_cache_premul.shrink_to_fit();
-        self.composite_cache_straight.clear();
-        self.composite_cache_straight.shrink_to_fit();
         self.composite_cache_at_revision = u64::MAX;
+        self.floating_straight_scratch.clear();
+        self.floating_straight_scratch.shrink_to_fit();
+        self.floating_pixbuf_cache = None;
+        self.floating_pixbuf_key = None;
     }
 
     pub fn widget_to_doc(&self, wx: f64, wy: f64) -> (f64, f64) {

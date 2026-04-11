@@ -78,6 +78,19 @@ fn normalized_theme(s: &str) -> &'static str {
     }
 }
 
+/// Read only the stored appearance value (`"default"`, `"light"`, or `"dark"`) without touching [`AppState`].
+/// Used before `GtkApplication` exists so libadwaita can apply the scheme early.
+pub(crate) fn saved_color_scheme_menu_value() -> &'static str {
+    let path = config_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "default";
+    };
+    let Ok(parsed) = serde_json::from_slice::<FileSettings>(&bytes) else {
+        return "default";
+    };
+    normalized_theme(parsed.color_scheme.trim())
+}
+
 fn merge_keybinds(stored: &[StoredBind]) -> Vec<(ToolKind, Option<char>)> {
     let mut out = AppState::default_tool_keybinds();
     if stored.is_empty() {

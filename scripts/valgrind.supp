@@ -1,0 +1,52 @@
+# Valgrind suppressions for wooly-paint (use with scripts/valgrind-wooly-paint.sh).
+# See: https://valgrind.org/docs/manual/mc-manual.html#mc-manual.suppfiles
+
+# *ring* uses uninitialized buffers in constant-time crypto; Memcheck reports false positives.
+{
+   wooly-ring-verify_slices_cond
+   Memcheck:Cond
+   fun:verify_slices_are_equal
+}
+{
+   wooly-ring-verify_slices_value4
+   Memcheck:Value4
+   fun:verify_slices_are_equal
+}
+{
+   wooly-ring-verify_slices_value8
+   Memcheck:Value8
+   fun:verify_slices_are_equal
+}
+
+# *rustls* may send TLS records with padding bytes that are deliberately not written; safe on the wire.
+{
+   wooly-rustls-writev-padding
+   Memcheck:Param
+   writev(vector[0])
+   fun:writev
+   fun:write_vectored
+   obj:*wooly*paint*
+}
+
+# Fontconfig / Pango / HarfBuzz: exit-time font stack caches (main thread + Pango worker).
+{
+   wooly-fontconfig-fc-pattern-malloc
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:FcPatternObjectInsertElt
+}
+{
+   wooly-fontconfig-fc-pattern-realloc
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:realloc
+   fun:FcPatternObjectInsertElt
+}
+{
+   wooly-harfbuzz-hb-blob-calloc
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:calloc
+   fun:hb_blob_create_from_file_or_fail
+}
