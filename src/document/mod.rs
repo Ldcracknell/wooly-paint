@@ -272,6 +272,67 @@ impl Document {
         self.height = new_h;
     }
 
+    /// Mirror all layers horizontally (flip around the vertical center line).
+    pub fn flip_x(&mut self) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        for layer in &mut self.layers {
+            for y in 0..h {
+                let row = y * w * 4;
+                for x in 0..w / 2 {
+                    let i = row + x * 4;
+                    let j = row + (w - 1 - x) * 4;
+                    for k in 0..4 {
+                        layer.pixels.swap(i + k, j + k);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mirror all layers vertically (flip around the horizontal center line).
+    pub fn flip_y(&mut self) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let row_stride = w * 4;
+        let mut tmp = vec![0u8; row_stride];
+        for layer in &mut self.layers {
+            for y in 0..h / 2 {
+                let r1 = y * row_stride;
+                let r2 = (h - 1 - y) * row_stride;
+                tmp.copy_from_slice(&layer.pixels[r1..r1 + row_stride]);
+                layer.pixels.copy_within(r2..r2 + row_stride, r1);
+                layer.pixels[r2..r2 + row_stride].copy_from_slice(&tmp);
+            }
+        }
+    }
+
+    /// Rotate all layers 90° clockwise; canvas size becomes `(height × width)`.
+    pub fn rotate_90_cw(&mut self) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let new_w = h as u32;
+        let new_h = w as u32;
+        for layer in &mut self.layers {
+            let old = std::mem::take(&mut layer.pixels);
+            let mut out = vec![0u8; w * h * 4];
+            for y_old in 0..h {
+                for x_old in 0..w {
+                    let x_new = h - 1 - y_old;
+                    let y_new = x_old;
+                    let si = (y_old * w + x_old) * 4;
+                    let di = (y_new * h + x_new) * 4;
+                    out[di..di + 4].copy_from_slice(&old[si..si + 4]);
+                }
+            }
+            layer.pixels = out;
+            layer.width = new_w;
+            layer.height = new_h;
+        }
+        self.width = new_w;
+        self.height = new_h;
+    }
+
     pub fn move_layer(&mut self, from: usize, to: usize) {
         if from >= self.layers.len() || to >= self.layers.len() || from == to {
             return;

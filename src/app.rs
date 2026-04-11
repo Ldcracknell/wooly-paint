@@ -2338,6 +2338,112 @@ fn new_document_dialog(
     d.present();
 }
 
+fn refresh_after_canvas_change(
+    state: &SharedState,
+    layers_cell: &LayersCell,
+    canvas: &CanvasCell,
+    zoom_fit: bool,
+) {
+    if zoom_fit {
+        zoom_to_fit(state, canvas);
+    }
+    refresh_layers_list(state, layers_cell, canvas);
+    queue_canvas(canvas);
+}
+
+fn finalize_canvas_geometry_change(g: &mut AppState) {
+    g.history.clear();
+    g.selection = None;
+    g.shape_drag_preview = None;
+    g.drag_start_doc = None;
+    g.last_doc_pos = None;
+    g.move_grab_doc = None;
+    g.floating_drag = None;
+    g.modified = true;
+    g.bump_document_revision();
+}
+
+fn canvas_resize_dialog(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    layers_cell: &LayersCell,
+    canvas: &CanvasCell,
+) {
+    let d = libadwaita::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Resize canvas")
+        .default_width(320)
+        .default_height(200)
+        .build();
+
+    let w_adj = gtk::Adjustment::new(800.0, 1.0, 8192.0, 1.0, 64.0, 0.0);
+    let h_adj = gtk::Adjustment::new(600.0, 1.0, 8192.0, 1.0, 64.0, 0.0);
+    let w_spin = gtk::SpinButton::new(Some(&w_adj), 1.0, 0);
+    let h_spin = gtk::SpinButton::new(Some(&h_adj), 1.0, 0);
+    {
+        let st = state.borrow();
+        w_adj.set_value(st.doc.width as f64);
+        h_adj.set_value(st.doc.height as f64);
+    }
+
+    let bx = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .spacing(12)
+        .build();
+    bx.append(&gtk::Label::new(Some("Width")));
+    bx.append(&w_spin);
+    bx.append(&gtk::Label::new(Some("Height")));
+    bx.append(&h_spin);
+
+    let ok = gtk::Button::with_label("Resize");
+    ok.add_css_class("suggested-action");
+    let cancel = gtk::Button::with_label("Cancel");
+    let btn_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    btn_row.append(&cancel);
+    btn_row.append(&ok);
+    bx.append(&btn_row);
+    d.set_content(Some(&bx));
+
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let dw = d.clone();
+    ok.connect_clicked(move |_| {
+        let nw = w_adj.value() as u32;
+        let nh = h_adj.value() as u32;
+        let mut g = st.borrow_mut();
+        commit_floating(&mut g);
+        let resized = nw != g.doc.width || nh != g.doc.height;
+        if resized {
+            g.doc.resize_canvas(nw, nh);
+            finalize_canvas_geometry_change(&mut g);
+        }
+        drop(g);
+        if resized {
+            refresh_after_canvas_change(&st, &lc, &cv, true);
+        } else {
+            refresh_layers_list(&st, &lc, &cv);
+            queue_canvas(&cv);
+        }
+        dw.close();
+    });
+    let dw_cancel = d.clone();
+    cancel.connect_clicked(move |_| {
+        dw_cancel.close();
+    });
+
+    d.present();
+}
+
 fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, tool_strings: &gtk::StringList) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
@@ -3324,6 +3430,13 @@ fn build_menu(
     file.append(Some("Save As…"), Some("win.save_as"));
     menu.append_submenu(Some("_File"), &file);
 
+    let canvas_menu = gio::Menu::new();
+    canvas_menu.append(Some("Resize canvas…"), Some("win.canvas_resize"));
+    canvas_menu.append(Some("Flip X"), Some("win.canvas_flip_x"));
+    canvas_menu.append(Some("Flip Y"), Some("win.canvas_flip_y"));
+    canvas_menu.append(Some("Rotate 90deg"), Some("win.canvas_rotate_cw"));
+    menu.append_submenu(Some("_Canvas"), &canvas_menu);
+
     let settings = gio::Menu::new();
     settings.append(Some("Keybinds…"), Some("win.keybinds"));
     settings.append(Some("Check for Updates…"), Some("win.check_updates"));
@@ -3391,6 +3504,58 @@ fn build_menu(
         save_file_as(&w, &st, &lc, &cv, None);
     });
     app_add_action(window, &save_as_act);
+
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let w = window.clone();
+    let canvas_resize_act = gio::SimpleAction::new("canvas_resize", None);
+    canvas_resize_act.connect_activate(move |_, _| {
+        canvas_resize_dialog(&w, &st, &lc, &cv);
+    });
+    app_add_action(window, &canvas_resize_act);
+
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let canvas_flip_x_act = gio::SimpleAction::new("canvas_flip_x", None);
+    canvas_flip_x_act.connect_activate(move |_, _| {
+        let mut g = st.borrow_mut();
+        commit_floating(&mut g);
+        g.doc.flip_x();
+        finalize_canvas_geometry_change(&mut g);
+        drop(g);
+        refresh_after_canvas_change(&st, &lc, &cv, false);
+    });
+    app_add_action(window, &canvas_flip_x_act);
+
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let canvas_flip_y_act = gio::SimpleAction::new("canvas_flip_y", None);
+    canvas_flip_y_act.connect_activate(move |_, _| {
+        let mut g = st.borrow_mut();
+        commit_floating(&mut g);
+        g.doc.flip_y();
+        finalize_canvas_geometry_change(&mut g);
+        drop(g);
+        refresh_after_canvas_change(&st, &lc, &cv, false);
+    });
+    app_add_action(window, &canvas_flip_y_act);
+
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let canvas_rotate_act = gio::SimpleAction::new("canvas_rotate_cw", None);
+    canvas_rotate_act.connect_activate(move |_, _| {
+        let mut g = st.borrow_mut();
+        commit_floating(&mut g);
+        g.doc.rotate_90_cw();
+        finalize_canvas_geometry_change(&mut g);
+        drop(g);
+        refresh_after_canvas_change(&st, &lc, &cv, true);
+    });
+    app_add_action(window, &canvas_rotate_act);
 
     let st = state.clone();
     let cv = canvas.clone();
