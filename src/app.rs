@@ -2,12 +2,12 @@ use crate::document::{
     composite_layers_into, premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul,
     Document,
 };
-use crate::state::{AppState, FloatingDrag, FloatingSelection};
+use crate::state::{AppState, FloatingDrag, FloatingSelection, Selection};
 use crate::tool_cursors;
 use crate::tools::{
-    clear_rect, copy_rect, draw_ellipse, draw_rect_outline, ellipse_outline_segment_count,
-    flood_fill, paste_rect, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
-    stroke_line_square, ToolKind,
+    clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse, draw_rect_outline,
+    ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect, region_tight_bbox,
+    sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_square, ToolKind,
 };
 use libadwaita::prelude::*;
 use libadwaita::{Application, ColorScheme};
@@ -1040,7 +1040,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             st.pan_y,
             st.zoom,
             st.floating.clone(),
-            st.selection,
+            st.selection.clone(),
             st.shape_drag_preview,
             st.fg,
             st.shape_filled,
@@ -1162,19 +1162,66 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.restore().unwrap();
     }
 
-    if let Some((sx, sy, sw, sh)) = selection {
+    if let Some(sel) = selection {
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        cr.set_dash(&[6.0, 6.0], 0.0);
-        cr.set_line_width(1.0 / zoom.max(0.001));
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-        cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
-        cr.stroke().unwrap();
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-        cr.set_dash(&[6.0, 6.0], 6.0);
-        cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
-        cr.stroke().unwrap();
+        let lw = 1.0 / zoom.max(0.001);
+        cr.set_line_width(lw);
+        match sel {
+            Selection::Rect(sx, sy, sw, sh) => {
+                cr.set_dash(&[6.0, 6.0], 0.0);
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+                cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
+                cr.stroke().unwrap();
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
+                cr.set_dash(&[6.0, 6.0], 6.0);
+                cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
+                cr.stroke().unwrap();
+            }
+            Selection::Region {
+                width: rw,
+                height: rh,
+                mask,
+            } => {
+                if rw == w && rh == h && mask.len() == (w * h) as usize {
+                    cr.new_path();
+                    let ww = rw as usize;
+                    for yy in 0..rh {
+                        for xx in 0..rw {
+                            let idx = (yy * rw + xx) as usize;
+                            if mask[idx] == 0 {
+                                continue;
+                            }
+                            let xf = xx as f64;
+                            let yf = yy as f64;
+                            if yy == 0 || mask[idx - ww] == 0 {
+                                cr.move_to(xf, yf);
+                                cr.line_to(xf + 1.0, yf);
+                            }
+                            if yy + 1 == rh || mask[idx + ww] == 0 {
+                                cr.move_to(xf, yf + 1.0);
+                                cr.line_to(xf + 1.0, yf + 1.0);
+                            }
+                            if xx == 0 || mask[idx - 1] == 0 {
+                                cr.move_to(xf, yf);
+                                cr.line_to(xf, yf + 1.0);
+                            }
+                            if xx + 1 == rw || mask[idx + 1] == 0 {
+                                cr.move_to(xf + 1.0, yf);
+                                cr.line_to(xf + 1.0, yf + 1.0);
+                            }
+                        }
+                    }
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+                    cr.set_dash(&[6.0, 6.0], 0.0);
+                    cr.stroke_preserve().unwrap();
+                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
+                    cr.set_dash(&[6.0, 6.0], 6.0);
+                    cr.stroke().unwrap();
+                }
+            }
+        }
         cr.restore().unwrap();
     }
 
@@ -1185,14 +1232,6 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         draw_shape_drag_preview(cr, tool, x0, y0, x1, y1, fg, shape_filled, brush_size, brush_hardness);
         cr.restore().unwrap();
     }
-}
-
-fn point_in_sel(x: f64, y: f64, sel: (i32, i32, i32, i32)) -> bool {
-    let (sx, sy, sw, sh) = sel;
-    x >= sx as f64
-        && y >= sy as f64
-        && x < (sx + sw) as f64
-        && y < (sy + sh) as f64
 }
 
 fn commit_floating(state: &mut AppState) {
@@ -1460,6 +1499,22 @@ fn setup_canvas_input(
             ToolKind::SelectRect => {
                 st.drag_start_doc = Some((dx, dy));
             }
+            ToolKind::MagicSelect => {
+                let dw = st.doc.width;
+                let dh = st.doc.height;
+                if let Some(layer) = st.doc.active_layer_ref() {
+                    let x = dx.floor().clamp(0.0, dw as f64 - 1.0) as u32;
+                    let y = dy.floor().clamp(0.0, dh as f64 - 1.0) as u32;
+                    let mask = flood_select_mask(layer, x, y, st.fill_tolerance);
+                    if mask.iter().any(|&v| v != 0) {
+                        st.selection = Some(Selection::Region {
+                            width: dw,
+                            height: dh,
+                            mask,
+                        });
+                    }
+                }
+            }
             ToolKind::Hand => {
                 *bws.borrow_mut() = Some((st.pan_x, st.pan_y));
                 tool_cursors::set_canvas_grabbing(&cnv);
@@ -1512,29 +1567,63 @@ fn setup_canvas_input(
                         }
                     }
                 }
-                if st.floating.is_none() {
-                    if let Some(sel) = st.selection {
-                        if point_in_sel(dx, dy, sel) {
-                            let (sx, sy, sw, sh) = sel;
-                            let layer = match st.doc.active_layer_mut() {
-                                Some(l) => l,
-                                None => return,
-                            };
-                            let before = layer.pixels.clone();
-                            let data = copy_rect(layer, sx, sy, sw, sh);
-                            clear_rect(layer, sx, sy, sw, sh);
+                               if st.floating.is_none() {
+                    if let Some(sel) = st.selection.clone() {
+                        if sel.contains_point(dx, dy) {
                             let li = st.doc.active_layer;
-                            st.history.commit_change(li, before);
-                            st.bump_document_revision();
-                            st.floating = Some(FloatingSelection::new_pasted(
-                                sw,
-                                sh,
-                                data,
-                                sx as f64,
-                                sy as f64,
-                            ));
-                            st.selection = None;
-                            st.modified = true;
+                            match sel {
+                                Selection::Rect(sx, sy, sw, sh) => {
+                                    let layer = match st.doc.active_layer_mut() {
+                                        Some(l) => l,
+                                        None => return,
+                                    };
+                                    let before = layer.pixels.clone();
+                                    let data = copy_rect(layer, sx, sy, sw, sh);
+                                    clear_rect(layer, sx, sy, sw, sh);
+                                    st.history.commit_change(li, before);
+                                    st.bump_document_revision();
+                                    st.floating = Some(FloatingSelection::new_pasted(
+                                        sw,
+                                        sh,
+                                        data,
+                                        sx as f64,
+                                        sy as f64,
+                                    ));
+                                    st.selection = None;
+                                    st.modified = true;
+                                }
+                                Selection::Region { width, height, mask } => {
+                                    if width != st.doc.width
+                                        || height != st.doc.height
+                                        || mask.len() != (width * height) as usize
+                                    {
+                                        return;
+                                    }
+                                    let Some((bx, by, bw, bh)) =
+                                        region_tight_bbox(&mask, width, height)
+                                    else {
+                                        return;
+                                    };
+                                    let layer = match st.doc.active_layer_mut() {
+                                        Some(l) => l,
+                                        None => return,
+                                    };
+                                    let before = layer.pixels.clone();
+                                    let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
+                                    clear_region_masked(layer, &mask);
+                                    st.history.commit_change(li, before);
+                                    st.bump_document_revision();
+                                    st.floating = Some(FloatingSelection::new_pasted(
+                                        bw,
+                                        bh,
+                                        data,
+                                        bx as f64,
+                                        by as f64,
+                                    ));
+                                    st.selection = None;
+                                    st.modified = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -1608,7 +1697,8 @@ fn setup_canvas_input(
                 let cur_wx = start_wx + ox;
                 let cur_wy = start_wy + oy;
                 let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
-                st.selection = Some(AppState::normalize_rect(x0, y0, cx, cy));
+                let (rx, ry, rw, rh) = AppState::normalize_rect(x0, y0, cx, cy);
+                st.selection = Some(Selection::Rect(rx, ry, rw, rh));
             }
             ToolKind::Hand => {
                 if let Some((px0, py0)) = *bws_up.borrow() {
@@ -1733,7 +1823,8 @@ fn setup_canvas_input(
                     let cur_wx = start_wx + ox;
                     let cur_wy = start_wy + oy;
                     let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
-                    st.selection = Some(AppState::normalize_rect(sx, sy, cx, cy));
+                    let (rx, ry, rw, rh) = AppState::normalize_rect(sx, sy, cx, cy);
+                    st.selection = Some(Selection::Rect(rx, ry, rw, rh));
                 }
                 st.drag_start_doc = None;
             }
@@ -1817,7 +1908,7 @@ fn setup_canvas_input(
 
 fn cut_selection(state: &SharedState) {
     let mut st = state.borrow_mut();
-    let Some((sx, sy, sw, sh)) = st.selection else {
+    let Some(sel) = st.selection.clone() else {
         return;
     };
     let idx = st.doc.active_layer;
@@ -1825,9 +1916,57 @@ fn cut_selection(state: &SharedState) {
         return;
     };
     let before = layer.pixels.clone();
-    let data = copy_rect(layer, sx, sy, sw, sh);
-    clear_rect(layer, sx, sy, sw, sh);
-    st.clipboard = Some((sw, sh, data));
+    match sel {
+        Selection::Rect(sx, sy, sw, sh) => {
+            let data = copy_rect(layer, sx, sy, sw, sh);
+            clear_rect(layer, sx, sy, sw, sh);
+            st.clipboard = Some((sw, sh, data));
+        }
+        Selection::Region { width, height, mask } => {
+            if width != layer.width
+                || height != layer.height
+                || mask.len() != (width * height) as usize
+            {
+                return;
+            }
+            let Some((bx, by, bw, bh)) = region_tight_bbox(&mask, width, height) else {
+                return;
+            };
+            let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
+            clear_region_masked(layer, &mask);
+            st.clipboard = Some((bw, bh, data));
+        }
+    }
+    st.history.commit_change(idx, before);
+    st.selection = None;
+    st.modified = true;
+    st.bump_document_revision();
+}
+
+fn erase_selection(state: &SharedState) {
+    let mut st = state.borrow_mut();
+    let Some(sel) = st.selection.clone() else {
+        return;
+    };
+    let idx = st.doc.active_layer;
+    let Some(layer) = st.doc.layers.get_mut(idx) else {
+        return;
+    };
+    let before = layer.pixels.clone();
+    match sel {
+        Selection::Rect(sx, sy, sw, sh) => {
+            clear_rect(layer, sx, sy, sw, sh);
+        }
+        Selection::Region { width, height, mask } => {
+            if width != layer.width
+                || height != layer.height
+                || mask.len() != (width * height) as usize
+            {
+                return;
+            }
+            clear_region_masked(layer, &mask);
+        }
+    }
     st.history.commit_change(idx, before);
     st.selection = None;
     st.modified = true;
@@ -1836,13 +1975,31 @@ fn cut_selection(state: &SharedState) {
 
 fn copy_selection(state: &SharedState) {
     let mut st = state.borrow_mut();
-    let Some((sx, sy, sw, sh)) = st.selection else {
+    let Some(sel) = st.selection.clone() else {
         return;
     };
     let Some(layer) = st.doc.active_layer_ref() else {
         return;
     };
-    let data = copy_rect(layer, sx, sy, sw, sh);
+    let (sw, sh, data) = match sel {
+        Selection::Rect(sx, sy, sw, sh) => {
+            let data = copy_rect(layer, sx, sy, sw, sh);
+            (sw, sh, data)
+        }
+        Selection::Region { width, height, mask } => {
+            if width != layer.width
+                || height != layer.height
+                || mask.len() != (width * height) as usize
+            {
+                return;
+            }
+            let Some((bx, by, bw, bh)) = region_tight_bbox(&mask, width, height) else {
+                return;
+            };
+            let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
+            (bw, bh, data)
+        }
+    };
     st.clipboard = Some((sw, sh, data.clone()));
 
     let straight = premul_to_straight_rgba(&data);
@@ -1874,7 +2031,7 @@ fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
     st.tool = ToolKind::Move;
     drop(st);
     if let Some(ref dd) = *tool_dd_cell.borrow() {
-        dd.set_selected(9);
+        dd.set_selected(10);
     }
 }
 
@@ -1902,7 +2059,7 @@ fn paste_image_data(
     st.tool = ToolKind::Move;
     drop(st);
     if let Some(ref dd) = *tool_dd_cell.borrow() {
-        dd.set_selected(9);
+        dd.set_selected(10);
     }
 }
 
@@ -2726,7 +2883,12 @@ fn build_ui(app: &Application) {
     layers_list.connect_row_selected(move |lb, row| {
         let Some(row) = row else { return };
         let idx = listbox_row_index(lb, row);
-        st_sel.borrow_mut().doc.active_layer = idx;
+        let mut g = st_sel.borrow_mut();
+        g.doc.active_layer = idx;
+        if matches!(g.selection, Some(Selection::Region { .. })) {
+            g.selection = None;
+        }
+        drop(g);
         queue_canvas(&cv_sel);
     });
 
@@ -2792,8 +2954,9 @@ fn build_ui(app: &Application) {
             6 => ToolKind::Rect,
             7 => ToolKind::Ellipse,
             8 => ToolKind::SelectRect,
-            9 => ToolKind::Move,
-            10 => ToolKind::Hand,
+            9 => ToolKind::MagicSelect,
+            10 => ToolKind::Move,
+            11 => ToolKind::Hand,
             _ => ToolKind::Brush,
         };
         let cur = g.tool;
@@ -3161,6 +3324,15 @@ fn build_ui(app: &Application) {
                 zoom_to_fit(&st_k, &cv_k);
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
+            }
+            gdk::Key::Delete | gdk::Key::BackSpace if !ctrl => {
+                if st_k.borrow().selection.is_some() {
+                    erase_selection(&st_k);
+                    queue_canvas(&cv_k);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
             }
             _ => {
                 if !ctrl {

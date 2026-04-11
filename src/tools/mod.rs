@@ -11,6 +11,7 @@ pub enum ToolKind {
     Rect,
     Ellipse,
     SelectRect,
+    MagicSelect,
     Move,
     Hand,
 }
@@ -27,6 +28,7 @@ impl ToolKind {
             Self::Rect => "Rectangle",
             Self::Ellipse => "Ellipse",
             Self::SelectRect => "Select",
+            Self::MagicSelect => "Magic select",
             Self::Move => "Move",
             Self::Hand => "Hand",
         }
@@ -43,8 +45,9 @@ impl ToolKind {
             Self::Rect => 6,
             Self::Ellipse => 7,
             Self::SelectRect => 8,
-            Self::Move => 9,
-            Self::Hand => 10,
+            Self::MagicSelect => 9,
+            Self::Move => 10,
+            Self::Hand => 11,
         }
     }
 }
@@ -297,6 +300,120 @@ pub fn stroke_line_square(
             eraser,
         );
     });
+}
+
+/// Connected pixels matching `layer[(x,y)]` within `tolerance` (premul RGBA). Does not modify the layer.
+pub fn flood_select_mask(layer: &Layer, x: u32, y: u32, tolerance: u8) -> Vec<u8> {
+    let w = layer.width;
+    let h = layer.height;
+    let len = (w * h) as usize;
+    let mut mask = vec![0u8; len];
+    if x >= w || y >= h {
+        return mask;
+    }
+    let start = layer.pixel_premul(x, y);
+    let tol = tolerance as i32;
+    let match_start =
+        |p: [u8; 4]| (0..4).all(|i| (p[i] as i32 - start[i] as i32).abs() <= tol);
+    let mut stack: Vec<(u32, u32)> = vec![(x, y)];
+    while let Some((cx, cy)) = stack.pop() {
+        let idx = (cy * w + cx) as usize;
+        if mask[idx] != 0 {
+            continue;
+        }
+        let p = layer.pixel_premul(cx, cy);
+        if !match_start(p) {
+            continue;
+        }
+        mask[idx] = 1;
+        if cx > 0 {
+            stack.push((cx - 1, cy));
+        }
+        if cx + 1 < w {
+            stack.push((cx + 1, cy));
+        }
+        if cy > 0 {
+            stack.push((cx, cy - 1));
+        }
+        if cy + 1 < h {
+            stack.push((cx, cy + 1));
+        }
+    }
+    mask
+}
+
+/// Tight integer bounds `(x, y, w, h)` of all non-zero mask cells.
+pub fn region_tight_bbox(mask: &[u8], width: u32, height: u32) -> Option<(i32, i32, i32, i32)> {
+    let w = width as i32;
+    let h = height as i32;
+    let mut min_x = w;
+    let mut min_y = h;
+    let mut max_x = -1i32;
+    let mut max_y = -1i32;
+    for y in 0..height {
+        for x in 0..width {
+            if mask[(y * width + x) as usize] != 0 {
+                let xi = x as i32;
+                let yi = y as i32;
+                min_x = min_x.min(xi);
+                min_y = min_y.min(yi);
+                max_x = max_x.max(xi);
+                max_y = max_y.max(yi);
+            }
+        }
+    }
+    if max_x < min_x {
+        return None;
+    }
+    Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+/// Copy premultiplied RGBA from `layer` into a `bw`×`bh` buffer; only pixels where `mask` is non-zero at doc coords.
+pub fn copy_region_masked(
+    layer: &Layer,
+    mask: &[u8],
+    bx: i32,
+    by: i32,
+    bw: i32,
+    bh: i32,
+) -> Vec<u8> {
+    let w = layer.width;
+    let h = layer.height;
+    let mut out = vec![0u8; (bw * bh * 4) as usize];
+    for row in 0..bh {
+        for col in 0..bw {
+            let sx = bx + col;
+            let sy = by + row;
+            let oi = ((row * bw + col) * 4) as usize;
+            if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
+                let mi = (sy as u32 * w + sx as u32) as usize;
+                if mi < mask.len() && mask[mi] != 0 {
+                    let i = layer.idx(sx as u32, sy as u32);
+                    out[oi..oi + 4].copy_from_slice(&layer.pixels[i..i + 4]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Clear premultiplied pixels where `mask` is non-zero (`mask` is document-sized).
+pub fn clear_region_masked(layer: &mut Layer, mask: &[u8]) {
+    let w = layer.width as usize;
+    let h = layer.height as usize;
+    let expected = w * h;
+    if mask.len() != expected {
+        return;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mi = y * w + x;
+            if mask[mi] != 0 {
+                let i = mi * 4;
+                layer.pixels[i..i + 4].fill(0);
+            }
+        }
+    }
 }
 
 pub fn flood_fill(layer: &mut Layer, x: u32, y: u32, fill_premul: [u8; 4], tolerance: u8) {

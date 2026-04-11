@@ -35,6 +35,37 @@ impl FloatingSelection {
     }
 }
 
+/// Rectangular marquee or magic-wand (connected) region in document space.
+#[derive(Clone)]
+pub enum Selection {
+    Rect(i32, i32, i32, i32),
+    /// `mask.len() == width * height`; non-zero = selected (same size as the document when created).
+    Region {
+        width: u32,
+        height: u32,
+        mask: Vec<u8>,
+    },
+}
+
+impl Selection {
+    pub fn contains_point(&self, x: f64, y: f64) -> bool {
+        let xi = x.floor() as i32;
+        let yi = y.floor() as i32;
+        match self {
+            Selection::Rect(sx, sy, sw, sh) => {
+                xi >= *sx && yi >= *sy && xi < sx + sw && yi < sy + sh
+            }
+            Selection::Region { width, height, mask } => {
+                if xi < 0 || yi < 0 || xi >= *width as i32 || yi >= *height as i32 {
+                    return false;
+                }
+                let idx = (yi as u32 * width + xi as u32) as usize;
+                mask.get(idx).copied().unwrap_or(0) != 0
+            }
+        }
+    }
+}
+
 /// Active drag on the floating selection (handles on the marquee, not sidebar).
 #[derive(Clone, Copy, Debug)]
 pub enum FloatingDrag {
@@ -68,7 +99,7 @@ pub struct AppState {
     pub zoom: f64,
     pub pan_x: f64,
     pub pan_y: f64,
-    pub selection: Option<(i32, i32, i32, i32)>,
+    pub selection: Option<Selection>,
     pub clipboard: Option<(i32, i32, Vec<u8>)>,
     pub floating: Option<FloatingSelection>,
     pub undo_snapshot: Option<(usize, Vec<u8>)>,
@@ -111,6 +142,7 @@ impl AppState {
             (ToolKind::Rect, None),
             (ToolKind::Ellipse, None),
             (ToolKind::SelectRect, Some('s')),
+            (ToolKind::MagicSelect, Some('w')),
             (ToolKind::Move, Some('m')),
             (ToolKind::Hand, Some('h')),
         ]

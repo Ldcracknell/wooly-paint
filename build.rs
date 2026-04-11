@@ -74,6 +74,8 @@ fn main() {
         ("ellipse", "circle.svg", 2.0, 2.0),
         // Top-left of dashed marquee.
         ("select", "square-dashed.svg", 3.0, 3.0),
+        // Star / sparkles centroid (magic wand “active” point).
+        ("wand", "wand.svg", 15.0, 9.0),
         ("move", "move.svg", 12.0, 12.0),
         // Palm / grab centroid for pan.
         ("hand", "hand.svg", 12.0, 14.0),

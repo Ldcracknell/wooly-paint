@@ -58,6 +58,7 @@ fn tool_from_name(s: &str) -> Option<ToolKind> {
         "Rectangle" => Some(ToolKind::Rect),
         "Ellipse" => Some(ToolKind::Ellipse),
         "Select" => Some(ToolKind::SelectRect),
+        "Magic select" => Some(ToolKind::MagicSelect),
         "Move" => Some(ToolKind::Move),
         "Hand" => Some(ToolKind::Hand),
         _ => None,

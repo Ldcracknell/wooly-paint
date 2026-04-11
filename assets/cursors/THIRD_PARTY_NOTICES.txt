@@ -1,4 +1,4 @@
-Tool cursor SVG sources (rasterized at build time to 32×32 PNG):
+Tool cursor SVG sources (rasterized at build time to 24×24 PNG):
 
  Lucide Icons (lucide-static package), ISC License
   https://lucide.dev/license

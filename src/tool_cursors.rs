@@ -19,6 +19,7 @@ pub struct ToolCursorPack {
     rect: gdk::Cursor,
     ellipse: gdk::Cursor,
     select: gdk::Cursor,
+    wand: gdk::Cursor,
     r#move: gdk::Cursor,
     hand: gdk::Cursor,
     grabbing: gdk::Cursor,
@@ -85,6 +86,11 @@ impl ToolCursorPack {
                 HOTSPOT_SELECT,
                 &fb,
             ),
+            wand: tex(
+                include_bytes!(concat!(env!("OUT_DIR"), "/wand.png")),
+                HOTSPOT_WAND,
+                &fb,
+            ),
             r#move: tex(
                 include_bytes!(concat!(env!("OUT_DIR"), "/move.png")),
                 HOTSPOT_MOVE,
@@ -110,6 +116,7 @@ impl ToolCursorPack {
             ToolKind::Rect => &self.rect,
             ToolKind::Ellipse => &self.ellipse,
             ToolKind::SelectRect => &self.select,
+            ToolKind::MagicSelect => &self.wand,
             ToolKind::Move => &self.r#move,
             ToolKind::Hand => &self.hand,
         }
