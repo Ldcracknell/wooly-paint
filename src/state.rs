@@ -9,6 +9,29 @@ pub struct FloatingSelection {
     pub data: Vec<u8>,
     pub x: f64,
     pub y: f64,
+    /// Clockwise degrees (cairo convention), pivot at bitmap center.
+    pub angle_deg: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+impl FloatingSelection {
+    pub fn new_pasted(w: i32, h: i32, data: Vec<u8>, x: f64, y: f64) -> Self {
+        Self {
+            w,
+            h,
+            data,
+            x,
+            y,
+            angle_deg: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            flip_h: false,
+            flip_v: false,
+        }
+    }
 }
 
 pub struct AppState {

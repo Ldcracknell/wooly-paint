@@ -36,11 +36,161 @@ type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
 type ColorPreviewDaCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type ToolDdCell = Rc<RefCell<Option<gtk::DropDown>>>;
+type FloatingPanelCell = Rc<RefCell<Option<FloatingPanel>>>;
+
+/// Sidebar controls for the floating clipboard / pasted image (scale, rotate, flip).
+struct FloatingPanel {
+    revealer: gtk::Revealer,
+    #[allow(dead_code)]
+    frame: gtk::Frame,
+    suppress: Rc<RefCell<bool>>,
+    scale_w_adj: gtk::Adjustment,
+    scale_h_adj: gtk::Adjustment,
+    rot_adj: gtk::Adjustment,
+}
+
+fn floating_image_to_doc_matrix(f: &FloatingSelection) -> gtk::cairo::Matrix {
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    let cx = f.x + fw * 0.5;
+    let cy = f.y + fh * 0.5;
+    let sx = f.scale_x * if f.flip_h { -1.0 } else { 1.0 };
+    let sy = f.scale_y * if f.flip_v { -1.0 } else { 1.0 };
+    let mut m = gtk::cairo::Matrix::identity();
+    m.translate(cx, cy);
+    m.rotate(f.angle_deg.to_radians());
+    m.scale(sx, sy);
+    m.translate(-fw * 0.5, -fh * 0.5);
+    m
+}
+
+fn floating_quad_doc(f: &FloatingSelection) -> [(f64, f64); 4] {
+    let m = floating_image_to_doc_matrix(f);
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    [(0.0, 0.0), (fw, 0.0), (fw, fh), (0.0, fh)].map(|(px, py)| m.transform_point(px, py))
+}
+
+fn doc_point_in_floating(doc_x: f64, doc_y: f64, f: &FloatingSelection) -> bool {
+    if f.scale_x <= 0.0 || f.scale_y <= 0.0 {
+        return false;
+    }
+    let m = floating_image_to_doc_matrix(f);
+    let inv = match m.try_invert() {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    let (lx, ly) = inv.transform_point(doc_x, doc_y);
+    lx >= -1e-3 && ly >= -1e-3 && lx <= f.w as f64 + 1e-3 && ly <= f.h as f64 + 1e-3
+}
+
+/// Cairo ARgb32 row (BGRA premultiplied) → tight premultiplied RGBA for layers.
+fn cairo_stride_to_premul_rgba_tight(src: &[u8], w: usize, h: usize, stride: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    for row in 0..h {
+        let s0 = row * stride;
+        let d0 = row * w * 4;
+        for col in 0..w {
+            let s = s0 + col * 4;
+            let d = d0 + col * 4;
+            out[d] = src[s + 2];
+            out[d + 1] = src[s + 1];
+            out[d + 2] = src[s];
+            out[d + 3] = src[s + 3];
+        }
+    }
+    out
+}
+
+fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32, i32, Vec<u8>)> {
+    if f.scale_x <= 0.0 || f.scale_y <= 0.0 {
+        return None;
+    }
+    let pts = floating_quad_doc(f);
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for (dx, dy) in pts {
+        min_x = min_x.min(dx);
+        min_y = min_y.min(dy);
+        max_x = max_x.max(dx);
+        max_y = max_y.max(dy);
+    }
+    let min_ix = min_x.floor() as i32;
+    let min_iy = min_y.floor() as i32;
+    let max_ix = max_x.ceil() as i32;
+    let max_iy = max_y.ceil() as i32;
+    let rw = (max_ix - min_ix).max(1);
+    let rh = (max_iy - min_iy).max(1);
+    if rw > 8192 || rh > 8192 {
+        return None;
+    }
+    let surf = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, rw, rh).ok()?;
+    {
+        let cr = gtk::cairo::Context::new(&surf).ok()?;
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+        cr.set_operator(gtk::cairo::Operator::Clear);
+        cr.paint().ok()?;
+        cr.set_operator(gtk::cairo::Operator::Over);
+        let fs = premul_to_straight_rgba(&f.data);
+        let fw = f.w.max(1);
+        let fh = f.h.max(1);
+        let pb = Pixbuf::from_bytes(
+            &glib::Bytes::from_owned(fs),
+            gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            fw,
+            fh,
+            fw * 4,
+        );
+        let m = floating_image_to_doc_matrix(f);
+        cr.translate(min_ix as f64, min_iy as f64);
+        cr.transform(m);
+        cr.set_source_pixbuf(&pb, 0.0, 0.0);
+        cr.source().set_filter(gtk::cairo::Filter::Nearest);
+        cr.paint().ok()?;
+    }
+    surf.flush();
+    let stride = surf.stride() as usize;
+    let w = surf.width() as usize;
+    let h = surf.height() as usize;
+    let owned = surf.take_data().ok()?;
+    let raw: &[u8] = owned.as_ref();
+    let premul = cairo_stride_to_premul_rgba_tight(raw, w, h, stride);
+    Some((min_ix, min_iy, rw, rh, premul))
+}
+
+fn sync_floating_panel(state: &SharedState, cell: &FloatingPanelCell) {
+    let cell_borrow = cell.borrow();
+    let Some(panel) = cell_borrow.as_ref() else {
+        return;
+    };
+    *panel.suppress.borrow_mut() = true;
+    let st = state.borrow();
+    let show = st.floating.is_some();
+    panel.revealer.set_reveal_child(show);
+    if let Some(f) = &st.floating {
+        panel
+            .scale_w_adj
+            .set_value((f.scale_x.clamp(0.01, 10.0) * 100.0).round());
+        panel
+            .scale_h_adj
+            .set_value((f.scale_y.clamp(0.01, 10.0) * 100.0).round());
+        let mut a = f.angle_deg % 360.0;
+        if a > 180.0 {
+            a -= 360.0;
+        } else if a < -180.0 {
+            a += 360.0;
+        }
+        panel.rot_adj.set_value(a);
+    }
+    *panel.suppress.borrow_mut() = false;
+}
 
 pub fn run() -> gtk::glib::ExitCode {
     libadwaita::init().expect("libadwaita init");
-    libadwaita::StyleManager::default()
-        .set_color_scheme(libadwaita::ColorScheme::Default);
     let app = Application::builder()
         .application_id("dev.woolymelon.WoolyPaint")
         .build();
@@ -745,10 +895,43 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        cr.translate(f.x, f.y);
+        let m = floating_image_to_doc_matrix(f);
+        cr.transform(m);
         cr.set_source_pixbuf(&pb, 0.0, 0.0);
-        cr.source().set_filter(gtk::cairo::Filter::Nearest);
+        let filt = if (f.scale_x - 1.0).abs() < 1e-6
+            && (f.scale_y - 1.0).abs() < 1e-6
+            && f.angle_deg.rem_euclid(90.0).abs() < 1e-6
+        {
+            gtk::cairo::Filter::Nearest
+        } else {
+            gtk::cairo::Filter::Good
+        };
+        cr.source().set_filter(filt);
         cr.paint().unwrap();
+        cr.restore().unwrap();
+
+        let quad = floating_quad_doc(f);
+        cr.save().unwrap();
+        cr.translate(pan_x, pan_y);
+        cr.scale(zoom, zoom);
+        let phase = (glib::monotonic_time() / 50000) % 20;
+        cr.set_dash(&[6.0, 6.0], phase as f64);
+        cr.set_line_width(1.0 / zoom.max(0.001));
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        cr.move_to(quad[0].0, quad[0].1);
+        cr.line_to(quad[1].0, quad[1].1);
+        cr.line_to(quad[2].0, quad[2].1);
+        cr.line_to(quad[3].0, quad[3].1);
+        cr.close_path();
+        cr.stroke().unwrap();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
+        cr.set_dash(&[6.0, 6.0], (phase as f64) + 6.0);
+        cr.move_to(quad[0].0, quad[0].1);
+        cr.line_to(quad[1].0, quad[1].1);
+        cr.line_to(quad[2].0, quad[2].1);
+        cr.line_to(quad[3].0, quad[3].1);
+        cr.close_path();
+        cr.stroke().unwrap();
         cr.restore().unwrap();
     }
 
@@ -795,14 +978,32 @@ fn commit_floating(state: &mut AppState) {
         return;
     };
     let before = layer.pixels.clone();
-    paste_rect(
-        layer,
-        f.x.round() as i32,
-        f.y.round() as i32,
-        f.w,
-        f.h,
-        &f.data,
-    );
+    let trivial = f.angle_deg.rem_euclid(360.0).abs() < 1e-6
+        && (f.scale_x - 1.0).abs() < 1e-6
+        && (f.scale_y - 1.0).abs() < 1e-6
+        && !f.flip_h
+        && !f.flip_v;
+    if trivial {
+        paste_rect(
+            layer,
+            f.x.round() as i32,
+            f.y.round() as i32,
+            f.w,
+            f.h,
+            &f.data,
+        );
+    } else if let Some((px, py, rw, rh, buf)) = rasterize_floating_to_premul(&f) {
+        paste_rect(layer, px, py, rw, rh, &buf);
+    } else {
+        paste_rect(
+            layer,
+            f.x.round() as i32,
+            f.y.round() as i32,
+            f.w,
+            f.h,
+            &f.data,
+        );
+    }
     if layer.pixels != before {
         state.history.commit_change(idx, before);
         state.modified = true;
@@ -920,6 +1121,7 @@ fn setup_canvas_input(
     canvas_cell: &CanvasCell,
     color_preview_da_cell: &ColorPreviewDaCell,
     recent_swatches: &gtk::FlowBox,
+    floating_panel: &FloatingPanelCell,
 ) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let last_brush_widget: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
@@ -937,6 +1139,7 @@ fn setup_canvas_input(
     let mws_b = move_widget_start.clone();
     let cb_drag = color_preview_da_cell.clone();
     let recent_drag = recent_swatches.clone();
+    let fp_drag_begin = floating_panel.clone();
     drag.connect_drag_begin(move |_g, wx, wy| {
         cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
@@ -1033,8 +1236,9 @@ fn setup_canvas_input(
             }
             ToolKind::Move => {
                 if let Some(ref f) = st.floating {
-                    if dx < f.x || dy < f.y || dx >= f.x + f.w as f64 || dy >= f.y + f.h as f64 {
+                    if !doc_point_in_floating(dx, dy, f) {
                         commit_floating(&mut st);
+                        sync_floating_panel(&st_drag_begin, &fp_drag_begin);
                     }
                 }
                 if st.floating.is_none() {
@@ -1051,15 +1255,16 @@ fn setup_canvas_input(
                             let li = st.doc.active_layer;
                             st.history.commit_change(li, before);
                             st.bump_document_revision();
-                            st.floating = Some(FloatingSelection {
-                                w: sw,
-                                h: sh,
+                            st.floating = Some(FloatingSelection::new_pasted(
+                                sw,
+                                sh,
                                 data,
-                                x: sx as f64,
-                                y: sy as f64,
-                            });
+                                sx as f64,
+                                sy as f64,
+                            ));
                             st.selection = None;
                             st.modified = true;
+                            sync_floating_panel(&st_drag_begin, &fp_drag_begin);
                         }
                     }
                 }
@@ -1348,7 +1553,11 @@ fn copy_selection(state: &SharedState) {
     }
 }
 
-fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
+fn paste_clipboard_center(
+    state: &SharedState,
+    tool_dd_cell: &ToolDdCell,
+    floating_panel: &FloatingPanelCell,
+) {
     let clip = state.borrow().clipboard.clone();
     let Some((sw, sh, data)) = clip else {
         return;
@@ -1359,35 +1568,51 @@ fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
     let h = st.doc.height as i32;
     let x = ((w - sw) / 2) as f64;
     let y = ((h - sh) / 2) as f64;
-    st.floating = Some(FloatingSelection { w: sw, h: sh, data, x, y });
+    st.floating = Some(FloatingSelection::new_pasted(sw, sh, data, x, y));
     st.selection = None;
     st.tool = ToolKind::Move;
     drop(st);
     if let Some(ref dd) = *tool_dd_cell.borrow() {
         dd.set_selected(9);
     }
+    sync_floating_panel(state, floating_panel);
 }
 
-fn paste_image_data(state: &SharedState, tool_dd_cell: &ToolDdCell, w: u32, h: u32, premul_data: Vec<u8>) {
+fn paste_image_data(
+    state: &SharedState,
+    tool_dd_cell: &ToolDdCell,
+    floating_panel: &FloatingPanelCell,
+    w: u32,
+    h: u32,
+    premul_data: Vec<u8>,
+) {
     let mut st = state.borrow_mut();
     commit_floating(&mut st);
     let doc_w = st.doc.width as i32;
     let doc_h = st.doc.height as i32;
     let x = ((doc_w - w as i32) / 2).max(0) as f64;
     let y = ((doc_h - h as i32) / 2).max(0) as f64;
-    st.floating = Some(FloatingSelection { w: w as i32, h: h as i32, data: premul_data, x, y });
+    st.floating = Some(FloatingSelection::new_pasted(
+        w as i32,
+        h as i32,
+        premul_data,
+        x,
+        y,
+    ));
     st.selection = None;
     st.tool = ToolKind::Move;
     drop(st);
     if let Some(ref dd) = *tool_dd_cell.borrow() {
         dd.set_selected(9);
     }
+    sync_floating_panel(state, floating_panel);
 }
 
 fn show_paste_oversize_dialog(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
     tool_dd_cell: &ToolDdCell,
+    floating_panel: &FloatingPanelCell,
     canvas_cell: &CanvasCell,
     layers_cell: &LayersCell,
     img_w: u32,
@@ -1442,17 +1667,19 @@ fn show_paste_oversize_dialog(
 
     let st = state.clone();
     let td = tool_dd_cell.clone();
+    let fp = floating_panel.clone();
     let cv = canvas_cell.clone();
     let data_c = data.clone();
     let dw = d.clone();
     paste_anyway.connect_clicked(move |_| {
-        paste_image_data(&st, &td, img_w, img_h, (*data_c).clone());
+        paste_image_data(&st, &td, &fp, img_w, img_h, (*data_c).clone());
         queue_canvas(&cv);
         dw.close();
     });
 
     let st = state.clone();
     let td = tool_dd_cell.clone();
+    let fp = floating_panel.clone();
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
     let dw = d.clone();
@@ -1465,7 +1692,7 @@ fn show_paste_oversize_dialog(
             s.history.clear();
             s.bump_document_revision();
         }
-        paste_image_data(&st, &td, img_w, img_h, (*data).clone());
+        paste_image_data(&st, &td, &fp, img_w, img_h, (*data).clone());
         zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
         queue_canvas(&cv);
@@ -1479,11 +1706,12 @@ fn try_paste_system_clipboard(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
     tool_dd_cell: &ToolDdCell,
+    floating_panel: &FloatingPanelCell,
     canvas_cell: &CanvasCell,
     layers_cell: &LayersCell,
 ) {
     let Some(display) = gdk::Display::default() else {
-        paste_clipboard_center(state, tool_dd_cell);
+        paste_clipboard_center(state, tool_dd_cell, floating_panel);
         queue_canvas(canvas_cell);
         return;
     };
@@ -1492,6 +1720,7 @@ fn try_paste_system_clipboard(
     let win = window.clone();
     let st = state.clone();
     let td = tool_dd_cell.clone();
+    let fp = floating_panel.clone();
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
 
@@ -1511,20 +1740,22 @@ fn try_paste_system_clipboard(
                             let doc_h = st.borrow().doc.height;
 
                             if iw > doc_w || ih > doc_h {
-                                show_paste_oversize_dialog(&win, &st, &td, &cv, &lc, iw, ih, premul);
+                                show_paste_oversize_dialog(
+                                    &win, &st, &td, &fp, &cv, &lc, iw, ih, premul,
+                                );
                             } else {
-                                paste_image_data(&st, &td, iw, ih, premul);
+                                paste_image_data(&st, &td, &fp, iw, ih, premul);
                                 queue_canvas(&cv);
                             }
                         }
                         Err(_) => {
-                            paste_clipboard_center(&st, &td);
+                            paste_clipboard_center(&st, &td, &fp);
                             queue_canvas(&cv);
                         }
                     }
                 }
                 _ => {
-                    paste_clipboard_center(&st, &td);
+                    paste_clipboard_center(&st, &td, &fp);
                     queue_canvas(&cv);
                 }
             }
@@ -1537,6 +1768,7 @@ fn open_file(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    floating_panel: &FloatingPanelCell,
 ) {
     let all_filter = gtk::FileFilter::new();
     all_filter.set_name(Some("All supported (*.png, *.ora)"));
@@ -1563,6 +1795,7 @@ fn open_file(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let fp = floating_panel.clone();
     dlg.open(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
             if let Some(path) = file.path() {
@@ -1583,6 +1816,7 @@ fn open_file(
                         g.drag_start_doc = None;
                         g.bump_document_revision();
                         drop(g);
+                        sync_floating_panel(&st, &fp);
                         zoom_to_fit(&st, &cv);
                         refresh_layers_list(&st, &lc, &cv);
                         queue_canvas(&cv);
@@ -1674,6 +1908,7 @@ fn new_document_dialog(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    floating_panel: &FloatingPanelCell,
 ) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
@@ -1717,6 +1952,7 @@ fn new_document_dialog(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let fp = floating_panel.clone();
     let dw = d.clone();
     ok.connect_clicked(move |_| {
         let w = w_adj.value() as u32;
@@ -1731,6 +1967,7 @@ fn new_document_dialog(
         g.modified = false;
         g.bump_document_revision();
         drop(g);
+        sync_floating_panel(&st, &fp);
         zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
         queue_canvas(&cv);
@@ -1941,6 +2178,8 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
     d.connect_close_request(move |_| {
         if !*saved_c.borrow() {
             st_close.borrow_mut().tool_keybinds = orig_close.clone();
+        } else {
+            crate::settings::persist(&st_close.borrow());
         }
         refresh_tool_labels(&st_close, &sl_close);
         glib::Propagation::Proceed
@@ -1960,11 +2199,20 @@ fn build_ui(app: &Application) {
     let win_for_icon = window.clone();
     window.connect_realize(move |_| apply_taskbar_icon(&win_for_icon));
 
-    let state: SharedState = Rc::new(RefCell::new(AppState::new()));
+    let mut initial_state = AppState::new();
+    let loaded_theme = crate::settings::load_into(&mut initial_state);
+    libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(loaded_theme));
+    let state: SharedState = Rc::new(RefCell::new(initial_state));
+
+    let st_shutdown = state.clone();
+    app.connect_shutdown(move |_| {
+        crate::settings::persist(&st_shutdown.borrow());
+    });
     let canvas_cell: CanvasCell = Rc::new(RefCell::new(None));
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
     let color_preview_da_cell: ColorPreviewDaCell = Rc::new(RefCell::new(None));
     let tool_dd_cell: ToolDdCell = Rc::new(RefCell::new(None));
+    let floating_panel_cell: FloatingPanelCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
     drawing_area.set_hexpand(true);
@@ -1985,7 +2233,7 @@ fn build_ui(app: &Application) {
     let tick_slot = Rc::new(RefCell::new(None::<gtk::TickCallbackId>));
     let tick_id = drawing_area.add_tick_callback(move |_w, _clock| {
         let st = st_tick.borrow();
-        if st.selection.is_some() {
+        if st.selection.is_some() || st.floating.is_some() {
             let now = glib::monotonic_time();
             let mut last = lm.borrow_mut();
             if now.saturating_sub(*last) >= 50_000 {
@@ -2009,14 +2257,6 @@ fn build_ui(app: &Application) {
 
     let preview_da = make_color_preview_area(&state);
     *color_preview_da_cell.borrow_mut() = Some(preview_da.clone());
-
-    setup_canvas_input(
-        &drawing_area,
-        &state,
-        &canvas_cell,
-        &color_preview_da_cell,
-        &recent_colors_flow,
-    );
 
     let layers_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Browse)
@@ -2246,6 +2486,179 @@ fn build_ui(app: &Application) {
 
     toolbar.append(&zoom_row);
 
+    let fp_suppress = Rc::new(RefCell::new(false));
+    let scale_w_adj = gtk::Adjustment::new(100.0, 1.0, 1000.0, 1.0, 10.0, 0.0);
+    let scale_h_adj = gtk::Adjustment::new(100.0, 1.0, 1000.0, 1.0, 10.0, 0.0);
+    let rot_adj = gtk::Adjustment::new(0.0, -180.0, 180.0, 1.0, 15.0, 0.0);
+    let scale_w_spin = gtk::SpinButton::new(Some(&scale_w_adj), 1.0, 0);
+    let scale_h_spin = gtk::SpinButton::new(Some(&scale_h_adj), 1.0, 0);
+    let rot_spin = gtk::SpinButton::new(Some(&rot_adj), 1.0, 0);
+    scale_w_spin.set_tooltip_text(Some("Horizontal scale (%)"));
+    scale_h_spin.set_tooltip_text(Some("Vertical scale (%)"));
+    rot_spin.set_tooltip_text(Some("Rotation (degrees)"));
+    scale_w_spin.set_width_request(64);
+    scale_h_spin.set_width_request(64);
+    rot_spin.set_width_request(64);
+
+    let st_sw = state.clone();
+    let cv_sw = canvas_cell.clone();
+    let sup_sw = fp_suppress.clone();
+    scale_w_adj.connect_value_changed(move |a| {
+        if *sup_sw.borrow() {
+            return;
+        }
+        let v = (a.value() / 100.0).clamp(0.01, 10.0);
+        if let Some(f) = st_sw.borrow_mut().floating.as_mut() {
+            f.scale_x = v;
+        }
+        queue_canvas(&cv_sw);
+    });
+    let st_sh = state.clone();
+    let cv_sh = canvas_cell.clone();
+    let sup_sh = fp_suppress.clone();
+    scale_h_adj.connect_value_changed(move |a| {
+        if *sup_sh.borrow() {
+            return;
+        }
+        let v = (a.value() / 100.0).clamp(0.01, 10.0);
+        if let Some(f) = st_sh.borrow_mut().floating.as_mut() {
+            f.scale_y = v;
+        }
+        queue_canvas(&cv_sh);
+    });
+    let st_rot = state.clone();
+    let cv_rot = canvas_cell.clone();
+    let sup_rot = fp_suppress.clone();
+    rot_adj.connect_value_changed(move |a| {
+        if *sup_rot.borrow() {
+            return;
+        }
+        if let Some(f) = st_rot.borrow_mut().floating.as_mut() {
+            f.angle_deg = a.value();
+        }
+        queue_canvas(&cv_rot);
+    });
+
+    let flip_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+    let flip_h_btn = gtk::Button::with_label("Flip H");
+    let flip_v_btn = gtk::Button::with_label("Flip V");
+    flip_h_btn.set_tooltip_text(Some("Mirror horizontally"));
+    flip_v_btn.set_tooltip_text(Some("Mirror vertically"));
+    let rot_ccw_btn = gtk::Button::with_label("-90°");
+    let rot_cw_btn = gtk::Button::with_label("+90°");
+    rot_ccw_btn.set_tooltip_text(Some("Rotate 90° counter-clockwise"));
+    rot_cw_btn.set_tooltip_text(Some("Rotate 90° clockwise"));
+    flip_row.append(&flip_h_btn);
+    flip_row.append(&flip_v_btn);
+    flip_row.append(&rot_ccw_btn);
+    flip_row.append(&rot_cw_btn);
+
+    let st_fh = state.clone();
+    let cv_fh = canvas_cell.clone();
+    flip_h_btn.connect_clicked(move |_| {
+        if let Some(f) = st_fh.borrow_mut().floating.as_mut() {
+            f.flip_h = !f.flip_h;
+        }
+        queue_canvas(&cv_fh);
+    });
+    let st_fv = state.clone();
+    let cv_fv = canvas_cell.clone();
+    flip_v_btn.connect_clicked(move |_| {
+        if let Some(f) = st_fv.borrow_mut().floating.as_mut() {
+            f.flip_v = !f.flip_v;
+        }
+        queue_canvas(&cv_fv);
+    });
+    let st_rccw = state.clone();
+    let cv_rccw = canvas_cell.clone();
+    let sup_r = fp_suppress.clone();
+    let rot_adj_ccw = rot_adj.clone();
+    rot_ccw_btn.connect_clicked(move |_| {
+        let mut g = st_rccw.borrow_mut();
+        let Some(f) = g.floating.as_mut() else {
+            return;
+        };
+        f.angle_deg -= 90.0;
+        let mut a = f.angle_deg % 360.0;
+        if a > 180.0 {
+            a -= 360.0;
+        } else if a < -180.0 {
+            a += 360.0;
+        }
+        f.angle_deg = a;
+        drop(g);
+        *sup_r.borrow_mut() = true;
+        rot_adj_ccw.set_value(a);
+        *sup_r.borrow_mut() = false;
+        queue_canvas(&cv_rccw);
+    });
+    let st_rcw = state.clone();
+    let cv_rcw = canvas_cell.clone();
+    let sup_r2 = fp_suppress.clone();
+    let rot_adj_cw = rot_adj.clone();
+    rot_cw_btn.connect_clicked(move |_| {
+        let mut g = st_rcw.borrow_mut();
+        let Some(f) = g.floating.as_mut() else {
+            return;
+        };
+        f.angle_deg += 90.0;
+        let mut a = f.angle_deg % 360.0;
+        if a > 180.0 {
+            a -= 360.0;
+        } else if a < -180.0 {
+            a += 360.0;
+        }
+        f.angle_deg = a;
+        drop(g);
+        *sup_r2.borrow_mut() = true;
+        rot_adj_cw.set_value(a);
+        *sup_r2.borrow_mut() = false;
+        queue_canvas(&cv_rcw);
+    });
+
+    let fp_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    fp_box.append(&make_row("Scale W", scale_w_spin.upcast_ref()));
+    fp_box.append(&make_row("Scale H", scale_h_spin.upcast_ref()));
+    fp_box.append(&make_row("Rotate", rot_spin.upcast_ref()));
+    fp_box.append(&flip_row);
+
+    let fp_revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .reveal_child(false)
+        .child(&fp_box)
+        .build();
+
+    let fp_frame = gtk::Frame::builder()
+        .label("Floating image")
+        .child(&fp_revealer)
+        .build();
+
+    toolbar.append(&fp_frame);
+
+    *floating_panel_cell.borrow_mut() = Some(FloatingPanel {
+        revealer: fp_revealer.clone(),
+        frame: fp_frame.clone(),
+        suppress: fp_suppress,
+        scale_w_adj: scale_w_adj.clone(),
+        scale_h_adj: scale_h_adj.clone(),
+        rot_adj: rot_adj.clone(),
+    });
+
+    setup_canvas_input(
+        &drawing_area,
+        &state,
+        &canvas_cell,
+        &color_preview_da_cell,
+        &recent_colors_flow,
+        &floating_panel_cell,
+    );
+
     let toolbar_spacer = gtk::Box::builder()
         .vexpand(true)
         .build();
@@ -2375,6 +2788,7 @@ fn build_ui(app: &Application) {
         &layers_cell,
         &canvas_cell,
         &tool_dd_cell,
+        &floating_panel_cell,
         &tool_strings,
     );
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
@@ -2407,6 +2821,7 @@ fn build_ui(app: &Application) {
     let st_k = state.clone();
     let lc_k = layers_cell.clone();
     let cv_k = canvas_cell.clone();
+    let fp_k = floating_panel_cell.clone();
     let win_k = window.clone();
     let td_k = tool_dd_cell.clone();
     key.connect_key_pressed(move |_c, keyval, _code, state_m| {
@@ -2432,7 +2847,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::o | gdk::Key::O if ctrl => {
-                open_file(&win_k, &st_k, &lc_k, &cv_k);
+                open_file(&win_k, &st_k, &lc_k, &cv_k, &fp_k);
                 glib::Propagation::Stop
             }
             gdk::Key::s | gdk::Key::S if ctrl => {
@@ -2440,7 +2855,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::n | gdk::Key::N if ctrl => {
-                new_document_dialog(&win_k, &st_k, &lc_k, &cv_k);
+                new_document_dialog(&win_k, &st_k, &lc_k, &cv_k, &fp_k);
                 glib::Propagation::Stop
             }
             gdk::Key::x | gdk::Key::X if ctrl => {
@@ -2453,7 +2868,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::v | gdk::Key::V if ctrl => {
-                try_paste_system_clipboard(&win_k, &st_k, &td_k, &cv_k, &lc_k);
+                try_paste_system_clipboard(&win_k, &st_k, &td_k, &fp_k, &cv_k, &lc_k);
                 glib::Propagation::Stop
             }
             gdk::Key::plus | gdk::Key::equal if ctrl => {
@@ -2509,6 +2924,8 @@ fn build_ui(app: &Application) {
 
     window.present();
 
+    schedule_launch_update_check(&window);
+
     let st_fit = state.clone();
     let cv_fit = canvas_cell.clone();
     glib::idle_add_local_once(move || {
@@ -2517,11 +2934,137 @@ fn build_ui(app: &Application) {
     });
 }
 
+fn schedule_launch_update_check(window: &libadwaita::ApplicationWindow) {
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    {
+        let _ = window;
+        return;
+    }
+    if let Ok(s) = std::env::var("WOOLYPAINT_SKIP_UPDATE_CHECK") {
+        let t = s.trim();
+        if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes") {
+            return;
+        }
+    }
+    let w = window.clone();
+    glib::timeout_add_seconds_local_once(2, move || {
+        let win_send = glib::SendWeakRef::from(w.downgrade());
+        std::thread::spawn(move || {
+            let result = crate::updater::check_for_update();
+            glib::MainContext::default().invoke(move || {
+                if let Ok(Some(info)) = result {
+                    if let Some(win) = win_send.upgrade() {
+                        present_update_dialog(&win, info);
+                    }
+                }
+            });
+        });
+    });
+}
+
+fn run_manual_update_check(window: &libadwaita::ApplicationWindow) {
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    {
+        show_simple_alert(
+            window,
+            "Updates",
+            "Automatic updates are only available for Linux x86_64 and Windows x86_64 release builds.",
+        );
+        return;
+    }
+    let win_send = glib::SendWeakRef::from(window.downgrade());
+    std::thread::spawn(move || {
+        let result = crate::updater::check_for_update();
+        glib::MainContext::default().invoke(move || {
+            let Some(w) = win_send.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(Some(info)) => present_update_dialog(&w, info),
+                Ok(None) => show_simple_alert(&w, "Up to date", "You are already running the latest release."),
+                Err(e) => show_simple_alert(
+                    &w,
+                    "Update check failed",
+                    &format!("Could not reach GitHub: {e}"),
+                ),
+            }
+        });
+    });
+}
+
+fn show_simple_alert(parent: &libadwaita::ApplicationWindow, heading: &str, body: &str) {
+    let dlg = libadwaita::AlertDialog::new(Some(heading), Some(body));
+    dlg.add_response("ok", "OK");
+    dlg.set_default_response(Some("ok"));
+    dlg.set_close_response("ok");
+    dlg.connect_response(None, |d, _| {
+        d.close();
+    });
+    dlg.present(Some(parent));
+}
+
+fn show_update_error(parent: &libadwaita::ApplicationWindow, message: &str) {
+    show_simple_alert(parent, "Update failed", message);
+}
+
+fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::updater::UpdateInfo) {
+    let cur = crate::updater::packaged_version();
+    let dlg = libadwaita::AlertDialog::new(
+        Some("Update available"),
+        Some(&format!(
+            "Version {} is available (you are on {}). Download and replace this installation with the latest portable build?",
+            info.version,
+            cur
+        )),
+    );
+    dlg.add_response("later", "Not now");
+    dlg.add_response("release", "View release…");
+    dlg.add_response("download", "Download and install");
+    dlg.set_close_response("later");
+    dlg.set_default_response(Some("download"));
+    dlg.set_response_appearance("download", libadwaita::ResponseAppearance::Suggested);
+
+    let parent_for_uri = parent.clone();
+    let release_url = info.release_page_url.clone();
+    let download_info = info;
+    let win_send = glib::SendWeakRef::from(parent.downgrade());
+
+    dlg.connect_response(None, move |d, response| {
+        match response {
+            "download" => {
+                let ii = download_info.clone();
+                let ws = win_send.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::updater::download_and_apply(&ii) {
+                        glib::MainContext::default().invoke(move || {
+                            if let Some(w) = ws.upgrade() {
+                                show_update_error(&w, &e.to_string());
+                            }
+                        });
+                    }
+                });
+            }
+            "release" => {
+                gtk::show_uri(Some(&parent_for_uri), &release_url, gdk::CURRENT_TIME);
+            }
+            _ => {}
+        }
+        d.close();
+    });
+    dlg.present(Some(parent));
+}
+
 fn color_scheme_from_menu_value(s: &str) -> ColorScheme {
     match s {
         "light" => ColorScheme::ForceLight,
         "dark" => ColorScheme::ForceDark,
-        _ => ColorScheme::Default,
+        "default" | _ => ColorScheme::Default,
     }
 }
 
@@ -2540,6 +3083,7 @@ fn build_menu(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
     tool_dd_cell: &ToolDdCell,
+    floating_panel: &FloatingPanelCell,
     tool_strings: &gtk::StringList,
 ) -> gio::Menu {
     let menu = gio::Menu::new();
@@ -2553,6 +3097,7 @@ fn build_menu(
 
     let settings = gio::Menu::new();
     settings.append(Some("Keybinds…"), Some("win.keybinds"));
+    settings.append(Some("Check for Updates…"), Some("win.check_updates"));
     let theme = gio::Menu::new();
     theme.append(Some("_Default"), Some("win.color_scheme('default')"));
     theme.append(Some("_Light"), Some("win.color_scheme('light')"));
@@ -2563,21 +3108,23 @@ fn build_menu(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let fp = floating_panel.clone();
     let w = window.clone();
 
     let new_act = gio::SimpleAction::new("new", None);
     new_act.connect_activate(move |_, _| {
-        new_document_dialog(&w, &st, &lc, &cv);
+        new_document_dialog(&w, &st, &lc, &cv, &fp);
     });
     app_add_action(window, &new_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let fp = floating_panel.clone();
     let w = window.clone();
     let open_act = gio::SimpleAction::new("open", None);
     open_act.connect_activate(move |_, _| {
-        open_file(&w, &st, &lc, &cv);
+        open_file(&w, &st, &lc, &cv, &fp);
     });
     app_add_action(window, &open_act);
 
@@ -2648,10 +3195,11 @@ fn build_menu(
     let cv = canvas.clone();
     let td_p = tool_dd_cell.clone();
     let lc_p = layers_cell.clone();
+    let fp_p = floating_panel.clone();
     let w_p = window.clone();
     let paste_act = gio::SimpleAction::new("paste", None);
     paste_act.connect_activate(move |_, _| {
-        try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p);
+        try_paste_system_clipboard(&w_p, &st, &td_p, &fp_p, &cv, &lc_p);
     });
     app_add_action(window, &paste_act);
 
@@ -2670,6 +3218,7 @@ fn build_menu(
         Some(glib::VariantTy::STRING),
         &initial_theme.to_variant(),
     );
+    let st_theme = state.clone();
     theme_act.connect_activate(move |act, param| {
         let Some(p) = param else {
             return;
@@ -2679,6 +3228,7 @@ fn build_menu(
         };
         libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(s.as_str()));
         act.set_state(p);
+        crate::settings::persist(&st_theme.borrow());
     });
     app_add_action(window, &theme_act);
 
