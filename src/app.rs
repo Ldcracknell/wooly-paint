@@ -35,6 +35,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use gtk::prelude::ListItemExt;
 use gtk::prelude::MenuModelExt;
 
 type SharedState = Rc<RefCell<AppState>>;
@@ -934,6 +935,50 @@ fn swatch_button(fg: [u8; 4], fill_cell: bool) -> gtk::Button {
     btn
 }
 
+/// Square tile matching palette fill swatches: neutral field, border, centered “+”.
+fn palette_add_color_tile_button() -> gtk::Button {
+    let da = gtk::DrawingArea::builder()
+        .width_request(20)
+        .height_request(26)
+        .hexpand(true)
+        .vexpand(true)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::Fill)
+        .build();
+    da.set_draw_func(move |_d, cr, w, h| {
+        let w = w as f64;
+        let h = h as f64;
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        cr.set_source_rgba(0.12, 0.12, 0.13, 1.0);
+        cr.rectangle(0.0, 0.0, w, h);
+        let _ = cr.fill();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+        cr.set_line_width(1.0);
+        cr.rectangle(0.5, 0.5, w - 1.0, h - 1.0);
+        let _ = cr.stroke();
+        let cx = w * 0.5;
+        let cy = h * 0.5;
+        let hl = (w.min(h) * 0.22).clamp(4.0, 9.0);
+        cr.set_source_rgba(0.78, 0.78, 0.82, 0.92);
+        cr.set_line_width(1.25);
+        cr.move_to(cx - hl, cy);
+        cr.line_to(cx + hl, cy);
+        cr.move_to(cx, cy - hl);
+        cr.line_to(cx, cy + hl);
+        let _ = cr.stroke();
+    });
+    gtk::Button::builder()
+        .child(&da)
+        .css_classes(["flat"])
+        .hexpand(true)
+        .vexpand(true)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::Fill)
+        .build()
+}
+
 #[derive(Clone)]
 struct PaletteSidebar {
     flow: gtk::FlowBox,
@@ -946,9 +991,44 @@ struct PaletteSidebar {
     picker_refresh: PickerUiRefresh,
 }
 
+fn palette_dropdown_row_factory() -> gtk::SignalListItemFactory {
+    let f = gtk::SignalListItemFactory::new();
+    f.connect_setup(|_, item| {
+        let Some(li) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let lbl = gtk::Label::builder().xalign(0.0).build();
+        li.set_child(Some(&lbl));
+    });
+    f.connect_bind(|_, item| {
+        let Some(li) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(lbl) = li.child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(obj) = li.item() else {
+            return;
+        };
+        let Ok(so) = obj.downcast::<gtk::StringObject>() else {
+            return;
+        };
+        let s = so.string();
+        let is_new_row = s.as_str() == crate::palette::NEW_PALETTE_DROPDOWN_LABEL;
+        lbl.set_text(&s);
+        if is_new_row {
+            lbl.add_css_class("dim-label");
+        } else {
+            lbl.remove_css_class("dim-label");
+        }
+    });
+    f
+}
+
 fn sync_palette_dropdown_model(book: &PaletteBook, strings: &gtk::StringList, dd: &gtk::DropDown) {
-    let names: Vec<&str> = book.entries.iter().map(|e| e.name.as_str()).collect();
-    strings.splice(0, strings.n_items(), &names);
+    let mut labels: Vec<&str> = book.entries.iter().map(|e| e.name.as_str()).collect();
+    labels.push(crate::palette::NEW_PALETTE_DROPDOWN_LABEL);
+    strings.splice(0, strings.n_items(), &labels);
     let sel = book.active.min(book.entries.len().saturating_sub(1));
     dd.set_selected(sel as u32);
 }
@@ -991,6 +1071,34 @@ fn fill_palette_swatches(ps: &PaletteSidebar, state: &SharedState) {
         btn.add_controller(gc);
         flow.append(&btn);
     }
+
+    let add_btn = palette_add_color_tile_button();
+    add_btn.set_tooltip_text(Some(
+        "Add the picker’s current colour (highlighted square) to this palette.",
+    ));
+    let st_add = state.clone();
+    let ps_add = ps.clone();
+    add_btn.connect_clicked(move |_| {
+        let rgba = {
+            let g = st_add.borrow();
+            match g.picker_target {
+                ColorSlot::Left => g.fg,
+                ColorSlot::Right => g.bg,
+            }
+        };
+        let added = {
+            let mut g = st_add.borrow_mut();
+            let ok = g.palette_book.append_color_to_active(rgba);
+            if ok {
+                crate::settings::persist(&g);
+            }
+            ok
+        };
+        if added {
+            fill_palette_swatches(&ps_add, &st_add);
+        }
+    });
+    flow.append(&add_btn);
 }
 
 fn refresh_palette_sidebar_full(ps: &PaletteSidebar, state: &SharedState) {
@@ -1132,7 +1240,7 @@ fn manage_palettes_dialog(
         .modal(true)
         .title("Manage palettes")
         .default_width(380)
-        .default_height(320)
+        .default_height(440)
         .resizable(true)
         .build();
 
@@ -1168,14 +1276,127 @@ fn manage_palettes_dialog(
 
     sync_dd();
 
+    let colors_lb = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .show_separators(true)
+        .build();
+    let colors_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .min_content_height(160)
+        .max_content_height(280)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&colors_lb)
+        .build();
+
+    let refresh_colors_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let refresh_colors: Rc<dyn Fn()> = Rc::new({
+        let slot = refresh_colors_slot.clone();
+        let colors_lb = colors_lb.clone();
+        let st = state.clone();
+        let dd = dd.clone();
+        let refresh_main = refresh_main.clone();
+        let w = window.clone();
+        move || {
+            let i = dd.selected() as usize;
+            while let Some(c) = colors_lb.first_child() {
+                colors_lb.remove(&c);
+            }
+            let colors: Vec<[u8; 4]> = {
+                let g = st.borrow();
+                g.palette_book
+                    .entries
+                    .get(i)
+                    .map(|e| e.colors.clone())
+                    .unwrap_or_default()
+            };
+            let can_remove = colors.len() > 1;
+            for (ci, &col) in colors.iter().enumerate() {
+                let row = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(8)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .margin_start(4)
+                    .margin_end(4)
+                    .build();
+                let sw = gtk::DrawingArea::builder()
+                    .width_request(28)
+                    .height_request(22)
+                    .build();
+                let r = col[0] as f64 / 255.0;
+                let gg = col[1] as f64 / 255.0;
+                let b = col[2] as f64 / 255.0;
+                let aa = col[3] as f64 / 255.0;
+                sw.set_draw_func(move |_d, cr, w, h| {
+                    cr.set_source_rgba(r, gg, b, aa);
+                    cr.rectangle(0.0, 0.0, w as f64, h as f64);
+                    let _ = cr.fill();
+                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+                    cr.set_line_width(1.0);
+                    cr.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
+                    let _ = cr.stroke();
+                });
+                let hex_s = if col[3] == 255 {
+                    format!("#{:02x}{:02x}{:02x}", col[0], col[1], col[2])
+                } else {
+                    format!(
+                        "#{:02x}{:02x}{:02x}{:02x}",
+                        col[0], col[1], col[2], col[3]
+                    )
+                };
+                let lbl = gtk::Label::new(Some(&hex_s));
+                lbl.set_hexpand(true);
+                lbl.set_xalign(0.0);
+                let rm = gtk::Button::with_label("Remove");
+                rm.set_sensitive(can_remove);
+                rm.set_tooltip_text(Some("Remove this colour from the palette"));
+                let st_rm = st.clone();
+                let dd_rm = dd.clone();
+                let w_rm = w.clone();
+                let refresh_main_rm = refresh_main.clone();
+                let slot_rm = slot.clone();
+                rm.connect_clicked(move |_| {
+                    let pi = dd_rm.selected() as usize;
+                    let ok = {
+                        let mut g = st_rm.borrow_mut();
+                        g.palette_book.remove_color_at(pi, ci)
+                    };
+                    if !ok {
+                        show_simple_alert(
+                            &w_rm,
+                            "Cannot remove",
+                            "Each palette must keep at least one colour.",
+                        );
+                        return;
+                    }
+                    crate::settings::persist(&st_rm.borrow());
+                    refresh_main_rm();
+                    if let Some(r) = slot_rm.borrow().as_ref() {
+                        r();
+                    }
+                });
+                row.append(&sw);
+                row.append(&lbl);
+                row.append(&rm);
+                colors_lb.append(&row);
+            }
+        }
+    });
+    *refresh_colors_slot.borrow_mut() = Some(refresh_colors.clone());
+
     let st_sel = state.clone();
     let ren_sel = rename_entry.clone();
+    let refresh_colors_sel = refresh_colors.clone();
     dd.connect_selected_notify(move |dropdown| {
         let i = dropdown.selected() as usize;
         let g = st_sel.borrow();
         if let Some(e) = g.palette_book.entries.get(i) {
             ren_sel.set_text(&e.name);
         }
+        drop(g);
+        refresh_colors_sel();
     });
     let init_name = {
         let g = state.borrow();
@@ -1307,6 +1528,11 @@ fn manage_palettes_dialog(
     bx.append(&gtk::Label::new(Some("Palette")));
     bx.append(&dd);
     bx.append(&row1);
+    let colors_hdr = gtk::Label::new(Some("Colours in palette"));
+    colors_hdr.add_css_class("dim-label");
+    colors_hdr.set_halign(gtk::Align::Start);
+    bx.append(&colors_hdr);
+    bx.append(&colors_scroll);
     bx.append(&gtk::Label::new(Some("Rename selected")));
     bx.append(&row2);
 
@@ -1323,6 +1549,7 @@ fn manage_palettes_dialog(
 
     bx.append(&btn_row);
     d.set_content(Some(&bx));
+    refresh_colors();
 
     let st_close = state.clone();
     let psc_close = ps.clone();
@@ -4715,6 +4942,9 @@ fn build_ui(app: &Application) {
 
     let palette_strings = gtk::StringList::new(&[]);
     let palette_dd = gtk::DropDown::new(Some(palette_strings.clone()), gtk::Expression::NONE);
+    let palette_row_factory = palette_dropdown_row_factory();
+    palette_dd.set_factory(Some(&palette_row_factory));
+    palette_dd.set_list_factory(Some(&palette_row_factory));
     palette_dd.set_hexpand(true);
     palette_dd.set_halign(gtk::Align::Fill);
     palette_dd.set_valign(gtk::Align::Center);
@@ -4776,8 +5006,18 @@ fn build_ui(app: &Application) {
     let psc_pal = palette_sidebar.clone();
     palette_dd.connect_selected_notify(move |dd| {
         let i = dd.selected() as usize;
+        let n = st_pdd.borrow().palette_book.entries.len();
+        if i == n {
+            {
+                let mut g = st_pdd.borrow_mut();
+                g.palette_book.new_empty_swatch();
+            }
+            crate::settings::persist(&st_pdd.borrow());
+            refresh_palette_sidebar_full(&psc_pal, &st_pdd);
+            return;
+        }
         let mut g = st_pdd.borrow_mut();
-        if i >= g.palette_book.entries.len() {
+        if i >= n {
             return;
         }
         if g.palette_book.active == i {

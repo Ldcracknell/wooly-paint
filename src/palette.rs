@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Built-in sidebar palette name (always kept at index0; not deletable).
 pub const BUILTIN_PALETTE_NAME: &str = "Default";
 
+/// Trailing row in the sidebar palette `DropDown`; selecting it creates a new palette.
+pub const NEW_PALETTE_DROPDOWN_LABEL: &str = "+ New palette";
+
 /// Hard cap per palette to keep the UI responsive.
 pub const MAX_COLORS_PER_PALETTE: usize = 512;
 
@@ -24,6 +27,110 @@ pub const BUILTIN_SWATCHES: &[[u8; 4]] = &[
     [128, 128, 128, 255],
     [192, 192, 192, 255],
     [139, 90, 43, 255],
+];
+
+/// Lexaloffle Pico-8 display palette (16 colours).
+pub const PICO8_COLORS: &[[u8; 4]] = &[
+    [0, 0, 0, 255],
+    [29, 43, 83, 255],
+    [126, 37, 83, 255],
+    [0, 135, 81, 255],
+    [171, 82, 54, 255],
+    [95, 87, 79, 255],
+    [194, 195, 199, 255],
+    [255, 241, 232, 255],
+    [255, 0, 77, 255],
+    [255, 163, 0, 255],
+    [255, 236, 39, 255],
+    [0, 231, 86, 255],
+    [41, 173, 255, 255],
+    [131, 118, 156, 255],
+    [255, 119, 168, 255],
+    [255, 204, 170, 255],
+];
+
+/// ENDESGA 32 (order matches common `.palette` / Lospec exports).
+pub const ENDESGA_32_COLORS: &[[u8; 4]] = &[
+    [190, 74, 47, 255],
+    [215, 118, 67, 255],
+    [234, 212, 170, 255],
+    [228, 166, 114, 255],
+    [184, 111, 80, 255],
+    [115, 62, 57, 255],
+    [62, 39, 49, 255],
+    [162, 38, 51, 255],
+    [228, 59, 68, 255],
+    [247, 118, 34, 255],
+    [254, 174, 52, 255],
+    [254, 231, 97, 255],
+    [99, 199, 77, 255],
+    [62, 137, 72, 255],
+    [38, 92, 66, 255],
+    [25, 60, 62, 255],
+    [18, 78, 137, 255],
+    [0, 153, 219, 255],
+    [44, 232, 245, 255],
+    [255, 255, 255, 255],
+    [192, 203, 220, 255],
+    [139, 155, 180, 255],
+    [90, 105, 136, 255],
+    [58, 68, 102, 255],
+    [38, 43, 68, 255],
+    [24, 20, 37, 255],
+    [255, 0, 68, 255],
+    [104, 56, 108, 255],
+    [181, 80, 136, 255],
+    [246, 117, 122, 255],
+    [232, 183, 150, 255],
+    [194, 133, 105, 255],
+];
+
+/// Sweetie 16 (GrafxKid).
+pub const SWEETIE_16_COLORS: &[[u8; 4]] = &[
+    [27, 38, 50, 255],
+    [72, 59, 58, 255],
+    [158, 40, 53, 255],
+    [229, 59, 68, 255],
+    [239, 101, 85, 255],
+    [252, 158, 79, 255],
+    [255, 210, 142, 255],
+    [153, 229, 80, 255],
+    [52, 190, 91, 255],
+    [69, 175, 110, 255],
+    [36, 128, 137, 255],
+    [30, 111, 124, 255],
+    [38, 92, 100, 255],
+    [44, 232, 244, 255],
+    [255, 255, 255, 255],
+    [75, 105, 47, 255],
+];
+
+/// DawnBringer 16.
+pub const DAWNBRINGER_16_COLORS: &[[u8; 4]] = &[
+    [20, 12, 28, 255],
+    [68, 36, 52, 255],
+    [48, 52, 109, 255],
+    [78, 74, 78, 255],
+    [133, 76, 48, 255],
+    [208, 70, 72, 255],
+    [89, 125, 206, 255],
+    [210, 125, 44, 255],
+    [133, 149, 161, 255],
+    [109, 170, 44, 255],
+    [210, 170, 153, 255],
+    [69, 40, 60, 255],
+    [126, 37, 83, 255],
+    [223, 113, 38, 255],
+    [25, 60, 62, 255],
+    [254, 231, 97, 255],
+];
+
+/// Classic 4-colour Game Boy-style greens.
+pub const GAMEBOY_4_COLORS: &[[u8; 4]] = &[
+    [15, 56, 15, 255],
+    [48, 98, 48, 255],
+    [139, 172, 15, 255],
+    [155, 188, 15, 255],
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,10 +157,14 @@ pub struct PaletteBook {
 impl PaletteBook {
     pub fn new_builtin_only() -> Self {
         Self {
-            entries: vec![NamedPalette::new(
-                BUILTIN_PALETTE_NAME,
-                BUILTIN_SWATCHES.to_vec(),
-            )],
+            entries: vec![
+                NamedPalette::new(BUILTIN_PALETTE_NAME, BUILTIN_SWATCHES.to_vec()),
+                NamedPalette::new("Pico-8", PICO8_COLORS.to_vec()),
+                NamedPalette::new("Endesga 32", ENDESGA_32_COLORS.to_vec()),
+                NamedPalette::new("Sweetie 16", SWEETIE_16_COLORS.to_vec()),
+                NamedPalette::new("DawnBringer 16", DAWNBRINGER_16_COLORS.to_vec()),
+                NamedPalette::new("Game Boy", GAMEBOY_4_COLORS.to_vec()),
+            ],
             active: 0,
         }
     }
@@ -71,12 +182,41 @@ impl PaletteBook {
         Self { entries, active }
     }
 
+    /// Append any built-in named palettes that are not already in the book (for upgrades / old settings files).
+    pub fn merge_missing_builtin_presets(&mut self) -> bool {
+        let builtins = Self::new_builtin_only().entries;
+        let mut names: std::collections::HashSet<String> =
+            self.entries.iter().map(|e| e.name.clone()).collect();
+        let mut added = false;
+        for bp in builtins {
+            if names.contains(&bp.name) {
+                continue;
+            }
+            names.insert(bp.name.clone());
+            self.entries.push(bp);
+            added = true;
+        }
+        self.clamp_active();
+        added
+    }
+
     pub fn active_palette(&self) -> &NamedPalette {
         &self.entries[self.active]
     }
 
     pub fn active_colors(&self) -> &[[u8; 4]] {
         &self.entries[self.active].colors
+    }
+
+    /// Append a swatch to the active palette. Returns `false` if the palette is at capacity.
+    pub fn append_color_to_active(&mut self, rgba: [u8; 4]) -> bool {
+        self.clamp_active();
+        let pal = &mut self.entries[self.active];
+        if pal.colors.len() >= MAX_COLORS_PER_PALETTE {
+            return false;
+        }
+        pal.colors.push(rgba);
+        true
     }
 
     pub fn clamp_active(&mut self) {
@@ -138,6 +278,19 @@ impl PaletteBook {
             return false;
         }
         self.entries[index].name = new_name.to_string();
+        true
+    }
+
+    /// Drop one swatch from a palette. Returns `false` if the palette would become empty.
+    pub fn remove_color_at(&mut self, palette_index: usize, color_index: usize) -> bool {
+        if palette_index >= self.entries.len() {
+            return false;
+        }
+        let colors = &mut self.entries[palette_index].colors;
+        if color_index >= colors.len() || colors.len() <= 1 {
+            return false;
+        }
+        colors.remove(color_index);
         true
     }
 }
@@ -338,5 +491,28 @@ mod tests {
             Some([255, 0, 77, 255])
         );
         assert_eq!(parse_hex_color_input("  #abc "), Some([0xaa, 0xbb, 0xcc, 255]));
+    }
+
+    #[test]
+    fn builtin_book_includes_presets() {
+        let book = PaletteBook::new_builtin_only();
+        assert_eq!(book.entries.len(), 6);
+        assert_eq!(book.entries[1].name, "Pico-8");
+        assert_eq!(book.entries[1].colors.len(), 16);
+        assert_eq!(book.entries[2].colors.len(), 32);
+        assert_eq!(book.entries[2].name, "Endesga 32");
+    }
+
+    #[test]
+    fn merge_presets_after_old_save() {
+        let mut book = PaletteBook::from_loaded(
+            vec![NamedPalette::new("Default", vec![[0, 0, 0, 255]])],
+            0,
+        );
+        assert_eq!(book.entries.len(), 1);
+        assert!(book.merge_missing_builtin_presets());
+        assert_eq!(book.entries.len(), 6);
+        assert!(book.entries.iter().any(|e| e.name == "Pico-8"));
+        assert!(!book.merge_missing_builtin_presets());
     }
 }

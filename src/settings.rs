@@ -133,6 +133,9 @@ pub fn load_into(state: &mut AppState) -> &'static str {
     if !parsed.palettes.is_empty() {
         state.palette_book = PaletteBook::from_loaded(parsed.palettes, parsed.active_palette);
     }
+    if state.palette_book.merge_missing_builtin_presets() {
+        persist(state);
+    }
     state.recent_files = parsed
         .recent_files
         .into_iter()
