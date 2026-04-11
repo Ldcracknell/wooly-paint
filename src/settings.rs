@@ -81,7 +81,7 @@ fn merge_keybinds(stored: &[StoredBind]) -> Vec<(ToolKind, Option<char>)> {
             .as_ref()
             .and_then(|s| s.chars().next())
             .map(|c| c.to_ascii_lowercase())
-            .filter(|c| c.is_ascii_alphanumeric());
+            .filter(|c| !c.is_control() && !c.is_whitespace());
         if let Some(idx) = out.iter().position(|(t, _)| *t == tool) {
             out[idx].1 = key;
         }

@@ -2388,7 +2388,7 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
         let Some(ch) = keyval.to_unicode().map(|c| c.to_ascii_lowercase()) else {
             return glib::Propagation::Proceed;
         };
-        if !ch.is_ascii_alphanumeric() {
+        if ch.is_control() || ch.is_whitespace() {
             return glib::Propagation::Proceed;
         }
 
@@ -2978,7 +2978,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             _ => {
-                if !ctrl && !shift {
+                if !ctrl {
                     if let Some(ch) = keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
                         let st_ref = st_k.borrow();
                         let tool = st_ref.tool_keybinds.iter()
