@@ -27,6 +27,8 @@ use gtk::prelude::EventControllerExt;
 use gtk::prelude::GestureDragExt;
 use gtk::prelude::GestureSingleExt;
 use gtk::prelude::RangeExt;
+use gtk::prelude::EditableExt;
+use gtk::prelude::ToggleButtonExt;
 use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
 use std::borrow::Cow;
@@ -38,6 +40,13 @@ use gtk::prelude::MenuModelExt;
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
+type PickerUiRefresh = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+fn picker_refresh_call(pr: &PickerUiRefresh) {
+    if let Some(f) = pr.borrow().as_ref() {
+        f();
+    }
+}
 type ColorPreviewDaCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type ToolDdCell = Rc<RefCell<Option<gtk::DropDown>>>;
 /// Screen-space size for floating handles (corners / edges / rotate knob), in pixels.
@@ -489,6 +498,31 @@ fn rgb_bytes_to_hsv(c: [u8; 4]) -> (f64, f64, f64) {
     (h.rem_euclid(1.0), s, max)
 }
 
+/// (s, v) on the `hh` slice that best matches RGB `c` (for SV square marker position).
+fn sv_on_hue_plane_for_rgb(hh: f64, c: [u8; 4]) -> (f64, f64) {
+    let tr = c[0] as f64 / 255.0;
+    let tg = c[1] as f64 / 255.0;
+    let tb = c[2] as f64 / 255.0;
+    let mut best_s = 0.0_f64;
+    let mut best_v = 0.0_f64;
+    let mut best_e = f64::MAX;
+    const N: i32 = 40;
+    for i in 0..=N {
+        let s = i as f64 / N as f64;
+        for j in 0..=N {
+            let v = j as f64 / N as f64;
+            let (r, g, b) = hsv_to_rgb01(hh, s, v);
+            let e = (r - tr).powi(2) + (g - tg).powi(2) + (b - tb).powi(2);
+            if e < best_e {
+                best_e = e;
+                best_s = s;
+                best_v = v;
+            }
+        }
+    }
+    (best_s, best_v)
+}
+
 fn hsv_to_rgb01(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
     let h = h.rem_euclid(1.0);
     let s = s.clamp(0.0, 1.0);
@@ -512,14 +546,30 @@ fn u8_chan(x: f64) -> u8 {
     (x.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-fn write_slot_rgb(st: &mut AppState, slot: ColorSlot, rgb: (f64, f64, f64)) {
+fn write_slot_rgb_a(st: &mut AppState, slot: ColorSlot, rgb: (f64, f64, f64), a: u8) {
     let (r, g, b) = rgb;
     let c = match slot {
         ColorSlot::Left => &mut st.fg,
         ColorSlot::Right => &mut st.bg,
     };
-    let a = c[3];
     *c = [u8_chan(r), u8_chan(g), u8_chan(b), a];
+}
+
+fn write_slot_rgb(st: &mut AppState, slot: ColorSlot, rgb: (f64, f64, f64)) {
+    let a = match slot {
+        ColorSlot::Left => st.fg[3],
+        ColorSlot::Right => st.bg[3],
+    };
+    write_slot_rgb_a(st, slot, rgb, a);
+}
+
+/// Picker gestures: left (and other non-right) buttons edit the primary slot; right button edits secondary.
+fn picker_target_for_gesture_button(btn: u32) -> ColorSlot {
+    if btn == gdk::BUTTON_SECONDARY {
+        ColorSlot::Right
+    } else {
+        ColorSlot::Left
+    }
 }
 
 fn apply_sv_pick(
@@ -527,6 +577,7 @@ fn apply_sv_pick(
     sv_area: &gtk::DrawingArea,
     fg_bg: &gtk::DrawingArea,
     canvas: &CanvasCell,
+    picker_refresh: &PickerUiRefresh,
     x: f64,
     y: f64,
 ) {
@@ -543,15 +594,281 @@ fn apply_sv_pick(
     let rgb = hsv_to_rgb01(hh, s, v);
     write_slot_rgb(&mut g, slot, rgb);
     drop(g);
+    picker_refresh_call(picker_refresh);
     sv_area.queue_draw();
     fg_bg.queue_draw();
     queue_canvas(canvas);
 }
 
-fn sync_hue_adj_ui(sup: &Cell<bool>, adj: &gtk::Adjustment, hue01: f64) {
-    sup.set(true);
-    adj.set_value((hue01.rem_euclid(1.0)) * 360.0);
-    sup.set(false);
+fn sync_picker_from_target_color(
+    state: &SharedState,
+    hue_sup: &Cell<bool>,
+    picker_sup: &Cell<bool>,
+    hue_adj: &gtk::Adjustment,
+    sat_adj: &gtk::Adjustment,
+    val_adj: &gtk::Adjustment,
+    r_adj: &gtk::Adjustment,
+    g_adj: &gtk::Adjustment,
+    b_adj: &gtk::Adjustment,
+    a_adj: &gtk::Adjustment,
+    sat_disp_adj: &gtk::Adjustment,
+    val_disp_adj: &gtk::Adjustment,
+    hex_entry: &gtk::Entry,
+    picker_tracks: &Rc<RefCell<Vec<gtk::DrawingArea>>>,
+    sv_square: &gtk::DrawingArea,
+) {
+    if picker_sup.get() {
+        return;
+    }
+    picker_sup.set(true);
+    let c = {
+        let st = state.borrow();
+        match st.picker_target {
+            ColorSlot::Left => st.fg,
+            ColorSlot::Right => st.bg,
+        }
+    };
+    let (h_rgb, s_rgb, v_rgb) = rgb_bytes_to_hsv(c);
+    let v_clamped = v_rgb.clamp(0.0, 1.0);
+    // Black (V=0) and grayscale (S=0) don't determine H (and black doesn't determine S) in RGB.
+    // Keep the slider/model hue and saturation so H/S stay draggable off black and grays stay tinted.
+    let h_sync = if v_clamped <= 1e-9 {
+        state.borrow().picker_hue.rem_euclid(1.0)
+    } else if s_rgb <= 1e-9 {
+        state.borrow().picker_hue.rem_euclid(1.0)
+    } else {
+        h_rgb.rem_euclid(1.0)
+    };
+    let s_sync = if v_clamped <= 1e-9 {
+        sat_adj.value().clamp(0.0, 1.0)
+    } else {
+        s_rgb.clamp(0.0, 1.0)
+    };
+    state.borrow_mut().picker_hue = h_sync;
+    hue_sup.set(true);
+    hue_adj.set_value(h_sync * 360.0);
+    hue_sup.set(false);
+    sat_adj.set_value(s_sync);
+    val_adj.set_value(v_clamped);
+    r_adj.set_value(c[0] as f64);
+    g_adj.set_value(c[1] as f64);
+    b_adj.set_value(c[2] as f64);
+    a_adj.set_value(c[3] as f64);
+    sat_disp_adj.set_value((s_sync * 100.0).round().clamp(0.0, 100.0));
+    val_disp_adj.set_value((v_clamped * 100.0).round().clamp(0.0, 100.0));
+    let hex = if c[3] == 255 {
+        format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+    } else {
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            c[0], c[1], c[2], c[3]
+        )
+    };
+    hex_entry.set_text(&hex);
+    picker_sup.set(false);
+    for d in picker_tracks.borrow().iter() {
+        d.queue_draw();
+    }
+    sv_square.queue_draw();
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerTrackKind {
+    Hue,
+    Sat,
+    Val,
+    Red,
+    Green,
+    Blue,
+    Alpha,
+}
+
+fn draw_checker_bg(cr: &gtk::cairo::Context, width: f64, height: f64) {
+    let sz = 5.0_f64;
+    let mut y = 0.0;
+    while y < height {
+        let mut x = 0.0;
+        while x < width {
+            let ix = (x / sz).floor() as i32;
+            let iy = (y / sz).floor() as i32;
+            let light = (ix + iy).rem_euclid(2) == 0;
+            if light {
+                cr.set_source_rgb(0.62, 0.62, 0.62);
+            } else {
+                cr.set_source_rgb(0.38, 0.38, 0.38);
+            }
+            let rw = sz.min(width - x);
+            let rh = sz.min(height - y);
+            cr.rectangle(x, y, rw, rh);
+            let _ = cr.fill();
+            x += sz;
+        }
+        y += sz;
+    }
+}
+
+fn make_picker_track(
+    kind: PickerTrackKind,
+    state: &SharedState,
+    adj: &gtk::Adjustment,
+    picker_tracks: &Rc<RefCell<Vec<gtk::DrawingArea>>>,
+) -> gtk::DrawingArea {
+    let da = gtk::DrawingArea::builder()
+        .height_request(22)
+        .hexpand(true)
+        .build();
+    let st = state.clone();
+    let adj_c = adj.clone();
+    da.set_draw_func(move |_d, cr, ww, hh| {
+        let w = ww as f64;
+        let h = hh as f64;
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+        let st_b = st.borrow();
+        let c = match st_b.picker_target {
+            ColorSlot::Left => st_b.fg,
+            ColorSlot::Right => st_b.bg,
+        };
+        let hh_pick = st_b.picker_hue;
+        let (_, s0, v0) = rgb_bytes_to_hsv(c);
+        let r0 = c[0] as f64 / 255.0;
+        let g0 = c[1] as f64 / 255.0;
+        let b0 = c[2] as f64 / 255.0;
+        drop(st_b);
+        if kind != PickerTrackKind::Alpha {
+            let ww_i = ww.max(1);
+            for px in 0..ww_i {
+                let t = (px as f64 + 0.5) / w;
+                let (r, g, b) = match kind {
+                    PickerTrackKind::Hue => hsv_to_rgb01(t, 1.0, 1.0),
+                    PickerTrackKind::Sat => hsv_to_rgb01(hh_pick, t, v0),
+                    PickerTrackKind::Val => hsv_to_rgb01(hh_pick, s0, t),
+                    PickerTrackKind::Red => (t, g0, b0),
+                    PickerTrackKind::Green => (r0, t, b0),
+                    PickerTrackKind::Blue => (r0, g0, t),
+                    PickerTrackKind::Alpha => (0.0, 0.0, 0.0),
+                };
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(px as f64, 0.0, 1.0, h);
+                let _ = cr.fill();
+            }
+        } else {
+            draw_checker_bg(cr, w, h);
+            let lg = gtk::cairo::LinearGradient::new(0.0, 0.0, w, 0.0);
+            lg.add_color_stop_rgba(0.0, r0, g0, b0, 0.0);
+            lg.add_color_stop_rgba(1.0, r0, g0, b0, 1.0);
+            let _ = cr.set_source(&lg);
+            cr.rectangle(0.0, 0.0, w, h);
+            let _ = cr.fill();
+        }
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.4);
+        cr.set_line_width(1.0);
+        cr.rectangle(0.5, 0.5, w - 1.0, h - 1.0);
+        let _ = cr.stroke();
+        let lo = adj_c.lower();
+        let hi = adj_c.upper();
+        let t = if (hi - lo).abs() < 1e-9 {
+            0.0
+        } else {
+            ((adj_c.value() - lo) / (hi - lo)).clamp(0.0, 1.0)
+        };
+        let x = t * w;
+        cr.set_source_rgb(0.06, 0.06, 0.06);
+        cr.move_to(x, 1.0);
+        cr.line_to(x - 5.0, h - 1.0);
+        cr.line_to(x + 5.0, h - 1.0);
+        cr.close_path();
+        let _ = cr.fill();
+    });
+    picker_tracks.borrow_mut().push(da.clone());
+    wire_picker_track_drag(&da, adj, picker_tracks, state);
+    da
+}
+
+fn wire_picker_track_drag(
+    da: &gtk::DrawingArea,
+    adj: &gtk::Adjustment,
+    picker_tracks: &Rc<RefCell<Vec<gtk::DrawingArea>>>,
+    state: &SharedState,
+) {
+    let painting = Rc::new(Cell::new(false));
+    let gc = gtk::GestureClick::new();
+    gc.set_button(0);
+    let adj_p = adj.clone();
+    let da_p = da.clone();
+    let tracks_p = picker_tracks.clone();
+    let paint_on = painting.clone();
+    let st_press = state.clone();
+    gc.connect_pressed(move |gesture, _, x, _| {
+        paint_on.set(true);
+        {
+            let mut g = st_press.borrow_mut();
+            g.picker_target = picker_target_for_gesture_button(gesture.current_button());
+        }
+        let w = da_p.width() as f64;
+        if w > 1.0 {
+            let t = (x / w).clamp(0.0, 1.0);
+            let lo = adj_p.lower();
+            let hi = adj_p.upper();
+            let mut v = lo + t * (hi - lo);
+            if adj_p.step_increment() >= 1.0 && hi > 1.5 {
+                v = v.round();
+            }
+            adj_p.set_value(v.clamp(lo, hi));
+        }
+        for tr in tracks_p.borrow().iter() {
+            tr.queue_draw();
+        }
+    });
+    let paint_off = painting.clone();
+    gc.connect_released(move |_, _, _, _| paint_off.set(false));
+    da.add_controller(gc);
+
+    let motion = gtk::EventControllerMotion::new();
+    let adj_m = adj.clone();
+    let da_m = da.clone();
+    let tracks_m = picker_tracks.clone();
+    let painting_m = painting.clone();
+    motion.connect_motion(move |_ec, x, _| {
+        if !painting_m.get() {
+            return;
+        }
+        let w = da_m.width() as f64;
+        if w > 1.0 {
+            let t = (x / w).clamp(0.0, 1.0);
+            let lo = adj_m.lower();
+            let hi = adj_m.upper();
+            let mut v = lo + t * (hi - lo);
+            if adj_m.step_increment() >= 1.0 && hi > 1.5 {
+                v = v.round();
+            }
+            adj_m.set_value(v.clamp(lo, hi));
+        }
+        for tr in tracks_m.borrow().iter() {
+            tr.queue_draw();
+        }
+    });
+    da.add_controller(motion);
+}
+
+fn picker_gradient_spin_row(label: &str, track: &gtk::DrawingArea, spin: &gtk::SpinButton) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .hexpand(true)
+        .build();
+    let l = gtk::Label::new(Some(label));
+    l.set_width_request(28);
+    l.set_xalign(1.0);
+    l.add_css_class("dim-label");
+    spin.set_width_request(72);
+    spin.set_digits(0);
+    row.append(&l);
+    track.set_hexpand(true);
+    row.append(track);
+    row.append(spin);
+    row
 }
 
 fn push_recent_color(st: &mut AppState, fg: [u8; 4]) {
@@ -625,9 +942,8 @@ struct PaletteSidebar {
     preview: gtk::DrawingArea,
     recent: gtk::FlowBox,
     canvas: CanvasCell,
-    hue_suppress: Rc<Cell<bool>>,
-    hue_adj: gtk::Adjustment,
     sv_area: gtk::DrawingArea,
+    picker_refresh: PickerUiRefresh,
 }
 
 fn sync_palette_dropdown_model(book: &PaletteBook, strings: &gtk::StringList, dd: &gtk::DropDown) {
@@ -649,34 +965,28 @@ fn fill_palette_swatches(ps: &PaletteSidebar, state: &SharedState) {
         let prev_pal = ps.preview.clone();
         let cv_pal = ps.canvas.clone();
         let rf_pal = ps.recent.clone();
-        let sup = ps.hue_suppress.clone();
-        let adj = ps.hue_adj.clone();
         let sv = ps.sv_area.clone();
+        let pr = ps.picker_refresh.clone();
         let gc = gtk::GestureClick::new();
         gc.set_button(0);
         gc.connect_pressed(move |gesture, _, _, _| {
             let btn_id = gesture.current_button();
-            let hue01 = {
+            {
                 let mut g = st_pal.borrow_mut();
-                let new_c = if btn_id == gdk::BUTTON_SECONDARY {
+                if btn_id == gdk::BUTTON_SECONDARY {
                     g.bg = col;
                     g.picker_target = ColorSlot::Right;
-                    g.bg
                 } else {
                     g.fg = col;
                     g.picker_target = ColorSlot::Left;
                     push_recent_color(&mut g, col);
-                    g.fg
-                };
-                let (h, _, _) = rgb_bytes_to_hsv(new_c);
-                g.picker_hue = h;
-                h
-            };
-            sync_hue_adj_ui(sup.as_ref(), &adj, hue01);
+                }
+            }
+            picker_refresh_call(&pr);
             prev_pal.queue_draw();
             sv.queue_draw();
             queue_canvas(&cv_pal);
-            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &cv_pal);
+            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &cv_pal, &pr);
         });
         btn.add_controller(gc);
         flow.append(&btn);
@@ -1031,9 +1341,8 @@ fn manage_palettes_dialog(
 fn make_fg_bg_selector(
     state: &SharedState,
     canvas: &CanvasCell,
-    hue_suppress: &Rc<Cell<bool>>,
-    hue_adj: &gtk::Adjustment,
     sv_da: &gtk::DrawingArea,
+    picker_refresh: &PickerUiRefresh,
 ) -> gtk::DrawingArea {
     const BG_X: f64 = 2.0;
     const BG_Y: f64 = 2.0;
@@ -1047,7 +1356,7 @@ fn make_fg_bg_selector(
         .hexpand(false)
         .vexpand(false)
         .tooltip_text(
-            "Back = secondary (right-click paint), front = primary (left-click). Left-click: swap colors. Right-click a square: edit that slot in the picker below.",
+            "Back = secondary (right-click paint), front = primary (left-click). Left-click: swap colors. Right-click a square: load that slot into the picker. Left-drag sliders or the saturation/value square edits the front color; right-drag edits the back color.",
         )
         .build();
     let st_draw = state.clone();
@@ -1084,8 +1393,7 @@ fn make_fg_bg_selector(
     let st = state.clone();
     let cv = canvas.clone();
     let da_c = da.clone();
-    let sup_c = hue_suppress.clone();
-    let adj_c = hue_adj.clone();
+    let pr = picker_refresh.clone();
     let sv_c = sv_da.clone();
     click.connect_pressed(move |gesture, n_press, x, y| {
         if n_press != 1 {
@@ -1109,6 +1417,7 @@ fn make_fg_bg_selector(
             g.fg = g.bg;
             g.bg = t;
             drop(g);
+            picker_refresh_call(&pr);
             da_c.queue_draw();
             sv_c.queue_draw();
             queue_canvas(&cv);
@@ -1118,7 +1427,7 @@ fn make_fg_bg_selector(
             let Some(slot) = slot_at else {
                 return;
             };
-            let hue01 = {
+            {
                 let mut g = st.borrow_mut();
                 g.picker_target = slot;
                 let c = match slot {
@@ -1127,9 +1436,8 @@ fn make_fg_bg_selector(
                 };
                 let (h, _, _) = rgb_bytes_to_hsv(c);
                 g.picker_hue = h;
-                h
-            };
-            sync_hue_adj_ui(sup_c.as_ref(), &adj_c, hue01);
+            }
+            picker_refresh_call(&pr);
             da_c.queue_draw();
             sv_c.queue_draw();
         }
@@ -1143,6 +1451,7 @@ fn refresh_recent_swatch_row(
     state: &SharedState,
     preview_da: &gtk::DrawingArea,
     cv: &CanvasCell,
+    picker_refresh: &PickerUiRefresh,
 ) {
     while let Some(c) = flow.first_child() {
         flow.remove(&c);
@@ -1154,6 +1463,7 @@ fn refresh_recent_swatch_row(
         let prev = preview_da.clone();
         let cv2 = cv.clone();
         let flow2 = flow.clone();
+        let pr = picker_refresh.clone();
         let gc = gtk::GestureClick::new();
         gc.set_button(0);
         gc.connect_pressed(move |gesture, _, _, _| {
@@ -1166,9 +1476,10 @@ fn refresh_recent_swatch_row(
                     push_recent_color(&mut g, col);
                 }
             }
+            picker_refresh_call(&pr);
             prev.queue_draw();
             queue_canvas(&cv2);
-            refresh_recent_swatch_row(&flow2, &st, &prev, &cv2);
+            refresh_recent_swatch_row(&flow2, &st, &prev, &cv2, &pr);
         });
         btn.add_controller(gc);
         flow.append(&btn);
@@ -1936,6 +2247,7 @@ fn setup_canvas_input(
     canvas_cell: &CanvasCell,
     color_preview_da_cell: &ColorPreviewDaCell,
     recent_swatches: &gtk::FlowBox,
+    picker_ui_refresh: &PickerUiRefresh,
 ) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let last_brush_widget: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
@@ -1954,6 +2266,7 @@ fn setup_canvas_input(
     let mws_b = move_widget_start.clone();
     let cb_drag = color_preview_da_cell.clone();
     let recent_drag = recent_swatches.clone();
+    let picker_drag = picker_ui_refresh.clone();
     drag.connect_drag_begin(move |gesture, wx, wy| {
         cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
@@ -2053,6 +2366,8 @@ fn setup_canvas_input(
                     st.fg = c;
                     push_recent_color(&mut st, c);
                 }
+                let (h, _, _) = rgb_bytes_to_hsv(c);
+                st.picker_hue = h.rem_euclid(1.0);
                 eyedrop_updated = true;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
@@ -2206,8 +2521,15 @@ fn setup_canvas_input(
         }
         if eyedrop_updated {
             if let Some(ref da) = *cb_drag.borrow() {
+                picker_refresh_call(&picker_drag);
                 da.queue_draw();
-                refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &cv_drag);
+                refresh_recent_swatch_row(
+                    &recent_drag,
+                    &st_drag_begin,
+                    da,
+                    &cv_drag,
+                    &picker_drag,
+                );
             }
         }
         queue_canvas(&cv_drag);
@@ -3422,18 +3744,48 @@ fn build_ui(app: &Application) {
         .halign(gtk::Align::Start)
         .build();
 
+    let picker_ui_refresh: PickerUiRefresh = Rc::new(RefCell::new(None));
+    let picker_suppress = Rc::new(Cell::new(false));
     let hue_suppress = Rc::new(Cell::new(false));
     let picker_hue_adj = gtk::Adjustment::new(0.0, 0.0, 360.0, 1.0, 10.0, 0.0);
+
+    let init_slot_color = {
+        let st = state.borrow();
+        match st.picker_target {
+            ColorSlot::Left => st.fg,
+            ColorSlot::Right => st.bg,
+        }
+    };
+    let (init_h, init_s, init_v) = rgb_bytes_to_hsv(init_slot_color);
     {
         let mut g = state.borrow_mut();
-        let (h, _, _) = rgb_bytes_to_hsv(g.fg);
-        g.picker_hue = h;
+        g.picker_hue = init_h.rem_euclid(1.0);
     }
-    sync_hue_adj_ui(
-        hue_suppress.as_ref(),
-        &picker_hue_adj,
-        state.borrow().picker_hue,
-    );
+
+    let picker_sat_adj = gtk::Adjustment::new(init_s, 0.0, 1.0, 0.01, 0.05, 0.0);
+    let picker_val_adj = gtk::Adjustment::new(init_v, 0.0, 1.0, 0.01, 0.05, 0.0);
+    let picker_r_adj =
+        gtk::Adjustment::new(init_slot_color[0] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_g_adj =
+        gtk::Adjustment::new(init_slot_color[1] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_b_adj =
+        gtk::Adjustment::new(init_slot_color[2] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_tracks: Rc<RefCell<Vec<gtk::DrawingArea>>> = Rc::new(RefCell::new(Vec::new()));
+    let picker_a_adj =
+        gtk::Adjustment::new(init_slot_color[3] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_s_disp_adj =
+        gtk::Adjustment::new((init_s * 100.0).round(), 0.0, 100.0, 1.0, 10.0, 0.0);
+    let picker_v_disp_adj =
+        gtk::Adjustment::new((init_v * 100.0).round(), 0.0, 100.0, 1.0, 10.0, 0.0);
+
+    hue_suppress.set(true);
+    picker_hue_adj.set_value(init_h.rem_euclid(1.0) * 360.0);
+    hue_suppress.set(false);
+
+    let hex_entry = gtk::Entry::builder()
+        .hexpand(true)
+        .placeholder_text("#RRGGBB or RRGGBB")
+        .build();
 
     let sv_da = gtk::DrawingArea::builder()
         .width_request(168)
@@ -3443,7 +3795,14 @@ fn build_ui(app: &Application) {
         .build();
     let st_svd = state.clone();
     sv_da.set_draw_func(move |_d, cr, w, h| {
-        let hh = st_svd.borrow().picker_hue;
+        let (hh, c) = {
+            let st = st_svd.borrow();
+            let c = match st.picker_target {
+                ColorSlot::Left => st.fg,
+                ColorSlot::Right => st.bg,
+            };
+            (st.picker_hue, c)
+        };
         let w = w as i32;
         let h = h as i32;
         if w <= 0 || h <= 0 {
@@ -3459,22 +3818,138 @@ fn build_ui(app: &Application) {
                 let _ = cr.fill();
             }
         }
+        let wf = w as f64;
+        let hf = h as f64;
+        let (ms, mv) = sv_on_hue_plane_for_rgb(hh, c);
+        let cx = (ms * wf).clamp(0.0, wf);
+        let cy = ((1.0 - mv) * hf).clamp(0.0, hf);
+        const PI: f64 = std::f64::consts::PI;
+        let rad = 3.5;
+        cr.set_line_width(1.0);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+        cr.arc(cx, cy, rad + 0.5, 0.0, 2.0 * PI);
+        let _ = cr.stroke();
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        cr.arc(cx, cy, rad, 0.0, 2.0 * PI);
+        let _ = cr.stroke();
     });
 
     let fg_bg_da = make_fg_bg_selector(
         &state,
         &canvas_cell,
-        &hue_suppress,
-        &picker_hue_adj,
         &sv_da,
+        &picker_ui_refresh,
     );
     *color_preview_da_cell.borrow_mut() = Some(fg_bg_da.clone());
+
+    let da_h = make_picker_track(PickerTrackKind::Hue, &state, &picker_hue_adj, &picker_tracks);
+    let da_s = make_picker_track(PickerTrackKind::Sat, &state, &picker_sat_adj, &picker_tracks);
+    let da_v = make_picker_track(PickerTrackKind::Val, &state, &picker_val_adj, &picker_tracks);
+    let da_r = make_picker_track(PickerTrackKind::Red, &state, &picker_r_adj, &picker_tracks);
+    let da_g = make_picker_track(PickerTrackKind::Green, &state, &picker_g_adj, &picker_tracks);
+    let da_b = make_picker_track(PickerTrackKind::Blue, &state, &picker_b_adj, &picker_tracks);
+    let da_a = make_picker_track(PickerTrackKind::Alpha, &state, &picker_a_adj, &picker_tracks);
+
+    let spin_h = gtk::SpinButton::new(Some(&picker_hue_adj), 1.0, 0);
+    spin_h.set_digits(0);
+    let spin_s = gtk::SpinButton::new(Some(&picker_s_disp_adj), 1.0, 0);
+    let spin_v = gtk::SpinButton::new(Some(&picker_v_disp_adj), 1.0, 0);
+    let spin_r = gtk::SpinButton::new(Some(&picker_r_adj), 1.0, 0);
+    let spin_g = gtk::SpinButton::new(Some(&picker_g_adj), 1.0, 0);
+    let spin_b = gtk::SpinButton::new(Some(&picker_b_adj), 1.0, 0);
+    let spin_a = gtk::SpinButton::new(Some(&picker_a_adj), 1.0, 0);
+
+    let hsv_panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    hsv_panel.append(&picker_gradient_spin_row("H:", &da_h, &spin_h));
+    hsv_panel.append(&picker_gradient_spin_row("S:", &da_s, &spin_s));
+    hsv_panel.append(&picker_gradient_spin_row("V:", &da_v, &spin_v));
+
+    let rgb_panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    rgb_panel.append(&picker_gradient_spin_row("R:", &da_r, &spin_r));
+    rgb_panel.append(&picker_gradient_spin_row("G:", &da_g, &spin_g));
+    rgb_panel.append(&picker_gradient_spin_row("B:", &da_b, &spin_b));
+    rgb_panel.set_visible(false);
+
+    let alpha_lbl = gtk::Label::new(Some("Alpha"));
+    alpha_lbl.add_css_class("dim-label");
+    alpha_lbl.set_halign(gtk::Align::Start);
+    let alpha_panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    alpha_panel.append(&alpha_lbl);
+    alpha_panel.append(&picker_gradient_spin_row("A:", &da_a, &spin_a));
+
+    let hsv_toggle = gtk::ToggleButton::with_label("HSV");
+    let rgb_toggle = gtk::ToggleButton::with_label("RGB");
+    rgb_toggle.set_group(Some(&hsv_toggle));
+    hsv_toggle.set_active(true);
+    let mode_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .hexpand(true)
+        .build();
+    mode_row.add_css_class("linked");
+    mode_row.append(&hsv_toggle);
+    mode_row.append(&rgb_toggle);
+
+    let hsv_panel_vis = hsv_panel.clone();
+    let rgb_panel_vis = rgb_panel.clone();
+    hsv_toggle.connect_toggled(move |t| {
+        if t.is_active() {
+            hsv_panel_vis.set_visible(true);
+            rgb_panel_vis.set_visible(false);
+        }
+    });
+    let hsv_panel_vis2 = hsv_panel.clone();
+    let rgb_panel_vis2 = rgb_panel.clone();
+    rgb_toggle.connect_toggled(move |t| {
+        if t.is_active() {
+            hsv_panel_vis2.set_visible(false);
+            rgb_panel_vis2.set_visible(true);
+        }
+    });
+
+    let ps_sd = picker_suppress.clone();
+    let sat_core = picker_sat_adj.clone();
+    picker_s_disp_adj.connect_value_changed(move |adj| {
+        if ps_sd.get() {
+            return;
+        }
+        sat_core.set_value((adj.value() / 100.0).clamp(0.0, 1.0));
+    });
+    let ps_vd = picker_suppress.clone();
+    let val_core = picker_val_adj.clone();
+    picker_v_disp_adj.connect_value_changed(move |adj| {
+        if ps_vd.get() {
+            return;
+        }
+        val_core.set_value((adj.value() / 100.0).clamp(0.0, 1.0));
+    });
 
     let st_hue = state.clone();
     let sv_hue = sv_da.clone();
     let fg_hue = fg_bg_da.clone();
     let cv_hue = canvas_cell.clone();
     let sup_hue = hue_suppress.clone();
+    let ps_hue = picker_suppress.clone();
+    let hue_adj_h = picker_hue_adj.clone();
+    let sat_h = picker_sat_adj.clone();
+    let val_h = picker_val_adj.clone();
+    let rh = picker_r_adj.clone();
+    let gh = picker_g_adj.clone();
+    let bh = picker_b_adj.clone();
+    let ah = picker_a_adj.clone();
+    let sd_h = picker_s_disp_adj.clone();
+    let vd_h = picker_v_disp_adj.clone();
+    let tr_h = picker_tracks.clone();
+    let hex_h = hex_entry.clone();
     picker_hue_adj.connect_value_changed(move |adj| {
         if sup_hue.get() {
             return;
@@ -3482,47 +3957,500 @@ fn build_ui(app: &Application) {
         let mut g = st_hue.borrow_mut();
         g.picker_hue = adj.value() / 360.0;
         let slot = g.picker_target;
-        let c = match slot {
-            ColorSlot::Left => g.fg,
-            ColorSlot::Right => g.bg,
-        };
-        let (_, s, v) = rgb_bytes_to_hsv(c);
+        let s = sat_h.value().clamp(0.0, 1.0);
+        let v = val_h.value().clamp(0.0, 1.0);
         let rgb = hsv_to_rgb01(g.picker_hue, s, v);
-        write_slot_rgb(&mut g, slot, rgb);
+        let a = ah.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(&mut g, slot, rgb, a);
         drop(g);
-        sv_hue.queue_draw();
+        sync_picker_from_target_color(
+            &st_hue,
+            sup_hue.as_ref(),
+            ps_hue.as_ref(),
+            &hue_adj_h,
+            &sat_h,
+            &val_h,
+            &rh,
+            &gh,
+            &bh,
+            &ah,
+            &sd_h,
+            &vd_h,
+            &hex_h,
+            &tr_h,
+            &sv_hue,
+        );
         fg_hue.queue_draw();
         queue_canvas(&cv_hue);
     });
 
+    let st_s = state.clone();
+    let ps_s = picker_suppress.clone();
+    let sup_s = hue_suppress.clone();
+    let sv_s = sv_da.clone();
+    let fg_s = fg_bg_da.clone();
+    let cv_s = canvas_cell.clone();
+    let sat_a = picker_sat_adj.clone();
+    let val_a = picker_val_adj.clone();
+    let hue_a = picker_hue_adj.clone();
+    let r_s = picker_r_adj.clone();
+    let g_s = picker_g_adj.clone();
+    let b_s = picker_b_adj.clone();
+    let a_s = picker_a_adj.clone();
+    let sd_s = picker_s_disp_adj.clone();
+    let vd_s = picker_v_disp_adj.clone();
+    let tr_s = picker_tracks.clone();
+    let hex_s = hex_entry.clone();
+    picker_sat_adj.connect_value_changed(move |adj| {
+        if ps_s.get() {
+            return;
+        }
+        let mut g = st_s.borrow_mut();
+        let h = g.picker_hue;
+        let slot = g.picker_target;
+        let s = adj.value().clamp(0.0, 1.0);
+        let v = val_a.value().clamp(0.0, 1.0);
+        let rgb = hsv_to_rgb01(h, s, v);
+        let a = a_s.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(&mut g, slot, rgb, a);
+        drop(g);
+        sync_picker_from_target_color(
+            &st_s,
+            sup_s.as_ref(),
+            ps_s.as_ref(),
+            &hue_a,
+            &sat_a,
+            &val_a,
+            &r_s,
+            &g_s,
+            &b_s,
+            &a_s,
+            &sd_s,
+            &vd_s,
+            &hex_s,
+            &tr_s,
+            &sv_s,
+        );
+        fg_s.queue_draw();
+        queue_canvas(&cv_s);
+    });
+
+    let st_v = state.clone();
+    let ps_v = picker_suppress.clone();
+    let sup_v = hue_suppress.clone();
+    let sv_v = sv_da.clone();
+    let fg_v = fg_bg_da.clone();
+    let cv_v = canvas_cell.clone();
+    let sat_av = picker_sat_adj.clone();
+    let val_av = picker_val_adj.clone();
+    let hue_av = picker_hue_adj.clone();
+    let r_v = picker_r_adj.clone();
+    let g_v = picker_g_adj.clone();
+    let b_v = picker_b_adj.clone();
+    let a_v = picker_a_adj.clone();
+    let sd_v = picker_s_disp_adj.clone();
+    let vd_v = picker_v_disp_adj.clone();
+    let tr_v = picker_tracks.clone();
+    let hex_v = hex_entry.clone();
+    picker_val_adj.connect_value_changed(move |adj| {
+        if ps_v.get() {
+            return;
+        }
+        let mut g = st_v.borrow_mut();
+        let h = g.picker_hue;
+        let slot = g.picker_target;
+        let s = sat_av.value().clamp(0.0, 1.0);
+        let v = adj.value().clamp(0.0, 1.0);
+        let rgb = hsv_to_rgb01(h, s, v);
+        let a = a_v.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(&mut g, slot, rgb, a);
+        drop(g);
+        sync_picker_from_target_color(
+            &st_v,
+            sup_v.as_ref(),
+            ps_v.as_ref(),
+            &hue_av,
+            &sat_av,
+            &val_av,
+            &r_v,
+            &g_v,
+            &b_v,
+            &a_v,
+            &sd_v,
+            &vd_v,
+            &hex_v,
+            &tr_v,
+            &sv_v,
+        );
+        fg_v.queue_draw();
+        queue_canvas(&cv_v);
+    });
+
+    let st_r = state.clone();
+    let ps_r = picker_suppress.clone();
+    let sup_r = hue_suppress.clone();
+    let sv_r = sv_da.clone();
+    let fg_r = fg_bg_da.clone();
+    let cv_r = canvas_cell.clone();
+    let r_ar = picker_r_adj.clone();
+    let g_ar = picker_g_adj.clone();
+    let b_ar = picker_b_adj.clone();
+    let sat_ar = picker_sat_adj.clone();
+    let val_ar = picker_val_adj.clone();
+    let hue_ar = picker_hue_adj.clone();
+    let a_r = picker_a_adj.clone();
+    let sd_r = picker_s_disp_adj.clone();
+    let vd_r = picker_v_disp_adj.clone();
+    let tr_r = picker_tracks.clone();
+    let hex_r = hex_entry.clone();
+    picker_r_adj.connect_value_changed(move |adj| {
+        if ps_r.get() {
+            return;
+        }
+        let mut g = st_r.borrow_mut();
+        let slot = g.picker_target;
+        let r = adj.value().round().clamp(0.0, 255.0) as u8;
+        let gg = g_ar.value().round().clamp(0.0, 255.0) as u8;
+        let bb = b_ar.value().round().clamp(0.0, 255.0) as u8;
+        let aa = a_r.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (r as f64 / 255.0, gg as f64 / 255.0, bb as f64 / 255.0),
+            aa,
+        );
+        drop(g);
+        sync_picker_from_target_color(
+            &st_r,
+            sup_r.as_ref(),
+            ps_r.as_ref(),
+            &hue_ar,
+            &sat_ar,
+            &val_ar,
+            &r_ar,
+            &g_ar,
+            &b_ar,
+            &a_r,
+            &sd_r,
+            &vd_r,
+            &hex_r,
+            &tr_r,
+            &sv_r,
+        );
+        fg_r.queue_draw();
+        queue_canvas(&cv_r);
+    });
+
+    let st_g = state.clone();
+    let ps_g = picker_suppress.clone();
+    let sup_g = hue_suppress.clone();
+    let sv_gm = sv_da.clone();
+    let fg_g = fg_bg_da.clone();
+    let cv_g = canvas_cell.clone();
+    let r_ag = picker_r_adj.clone();
+    let g_ag = picker_g_adj.clone();
+    let b_ag = picker_b_adj.clone();
+    let sat_ag = picker_sat_adj.clone();
+    let val_ag = picker_val_adj.clone();
+    let hue_ag = picker_hue_adj.clone();
+    let a_g = picker_a_adj.clone();
+    let sd_g = picker_s_disp_adj.clone();
+    let vd_g = picker_v_disp_adj.clone();
+    let tr_g = picker_tracks.clone();
+    let hex_g = hex_entry.clone();
+    picker_g_adj.connect_value_changed(move |adj| {
+        if ps_g.get() {
+            return;
+        }
+        let mut g = st_g.borrow_mut();
+        let slot = g.picker_target;
+        let r = r_ag.value().round().clamp(0.0, 255.0) as u8;
+        let gg = adj.value().round().clamp(0.0, 255.0) as u8;
+        let bb = b_ag.value().round().clamp(0.0, 255.0) as u8;
+        let aa = a_g.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (r as f64 / 255.0, gg as f64 / 255.0, bb as f64 / 255.0),
+            aa,
+        );
+        drop(g);
+        sync_picker_from_target_color(
+            &st_g,
+            sup_g.as_ref(),
+            ps_g.as_ref(),
+            &hue_ag,
+            &sat_ag,
+            &val_ag,
+            &r_ag,
+            &g_ag,
+            &b_ag,
+            &a_g,
+            &sd_g,
+            &vd_g,
+            &hex_g,
+            &tr_g,
+            &sv_gm,
+        );
+        fg_g.queue_draw();
+        queue_canvas(&cv_g);
+    });
+
+    let st_b = state.clone();
+    let ps_b = picker_suppress.clone();
+    let sup_b = hue_suppress.clone();
+    let sv_b = sv_da.clone();
+    let fg_b = fg_bg_da.clone();
+    let cv_b = canvas_cell.clone();
+    let r_ab = picker_r_adj.clone();
+    let g_ab = picker_g_adj.clone();
+    let b_ab = picker_b_adj.clone();
+    let sat_ab = picker_sat_adj.clone();
+    let val_ab = picker_val_adj.clone();
+    let hue_ab = picker_hue_adj.clone();
+    let a_b = picker_a_adj.clone();
+    let sd_b = picker_s_disp_adj.clone();
+    let vd_b = picker_v_disp_adj.clone();
+    let tr_b = picker_tracks.clone();
+    let hex_b = hex_entry.clone();
+    picker_b_adj.connect_value_changed(move |adj| {
+        if ps_b.get() {
+            return;
+        }
+        let mut g = st_b.borrow_mut();
+        let slot = g.picker_target;
+        let r = r_ab.value().round().clamp(0.0, 255.0) as u8;
+        let gg = g_ab.value().round().clamp(0.0, 255.0) as u8;
+        let bb = adj.value().round().clamp(0.0, 255.0) as u8;
+        let aa = a_b.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (r as f64 / 255.0, gg as f64 / 255.0, bb as f64 / 255.0),
+            aa,
+        );
+        drop(g);
+        sync_picker_from_target_color(
+            &st_b,
+            sup_b.as_ref(),
+            ps_b.as_ref(),
+            &hue_ab,
+            &sat_ab,
+            &val_ab,
+            &r_ab,
+            &g_ab,
+            &b_ab,
+            &a_b,
+            &sd_b,
+            &vd_b,
+            &hex_b,
+            &tr_b,
+            &sv_b,
+        );
+        fg_b.queue_draw();
+        queue_canvas(&cv_b);
+    });
+
+    let st_alph = state.clone();
+    let ps_alph = picker_suppress.clone();
+    let sup_alph = hue_suppress.clone();
+    let sv_alph = sv_da.clone();
+    let fg_alph = fg_bg_da.clone();
+    let cv_alph = canvas_cell.clone();
+    let hue_alph = picker_hue_adj.clone();
+    let sat_alph = picker_sat_adj.clone();
+    let val_alph = picker_val_adj.clone();
+    let r_alph = picker_r_adj.clone();
+    let g_alph = picker_g_adj.clone();
+    let b_alph = picker_b_adj.clone();
+    let a_alph = picker_a_adj.clone();
+    let sd_alph = picker_s_disp_adj.clone();
+    let vd_alph = picker_v_disp_adj.clone();
+    let tr_alph = picker_tracks.clone();
+    let hex_alph = hex_entry.clone();
+    picker_a_adj.connect_value_changed(move |adj| {
+        if ps_alph.get() {
+            return;
+        }
+        let mut g = st_alph.borrow_mut();
+        let slot = g.picker_target;
+        let (r0, g0, b0) = match slot {
+            ColorSlot::Left => (g.fg[0], g.fg[1], g.fg[2]),
+            ColorSlot::Right => (g.bg[0], g.bg[1], g.bg[2]),
+        };
+        let rgb = (
+            r0 as f64 / 255.0,
+            g0 as f64 / 255.0,
+            b0 as f64 / 255.0,
+        );
+        let aa = adj.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(&mut g, slot, rgb, aa);
+        drop(g);
+        sync_picker_from_target_color(
+            &st_alph,
+            sup_alph.as_ref(),
+            ps_alph.as_ref(),
+            &hue_alph,
+            &sat_alph,
+            &val_alph,
+            &r_alph,
+            &g_alph,
+            &b_alph,
+            &a_alph,
+            &sd_alph,
+            &vd_alph,
+            &hex_alph,
+            &tr_alph,
+            &sv_alph,
+        );
+        fg_alph.queue_draw();
+        queue_canvas(&cv_alph);
+    });
+
+    let st_hex = state.clone();
+    let sup_hex = hue_suppress.clone();
+    let ps_hex = picker_suppress.clone();
+    let sv_hex = sv_da.clone();
+    let fg_hex = fg_bg_da.clone();
+    let cv_hex = canvas_cell.clone();
+    let ha = picker_hue_adj.clone();
+    let sa = picker_sat_adj.clone();
+    let va = picker_val_adj.clone();
+    let ra = picker_r_adj.clone();
+    let ga = picker_g_adj.clone();
+    let ba = picker_b_adj.clone();
+    let aa_hex = picker_a_adj.clone();
+    let sd_hex = picker_s_disp_adj.clone();
+    let vd_hex = picker_v_disp_adj.clone();
+    let tr_hex = picker_tracks.clone();
+    let hex_e = hex_entry.clone();
+    hex_entry.connect_activate(move |e| {
+        let t = e.text().to_string();
+        let trimmed = t.trim();
+        let Some(mut rgba) = palette::parse_hex_color_input(trimmed) else {
+            return;
+        };
+        let hex_digits: String = trimmed
+            .trim_start_matches('#')
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        let use_parsed_alpha = hex_digits.len() == 8;
+        let mut g = st_hex.borrow_mut();
+        let slot = g.picker_target;
+        if !use_parsed_alpha {
+            rgba[3] = aa_hex.value().round().clamp(0.0, 255.0) as u8;
+        }
+        match slot {
+            ColorSlot::Left => {
+                g.fg = rgba;
+                push_recent_color(&mut g, rgba);
+            }
+            ColorSlot::Right => g.bg = rgba,
+        }
+        let (h, _, _) = rgb_bytes_to_hsv(rgba);
+        g.picker_hue = h.rem_euclid(1.0);
+        drop(g);
+        sync_picker_from_target_color(
+            &st_hex,
+            sup_hex.as_ref(),
+            ps_hex.as_ref(),
+            &ha,
+            &sa,
+            &va,
+            &ra,
+            &ga,
+            &ba,
+            &aa_hex,
+            &sd_hex,
+            &vd_hex,
+            &hex_e,
+            &tr_hex,
+            &sv_hex,
+        );
+        fg_hex.queue_draw();
+        queue_canvas(&cv_hex);
+    });
+
+    let st_ref = state.clone();
+    let sup_ref = hue_suppress.clone();
+    let ps_ref = picker_suppress.clone();
+    let ha_ref = picker_hue_adj.clone();
+    let sa_ref = picker_sat_adj.clone();
+    let va_ref = picker_val_adj.clone();
+    let ra_ref = picker_r_adj.clone();
+    let ga_ref = picker_g_adj.clone();
+    let ba_ref = picker_b_adj.clone();
+    let aa_ref = picker_a_adj.clone();
+    let sd_ref = picker_s_disp_adj.clone();
+    let vd_ref = picker_v_disp_adj.clone();
+    let tr_ref = picker_tracks.clone();
+    let hex_ref = hex_entry.clone();
+    let sv_ref = sv_da.clone();
+    *picker_ui_refresh.borrow_mut() = Some(Rc::new(move || {
+        sync_picker_from_target_color(
+            &st_ref,
+            sup_ref.as_ref(),
+            ps_ref.as_ref(),
+            &ha_ref,
+            &sa_ref,
+            &va_ref,
+            &ra_ref,
+            &ga_ref,
+            &ba_ref,
+            &aa_ref,
+            &sd_ref,
+            &vd_ref,
+            &hex_ref,
+            &tr_ref,
+            &sv_ref,
+        );
+    }));
+    picker_refresh_call(&picker_ui_refresh);
+
     let sv_painting = Rc::new(Cell::new(false));
     let sv_g = gtk::GestureClick::new();
+    sv_g.set_button(0);
     let sv_paint_on = sv_painting.clone();
     let st_press = state.clone();
     let sv_press = sv_da.clone();
     let fg_press = fg_bg_da.clone();
     let cv_press = canvas_cell.clone();
-    sv_g.connect_pressed(move |_, _, x, y| {
+    let pr_press = picker_ui_refresh.clone();
+    sv_g.connect_pressed(move |gesture, _, x, y| {
         sv_paint_on.set(true);
-        apply_sv_pick(&st_press, &sv_press, &fg_press, &cv_press, x, y);
+        {
+            let mut g = st_press.borrow_mut();
+            g.picker_target = picker_target_for_gesture_button(gesture.current_button());
+        }
+        apply_sv_pick(
+            &st_press,
+            &sv_press,
+            &fg_press,
+            &cv_press,
+            &pr_press,
+            x,
+            y,
+        );
     });
     let sv_paint_m = sv_painting.clone();
     let st_m = state.clone();
     let sv_m = sv_da.clone();
     let fg_m = fg_bg_da.clone();
     let cv_m = canvas_cell.clone();
+    let pr_m = picker_ui_refresh.clone();
     let sv_motion = gtk::EventControllerMotion::new();
     sv_motion.connect_motion(move |ec, x, y| {
         if !sv_paint_m.get() {
             return;
         }
-        if !ec
-            .current_event_state()
-            .contains(gdk::ModifierType::BUTTON1_MASK)
+        let buttons = ec.current_event_state();
+        if !buttons.contains(gdk::ModifierType::BUTTON1_MASK)
+            && !buttons.contains(gdk::ModifierType::BUTTON3_MASK)
         {
             return;
         }
-        apply_sv_pick(&st_m, &sv_m, &fg_m, &cv_m, x, y);
+        apply_sv_pick(&st_m, &sv_m, &fg_m, &cv_m, &pr_m, x, y);
     });
     let sv_paint_off = sv_painting.clone();
     sv_g.connect_released(move |_, _, _, _| {
@@ -3531,13 +4459,6 @@ fn build_ui(app: &Application) {
     sv_da.add_controller(sv_g);
     sv_da.add_controller(sv_motion);
 
-    setup_canvas_input(
-        &drawing_area,
-        &state,
-        &canvas_cell,
-        &color_preview_da_cell,
-        &recent_colors_flow,
-    );
     tool_cursors::sync_canvas_tool_cursor(&drawing_area, state.borrow().tool);
 
     let layers_list = gtk::ListBox::builder()
@@ -3828,14 +4749,15 @@ fn build_ui(app: &Application) {
         .build();
     color_sidebar.append(&palette_scroll);
 
-    let hue_lbl = gtk::Label::new(Some("Hue"));
-    hue_lbl.add_css_class("dim-label");
-    hue_lbl.set_halign(gtk::Align::Start);
-    color_sidebar.append(&hue_lbl);
-    let hue_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&picker_hue_adj));
-    hue_scale.set_draw_value(false);
-    hue_scale.set_hexpand(true);
-    color_sidebar.append(&hue_scale);
+    color_sidebar.append(&mode_row);
+    color_sidebar.append(&hsv_panel);
+    color_sidebar.append(&rgb_panel);
+    color_sidebar.append(&alpha_panel);
+    let hex_lbl = gtk::Label::new(Some("Hex"));
+    hex_lbl.add_css_class("dim-label");
+    hex_lbl.set_halign(gtk::Align::Start);
+    color_sidebar.append(&hex_lbl);
+    color_sidebar.append(&hex_entry);
     color_sidebar.append(&sv_da);
 
     let palette_sidebar = PaletteSidebar {
@@ -3845,9 +4767,8 @@ fn build_ui(app: &Application) {
         preview: fg_bg_da.clone(),
         recent: recent_colors_flow.clone(),
         canvas: canvas_cell.clone(),
-        hue_suppress: hue_suppress.clone(),
-        hue_adj: picker_hue_adj.clone(),
         sv_area: sv_da.clone(),
+        picker_refresh: picker_ui_refresh.clone(),
     };
     refresh_palette_sidebar_full(&palette_sidebar, &state);
 
@@ -3884,6 +4805,16 @@ fn build_ui(app: &Application) {
         &state,
         &fg_bg_da,
         &canvas_cell,
+        &picker_ui_refresh,
+    );
+
+    setup_canvas_input(
+        &drawing_area,
+        &state,
+        &canvas_cell,
+        &color_preview_da_cell,
+        &recent_colors_flow,
+        &picker_ui_refresh,
     );
 
     let editor = gtk::Box::builder()

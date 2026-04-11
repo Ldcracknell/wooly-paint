@@ -1,4 +1,4 @@
-//! Named color palettes, hex import/export (Lospec-style `#RRGGBB` lines), and persistence helpers.
+//! Named color palettes, hex import/export (Lospec / Pico-8 style: `#RRGGBB` or plain `RRGGBB` lines), and persistence helpers.
 
 use serde::{Deserialize, Serialize};
 
@@ -160,71 +160,90 @@ fn rgb12_to_rgb24(r: u8, g: u8, b: u8) -> [u8; 3] {
     [r << 4 | r, g << 4 | g, b << 4 | b]
 }
 
-/// Parse one `#`-prefixed run starting at `bytes[i] == b'#'`. Returns `(RGBA, index after token)`.
-fn parse_hash_token(bytes: &[u8], start: usize) -> Option<([u8; 4], usize)> {
-    if bytes.get(start) != Some(&b'#') {
+/// Parse `RGB`, `RGBA`, `RRGGBB`, or `RRGGBBAA` from a byte slice of ASCII hex digits (no `#`).
+fn parse_hex_color_digits(slice: &[u8]) -> Option<[u8; 4]> {
+    if !slice.iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut j = start + 1;
-    while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
-        j += 1;
-    }
-    let len = j - (start + 1);
-    let slice = &bytes[start + 1..j];
-    let rgba = match len {
-        3 if slice.len() == 3 => {
+    let len = slice.len();
+    match len {
+        3 => {
             let r = hex_value(slice[0])?;
             let g = hex_value(slice[1])?;
             let b = hex_value(slice[2])?;
             let [r, g, b] = rgb12_to_rgb24(r, g, b);
-            [r, g, b, 255]
+            Some([r, g, b, 255])
         }
-        4 if slice.len() == 4 => {
+        4 => {
             let r = hex_value(slice[0])?;
             let g = hex_value(slice[1])?;
             let b = hex_value(slice[2])?;
             let a = hex_value(slice[3])?;
             let [r, g, b] = rgb12_to_rgb24(r, g, b);
-            [r, g, b, a << 4 | a]
+            Some([r, g, b, a << 4 | a])
         }
-        6 if slice.len() == 6 => {
-            [
-                parse_hex_nibble_pair(slice[0], slice[1])?,
-                parse_hex_nibble_pair(slice[2], slice[3])?,
-                parse_hex_nibble_pair(slice[4], slice[5])?,
-                255,
-            ]
+        6 => Some([
+            parse_hex_nibble_pair(slice[0], slice[1])?,
+            parse_hex_nibble_pair(slice[2], slice[3])?,
+            parse_hex_nibble_pair(slice[4], slice[5])?,
+            255,
+        ]),
+        8 => Some([
+            parse_hex_nibble_pair(slice[0], slice[1])?,
+            parse_hex_nibble_pair(slice[2], slice[3])?,
+            parse_hex_nibble_pair(slice[4], slice[5])?,
+            parse_hex_nibble_pair(slice[6], slice[7])?,
+        ]),
+        _ => None,
+    }
+}
+
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = s.split_first() {
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
         }
-        8 if slice.len() == 8 => {
-            [
-                parse_hex_nibble_pair(slice[0], slice[1])?,
-                parse_hex_nibble_pair(slice[2], slice[3])?,
-                parse_hex_nibble_pair(slice[4], slice[5])?,
-                parse_hex_nibble_pair(slice[6], slice[7])?,
-            ]
+    }
+    while let Some((&last, rest)) = s.split_last() {
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
         }
-        _ => return None,
-    };
-    Some((rgba, j))
+    }
+    s
+}
+
+/// One token: optional `#` prefix, then 3/4/6/8 hex digits.
+fn color_from_token(mut token: &[u8]) -> Option<[u8; 4]> {
+    token = trim_ascii(token);
+    if token.first() == Some(&b'#') {
+        token = &token[1..];
+    }
+    token = trim_ascii(token);
+    if token.is_empty() {
+        return None;
+    }
+    parse_hex_color_digits(token)
 }
 
 fn colors_from_line(line: &[u8]) -> Vec<[u8; 4]> {
     let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < line.len() {
-        if line[i] == b'#' {
-            if let Some((rgba, next)) = parse_hash_token(line, i) {
-                out.push(rgba);
-                i = next;
-                continue;
-            }
+    for raw in line.split(|b| *b == b',' || b.is_ascii_whitespace()) {
+        let raw = trim_ascii(raw);
+        if raw.is_empty() {
+            continue;
         }
-        i += 1;
+        if let Some(rgba) = color_from_token(raw) {
+            out.push(rgba);
+        }
     }
     out
 }
 
-/// Parse Lospec-style hex text: lines of `#RRGGBB`, optional `#RRGGBBAA`, `#RGB`, comments, or multiple tokens per line.
+/// Parse hex palette text: lines of `#RRGGBB` or plain `RRGGBB` (Pico-8 export), optional `#RRGGBBAA` / `RRGGBBAA`, `#RGB`, `;` comments, comma/whitespace-separated tokens.
 pub fn parse_hex_palette_text(text: &str) -> Result<Vec<[u8; 4]>, String> {
     let mut colors = Vec::new();
     for raw in text.lines() {
@@ -246,10 +265,19 @@ pub fn parse_hex_palette_text(text: &str) -> Result<Vec<[u8; 4]>, String> {
         }
     }
     if colors.is_empty() {
-        Err("No hex colors found (expected lines like #RRGGBB)".to_string())
+        Err("No hex colors found (expected lines like #RRGGBB or RRGGBB)".to_string())
     } else {
         Ok(colors)
     }
+}
+
+/// Parse a single color from a text field (optional `#`, one token; ignores extra whitespace).
+pub fn parse_hex_color_input(text: &str) -> Option<[u8; 4]> {
+    let line = text.trim();
+    if line.is_empty() {
+        return None;
+    }
+    colors_from_line(line.as_bytes()).into_iter().next()
 }
 
 /// Export as Lospec-friendly hex: one `#RRGGBB` per line. Uses opaque alpha only; otherwise `#RRGGBBAA`.
@@ -282,6 +310,16 @@ mod tests {
     }
 
     #[test]
+    fn pico8_bare_hex_lines() {
+        let text = "000000\n1D2B53\n7E2553\n";
+        let v = parse_hex_palette_text(text).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], [0, 0, 0, 255]);
+        assert_eq!(v[1], [0x1d, 0x2b, 0x53, 255]);
+        assert_eq!(v[2], [0x7e, 0x25, 0x53, 255]);
+    }
+
+    #[test]
     fn rgb_short_form() {
         let v = parse_hex_palette_text("#f0a\n").unwrap();
         assert_eq!(v[0], [0xff, 0x00, 0xaa, 255]);
@@ -291,5 +329,14 @@ mod tests {
     fn with_alpha() {
         let v = parse_hex_palette_text("#10203040\n").unwrap();
         assert_eq!(v[0], [0x10, 0x20, 0x30, 0x40]);
+    }
+
+    #[test]
+    fn single_hex_input_no_hash() {
+        assert_eq!(
+            parse_hex_color_input("FF004D"),
+            Some([255, 0, 77, 255])
+        );
+        assert_eq!(parse_hex_color_input("  #abc "), Some([0xaa, 0xbb, 0xcc, 255]));
     }
 }
