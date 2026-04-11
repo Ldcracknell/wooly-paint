@@ -2,7 +2,7 @@ use crate::document::{
     composite_layers_into, premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul,
     Document,
 };
-use crate::state::{AppState, FloatingSelection};
+use crate::state::{AppState, FloatingDrag, FloatingSelection};
 use crate::tools::{
     clear_rect, copy_rect, draw_ellipse, draw_rect_outline, ellipse_outline_segment_count,
     flood_fill, paste_rect, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
@@ -36,16 +36,10 @@ type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
 type ColorPreviewDaCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type ToolDdCell = Rc<RefCell<Option<gtk::DropDown>>>;
-type FloatingPanelCell = Rc<RefCell<Option<FloatingPanel>>>;
-
-/// Sidebar controls for the floating clipboard / pasted image (scale, rotate, flip).
-struct FloatingPanel {
-    revealer: gtk::Revealer,
-    suppress: Rc<RefCell<bool>>,
-    scale_w_adj: gtk::Adjustment,
-    scale_h_adj: gtk::Adjustment,
-    rot_adj: gtk::Adjustment,
-}
+/// Screen-space size for floating handles (corners / edges / rotate knob), in pixels.
+const FLOAT_HANDLE_PX: f64 = 7.0;
+/// Rotation handle sits this many pixels beyond the top edge (document space; scaled by zoom in hit test via radius).
+const FLOAT_ROT_OFFSET_DOC: f64 = 22.0;
 
 fn floating_image_to_doc_matrix(f: &FloatingSelection) -> gtk::cairo::Matrix {
     let fw = f.w.max(1) as f64;
@@ -80,6 +74,265 @@ fn doc_point_in_floating(doc_x: f64, doc_y: f64, f: &FloatingSelection) -> bool 
     };
     let (lx, ly) = inv.transform_point(doc_x, doc_y);
     lx >= -1e-3 && ly >= -1e-3 && lx <= f.w as f64 + 1e-3 && ly <= f.h as f64 + 1e-3
+}
+
+fn flip_scale_signs(f: &FloatingSelection) -> (f64, f64) {
+    (
+        if f.flip_h { -1.0 } else { 1.0 },
+        if f.flip_v { -1.0 } else { 1.0 },
+    )
+}
+
+fn floating_transform_center(f: &FloatingSelection) -> (f64, f64) {
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    (f.x + fw * 0.5, f.y + fh * 0.5)
+}
+
+fn corner_local(i: u8, w: f64, h: f64) -> (f64, f64) {
+    match i % 4 {
+        0 => (0.0, 0.0),
+        1 => (w, 0.0),
+        2 => (w, h),
+        _ => (0.0, h),
+    }
+}
+
+/// Opposite edge's midpoint (local) used as fixed anchor when dragging edge `e`.
+fn edge_anchor_local_for_resize(edge: u8, fw: f64, fh: f64) -> (f64, f64) {
+    match edge % 4 {
+        0 => (fw * 0.5, fh),
+        1 => (0.0, fh * 0.5),
+        2 => (fw * 0.5, 0.0),
+        _ => (fw, fh * 0.5),
+    }
+}
+
+fn rot_dist(angle_deg: f64, vx: f64, vy: f64) -> (f64, f64) {
+    let mut mm = gtk::cairo::Matrix::identity();
+    mm.rotate(angle_deg.to_radians());
+    mm.transform_distance(vx, vy)
+}
+
+fn rot_dist_inv(angle_deg: f64, vx: f64, vy: f64) -> (f64, f64) {
+    let mut mm = gtk::cairo::Matrix::identity();
+    mm.rotate(-angle_deg.to_radians());
+    mm.transform_distance(vx, vy)
+}
+
+fn dist_point(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn dist_seg(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (px, py) = p;
+    let (ax, ay) = a;
+    let (bx, by) = b;
+    let abx = bx - ax;
+    let aby = by - ay;
+    let apx = px - ax;
+    let apy = py - ay;
+    let ab2 = abx * abx + aby * aby;
+    if ab2 < 1e-18 {
+        return dist_point(p, a);
+    }
+    let t = ((apx * abx + apy * aby) / ab2).clamp(0.0, 1.0);
+    let qx = ax + t * abx;
+    let qy = ay + t * aby;
+    dist_point(p, (qx, qy))
+}
+
+fn floating_handle_radius_doc(zoom: f64) -> f64 {
+    (FLOAT_HANDLE_PX / zoom.max(0.001)).max(1.0)
+}
+
+fn floating_rotate_handle_doc(f: &FloatingSelection) -> (f64, f64) {
+    let m = floating_image_to_doc_matrix(f);
+    let fw = f.w.max(1) as f64;
+    let top_mid = m.transform_point(fw * 0.5, 0.0);
+    let c = floating_transform_center(f);
+    let vx = top_mid.0 - c.0;
+    let vy = top_mid.1 - c.1;
+    let len = (vx * vx + vy * vy).sqrt();
+    if len < 1e-6 {
+        return (top_mid.0, top_mid.1 - FLOAT_ROT_OFFSET_DOC);
+    }
+    let ux = vx / len;
+    let uy = vy / len;
+    (
+        top_mid.0 + ux * FLOAT_ROT_OFFSET_DOC,
+        top_mid.1 + uy * FLOAT_ROT_OFFSET_DOC,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatPress {
+    Outside,
+    Rotate,
+    Corner(u8),
+    Edge(u8),
+    Body,
+}
+
+fn float_press_at(doc_x: f64, doc_y: f64, zoom: f64, f: &FloatingSelection) -> FloatPress {
+    let r = floating_handle_radius_doc(zoom);
+    let hr = floating_rotate_handle_doc(f);
+    if dist_point((doc_x, doc_y), hr) <= r * 1.45 {
+        return FloatPress::Rotate;
+    }
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    let m = floating_image_to_doc_matrix(f);
+    for i in 0u8..4u8 {
+        let (lx, ly) = corner_local(i, fw, fh);
+        let p = m.transform_point(lx, ly);
+        if dist_point((doc_x, doc_y), p) <= r {
+            return FloatPress::Corner(i);
+        }
+    }
+    for e in 0u8..4u8 {
+        let (ax, ay) = corner_local(e, fw, fh);
+        let (bx, by) = corner_local((e + 1) % 4, fw, fh);
+        let pa = m.transform_point(ax, ay);
+        let pb = m.transform_point(bx, by);
+        if dist_seg((doc_x, doc_y), pa, pb) <= r {
+            return FloatPress::Edge(e);
+        }
+    }
+    if doc_point_in_floating(doc_x, doc_y, f) {
+        FloatPress::Body
+    } else {
+        FloatPress::Outside
+    }
+}
+
+fn apply_floating_resize_corner(
+    f: &mut FloatingSelection,
+    dragged_corner: u8,
+    anchor_doc: (f64, f64),
+    p_doc: (f64, f64),
+) {
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    let opp = (dragged_corner + 2) % 4;
+    let (ax, ay) = corner_local(opp, fw, fh);
+    let (dx, dy) = corner_local(dragged_corner, fw, fh);
+    let ux_a = ax - fw * 0.5;
+    let uy_a = ay - fh * 0.5;
+    let ux_d = dx - fw * 0.5;
+    let uy_d = dy - fh * 0.5;
+    let dux = ux_d - ux_a;
+    let duy = uy_d - uy_a;
+    let (fh_s, fv_s) = flip_scale_signs(f);
+    let vx = p_doc.0 - anchor_doc.0;
+    let vy = p_doc.1 - anchor_doc.1;
+    let (wx, wy) = rot_dist_inv(f.angle_deg, vx, vy);
+    let eps = 1e-6;
+    let mut sx = f.scale_x;
+    let mut sy = f.scale_y;
+    if dux.abs() > eps {
+        sx = (wx / (fh_s * dux)).clamp(0.02, 100.0);
+    }
+    if duy.abs() > eps {
+        sy = (wy / (fv_s * duy)).clamp(0.02, 100.0);
+    }
+    let sxu_x = sx * fh_s * ux_a;
+    let sxu_y = sy * fv_s * uy_a;
+    let (rx, ry) = rot_dist(f.angle_deg, sxu_x, sxu_y);
+    let cx = anchor_doc.0 - rx;
+    let cy = anchor_doc.1 - ry;
+    f.x = cx - fw * 0.5;
+    f.y = cy - fh * 0.5;
+    f.scale_x = sx;
+    f.scale_y = sy;
+}
+
+fn apply_floating_resize_edge(
+    f: &mut FloatingSelection,
+    edge: u8,
+    anchor_doc: (f64, f64),
+    p_doc: (f64, f64),
+) {
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    let (fh_s, fv_s) = flip_scale_signs(f);
+    let vx = p_doc.0 - anchor_doc.0;
+    let vy = p_doc.1 - anchor_doc.1;
+    let (wx, wy) = rot_dist_inv(f.angle_deg, vx, vy);
+    let eps = 1e-6;
+    let mut sx = f.scale_x;
+    let mut sy = f.scale_y;
+    let (ux_a, uy_a) = match edge % 4 {
+        0 => (0.0, fh * 0.5),
+        1 => (-fw * 0.5, 0.0),
+        2 => (0.0, -fh * 0.5),
+        _ => (fw * 0.5, 0.0),
+    };
+    match edge % 4 {
+        0 => {
+            sy = (-wy / (fv_s * fh)).clamp(0.02, 100.0);
+        }
+        1 => {
+            if fw.abs() > eps {
+                sx = (wx / (fh_s * fw)).clamp(0.02, 100.0);
+            }
+        }
+        2 => {
+            sy = (wy / (fv_s * fh)).clamp(0.02, 100.0);
+        }
+        _ => {
+            if fw.abs() > eps {
+                sx = (wx / (fh_s * (-fw))).clamp(0.02, 100.0);
+            }
+        }
+    }
+    let sxu_x = sx * fh_s * ux_a;
+    let sxu_y = sy * fv_s * uy_a;
+    let (rx, ry) = rot_dist(f.angle_deg, sxu_x, sxu_y);
+    let cx = anchor_doc.0 - rx;
+    let cy = anchor_doc.1 - ry;
+    f.x = cx - fw * 0.5;
+    f.y = cy - fh * 0.5;
+    f.scale_x = sx;
+    f.scale_y = sy;
+}
+
+fn draw_floating_handles(cr: &gtk::cairo::Context, zoom: f64, f: &FloatingSelection) {
+    let fw = f.w.max(1) as f64;
+    let fh = f.h.max(1) as f64;
+    let m = floating_image_to_doc_matrix(f);
+    let hs = (4.5_f64 / zoom.max(0.001)).max(1.5);
+    let draw_sq = |cr: &gtk::cairo::Context, cx: f64, cy: f64| {
+        cr.rectangle(cx - hs, cy - hs, hs * 2.0, hs * 2.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        cr.fill_preserve().unwrap();
+        cr.set_source_rgba(0.1, 0.1, 0.1, 0.95);
+        cr.set_line_width(1.0 / zoom.max(0.001));
+        cr.stroke().unwrap();
+    };
+    for i in 0u8..4u8 {
+        let (lx, ly) = corner_local(i, fw, fh);
+        let p = m.transform_point(lx, ly);
+        draw_sq(cr, p.0, p.1);
+    }
+    for e in 0u8..4u8 {
+        let (ax, ay) = corner_local(e, fw, fh);
+        let (bx, by) = corner_local((e + 1) % 4, fw, fh);
+        let pa = m.transform_point(ax, ay);
+        let pb = m.transform_point(bx, by);
+        let mx = (pa.0 + pb.0) * 0.5;
+        let my = (pa.1 + pb.1) * 0.5;
+        draw_sq(cr, mx, my);
+    }
+    let rh = floating_rotate_handle_doc(f);
+    cr.arc(rh.0, rh.1, hs * 1.05, 0.0, std::f64::consts::TAU);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+    cr.fill_preserve().unwrap();
+    cr.set_source_rgba(0.1, 0.1, 0.1, 0.95);
+    cr.set_line_width(1.0 / zoom.max(0.001));
+    cr.stroke().unwrap();
 }
 
 /// Cairo ARgb32 row (BGRA premultiplied) → tight premultiplied RGBA for layers.
@@ -158,33 +411,6 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
     let raw: &[u8] = owned.as_ref();
     let premul = cairo_stride_to_premul_rgba_tight(raw, w, h, stride);
     Some((min_ix, min_iy, rw, rh, premul))
-}
-
-fn sync_floating_panel(state: &SharedState, cell: &FloatingPanelCell) {
-    let cell_borrow = cell.borrow();
-    let Some(panel) = cell_borrow.as_ref() else {
-        return;
-    };
-    *panel.suppress.borrow_mut() = true;
-    let st = state.borrow();
-    let show = st.floating.is_some();
-    panel.revealer.set_reveal_child(show);
-    if let Some(f) = &st.floating {
-        panel
-            .scale_w_adj
-            .set_value((f.scale_x.clamp(0.01, 10.0) * 100.0).round());
-        panel
-            .scale_h_adj
-            .set_value((f.scale_y.clamp(0.01, 10.0) * 100.0).round());
-        let mut a = f.angle_deg % 360.0;
-        if a > 180.0 {
-            a -= 360.0;
-        } else if a < -180.0 {
-            a += 360.0;
-        }
-        panel.rot_adj.set_value(a);
-    }
-    *panel.suppress.borrow_mut() = false;
 }
 
 pub fn run() -> gtk::glib::ExitCode {
@@ -912,8 +1138,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        let phase = (glib::monotonic_time() / 50000) % 20;
-        cr.set_dash(&[6.0, 6.0], phase as f64);
+        cr.set_dash(&[6.0, 6.0], 0.0);
         cr.set_line_width(1.0 / zoom.max(0.001));
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
         cr.move_to(quad[0].0, quad[0].1);
@@ -923,13 +1148,14 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.close_path();
         cr.stroke().unwrap();
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-        cr.set_dash(&[6.0, 6.0], (phase as f64) + 6.0);
+        cr.set_dash(&[6.0, 6.0], 6.0);
         cr.move_to(quad[0].0, quad[0].1);
         cr.line_to(quad[1].0, quad[1].1);
         cr.line_to(quad[2].0, quad[2].1);
         cr.line_to(quad[3].0, quad[3].1);
         cr.close_path();
         cr.stroke().unwrap();
+        draw_floating_handles(cr, zoom, f);
         cr.restore().unwrap();
     }
 
@@ -937,14 +1163,13 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        let phase = (glib::monotonic_time() / 50000) % 20;
-        cr.set_dash(&[6.0, 6.0], phase as f64);
+        cr.set_dash(&[6.0, 6.0], 0.0);
         cr.set_line_width(1.0 / zoom.max(0.001));
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
         cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
         cr.stroke().unwrap();
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-        cr.set_dash(&[6.0, 6.0], (phase as f64) + 6.0);
+        cr.set_dash(&[6.0, 6.0], 6.0);
         cr.rectangle(sx as f64, sy as f64, sw as f64, sh as f64);
         cr.stroke().unwrap();
         cr.restore().unwrap();
@@ -971,6 +1196,8 @@ fn commit_floating(state: &mut AppState) {
     let Some(f) = state.floating.take() else {
         return;
     };
+    state.floating_drag = None;
+    state.move_grab_doc = None;
     let idx = state.doc.active_layer;
     let Some(layer) = state.doc.layers.get_mut(idx) else {
         return;
@@ -1119,7 +1346,6 @@ fn setup_canvas_input(
     canvas_cell: &CanvasCell,
     color_preview_da_cell: &ColorPreviewDaCell,
     recent_swatches: &gtk::FlowBox,
-    floating_panel: &FloatingPanelCell,
 ) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let last_brush_widget: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
@@ -1137,10 +1363,12 @@ fn setup_canvas_input(
     let mws_b = move_widget_start.clone();
     let cb_drag = color_preview_da_cell.clone();
     let recent_drag = recent_swatches.clone();
-    let fp_drag_begin = floating_panel.clone();
     drag.connect_drag_begin(move |_g, wx, wy| {
         cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
+        if st.floating.is_some() && st.tool != ToolKind::Move {
+            commit_floating(&mut st);
+        }
         let (dx, dy) = st.widget_to_doc(wx, wy);
         let mut eyedrop_updated = false;
         let mut start_brush_paint_tick = false;
@@ -1233,10 +1461,51 @@ fn setup_canvas_input(
                 *bws.borrow_mut() = Some((st.pan_x, st.pan_y));
             }
             ToolKind::Move => {
-                if let Some(ref f) = st.floating {
-                    if !doc_point_in_floating(dx, dy, f) {
-                        commit_floating(&mut st);
-                        sync_floating_panel(&st_drag_begin, &fp_drag_begin);
+                st.floating_drag = None;
+                st.move_grab_doc = None;
+                if let Some(f) = st.floating.clone() {
+                    match float_press_at(dx, dy, st.zoom, &f) {
+                        FloatPress::Outside => {
+                            commit_floating(&mut st);
+                        }
+                        FloatPress::Rotate => {
+                            let (cx, cy) = floating_transform_center(&f);
+                            let start_pointer_rad = (dy - cy).atan2(dx - cx);
+                            st.floating_drag = Some(FloatingDrag::Rotate {
+                                base_angle_deg: f.angle_deg,
+                                start_pointer_rad,
+                            });
+                            *mws_b.borrow_mut() = Some((wx, wy));
+                        }
+                        FloatPress::Corner(i) => {
+                            let m = floating_image_to_doc_matrix(&f);
+                            let fw = f.w.max(1) as f64;
+                            let fh = f.h.max(1) as f64;
+                            let opp = (i + 2) % 4;
+                            let (alx, aly) = corner_local(opp, fw, fh);
+                            let anchor_doc = m.transform_point(alx, aly);
+                            st.floating_drag = Some(FloatingDrag::ResizeCorner {
+                                dragged_corner: i,
+                                anchor_doc,
+                            });
+                            *mws_b.borrow_mut() = Some((wx, wy));
+                        }
+                        FloatPress::Edge(e) => {
+                            let m = floating_image_to_doc_matrix(&f);
+                            let fw = f.w.max(1) as f64;
+                            let fh = f.h.max(1) as f64;
+                            let (ax, ay) = edge_anchor_local_for_resize(e, fw, fh);
+                            let anchor_doc = m.transform_point(ax, ay);
+                            st.floating_drag = Some(FloatingDrag::ResizeEdge { edge: e, anchor_doc });
+                            *mws_b.borrow_mut() = Some((wx, wy));
+                        }
+                        FloatPress::Body => {
+                            st.floating_drag = Some(FloatingDrag::Move {
+                                grab_off_x: dx - f.x,
+                                grab_off_y: dy - f.y,
+                            });
+                            *mws_b.borrow_mut() = Some((wx, wy));
+                        }
                     }
                 }
                 if st.floating.is_none() {
@@ -1262,13 +1531,8 @@ fn setup_canvas_input(
                             ));
                             st.selection = None;
                             st.modified = true;
-                            sync_floating_panel(&st_drag_begin, &fp_drag_begin);
                         }
                     }
-                }
-                if let Some(ref f) = st.floating {
-                    st.move_grab_doc = Some((dx - f.x, dy - f.y));
-                    *mws_b.borrow_mut() = Some((wx, wy));
                 }
             }
         }
@@ -1349,17 +1613,43 @@ fn setup_canvas_input(
                 }
             }
             ToolKind::Move => {
-                let grab = st.move_grab_doc;
                 let wpress = *mws_u.borrow();
                 let px = st.pan_x;
                 let py = st.pan_y;
                 let z = st.zoom;
-                if let (Some(ref mut f), Some(g), Some((wpx, wpy))) =
-                    (&mut st.floating, grab, wpress)
-                {
-                    let (cx, cy) = ((wpx + ox - px) / z, (wpy + oy - py) / z);
-                    f.x = cx - g.0;
-                    f.y = cy - g.1;
+                let Some((wpx, wpy)) = wpress else {
+                    return;
+                };
+                let (cx, cy) = ((wpx + ox - px) / z, (wpy + oy - py) / z);
+                let drag = st.floating_drag;
+                if let (Some(ref mut f), Some(d)) = (&mut st.floating, drag) {
+                    match d {
+                        FloatingDrag::Move {
+                            grab_off_x,
+                            grab_off_y,
+                        } => {
+                            f.x = cx - grab_off_x;
+                            f.y = cy - grab_off_y;
+                        }
+                        FloatingDrag::Rotate {
+                            base_angle_deg,
+                            start_pointer_rad,
+                        } => {
+                            let (pcx, pcy) = floating_transform_center(f);
+                            let ang = (cy - pcy).atan2(cx - pcx);
+                            f.angle_deg = base_angle_deg
+                                + (ang - start_pointer_rad) * 180.0 / std::f64::consts::PI;
+                        }
+                        FloatingDrag::ResizeCorner {
+                            dragged_corner,
+                            anchor_doc,
+                        } => {
+                            apply_floating_resize_corner(f, dragged_corner, anchor_doc, (cx, cy));
+                        }
+                        FloatingDrag::ResizeEdge { edge, anchor_doc } => {
+                            apply_floating_resize_edge(f, edge, anchor_doc, (cx, cy));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1448,6 +1738,7 @@ fn setup_canvas_input(
             }
             ToolKind::Move => {
                 st.move_grab_doc = None;
+                st.floating_drag = None;
                 st.drag_start_doc = None;
                 *mws_e.borrow_mut() = None;
             }
@@ -1551,11 +1842,7 @@ fn copy_selection(state: &SharedState) {
     }
 }
 
-fn paste_clipboard_center(
-    state: &SharedState,
-    tool_dd_cell: &ToolDdCell,
-    floating_panel: &FloatingPanelCell,
-) {
+fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
     let clip = state.borrow().clipboard.clone();
     let Some((sw, sh, data)) = clip else {
         return;
@@ -1573,13 +1860,11 @@ fn paste_clipboard_center(
     if let Some(ref dd) = *tool_dd_cell.borrow() {
         dd.set_selected(9);
     }
-    sync_floating_panel(state, floating_panel);
 }
 
 fn paste_image_data(
     state: &SharedState,
     tool_dd_cell: &ToolDdCell,
-    floating_panel: &FloatingPanelCell,
     w: u32,
     h: u32,
     premul_data: Vec<u8>,
@@ -1603,14 +1888,12 @@ fn paste_image_data(
     if let Some(ref dd) = *tool_dd_cell.borrow() {
         dd.set_selected(9);
     }
-    sync_floating_panel(state, floating_panel);
 }
 
 fn show_paste_oversize_dialog(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
     tool_dd_cell: &ToolDdCell,
-    floating_panel: &FloatingPanelCell,
     canvas_cell: &CanvasCell,
     layers_cell: &LayersCell,
     img_w: u32,
@@ -1665,19 +1948,17 @@ fn show_paste_oversize_dialog(
 
     let st = state.clone();
     let td = tool_dd_cell.clone();
-    let fp = floating_panel.clone();
     let cv = canvas_cell.clone();
     let data_c = data.clone();
     let dw = d.clone();
     paste_anyway.connect_clicked(move |_| {
-        paste_image_data(&st, &td, &fp, img_w, img_h, (*data_c).clone());
+        paste_image_data(&st, &td, img_w, img_h, (*data_c).clone());
         queue_canvas(&cv);
         dw.close();
     });
 
     let st = state.clone();
     let td = tool_dd_cell.clone();
-    let fp = floating_panel.clone();
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
     let dw = d.clone();
@@ -1690,7 +1971,7 @@ fn show_paste_oversize_dialog(
             s.history.clear();
             s.bump_document_revision();
         }
-        paste_image_data(&st, &td, &fp, img_w, img_h, (*data).clone());
+        paste_image_data(&st, &td, img_w, img_h, (*data).clone());
         zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
         queue_canvas(&cv);
@@ -1704,12 +1985,11 @@ fn try_paste_system_clipboard(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
     tool_dd_cell: &ToolDdCell,
-    floating_panel: &FloatingPanelCell,
     canvas_cell: &CanvasCell,
     layers_cell: &LayersCell,
 ) {
     let Some(display) = gdk::Display::default() else {
-        paste_clipboard_center(state, tool_dd_cell, floating_panel);
+        paste_clipboard_center(state, tool_dd_cell);
         queue_canvas(canvas_cell);
         return;
     };
@@ -1718,7 +1998,6 @@ fn try_paste_system_clipboard(
     let win = window.clone();
     let st = state.clone();
     let td = tool_dd_cell.clone();
-    let fp = floating_panel.clone();
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
 
@@ -1739,21 +2018,21 @@ fn try_paste_system_clipboard(
 
                             if iw > doc_w || ih > doc_h {
                                 show_paste_oversize_dialog(
-                                    &win, &st, &td, &fp, &cv, &lc, iw, ih, premul,
+                                    &win, &st, &td, &cv, &lc, iw, ih, premul,
                                 );
                             } else {
-                                paste_image_data(&st, &td, &fp, iw, ih, premul);
+                                paste_image_data(&st, &td, iw, ih, premul);
                                 queue_canvas(&cv);
                             }
                         }
                         Err(_) => {
-                            paste_clipboard_center(&st, &td, &fp);
+                            paste_clipboard_center(&st, &td);
                             queue_canvas(&cv);
                         }
                     }
                 }
                 _ => {
-                    paste_clipboard_center(&st, &td, &fp);
+                    paste_clipboard_center(&st, &td);
                     queue_canvas(&cv);
                 }
             }
@@ -1766,7 +2045,6 @@ fn open_file(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
-    floating_panel: &FloatingPanelCell,
 ) {
     let all_filter = gtk::FileFilter::new();
     all_filter.set_name(Some("All supported (*.png, *.ora)"));
@@ -1793,7 +2071,6 @@ fn open_file(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
-    let fp = floating_panel.clone();
     dlg.open(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
             if let Some(path) = file.path() {
@@ -1810,11 +2087,11 @@ fn open_file(
                         g.modified = false;
                         g.selection = None;
                         g.floating = None;
+                        g.floating_drag = None;
                         g.shape_drag_preview = None;
                         g.drag_start_doc = None;
                         g.bump_document_revision();
                         drop(g);
-                        sync_floating_panel(&st, &fp);
                         zoom_to_fit(&st, &cv);
                         refresh_layers_list(&st, &lc, &cv);
                         queue_canvas(&cv);
@@ -1906,7 +2183,6 @@ fn new_document_dialog(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
-    floating_panel: &FloatingPanelCell,
 ) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
@@ -1950,7 +2226,6 @@ fn new_document_dialog(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
-    let fp = floating_panel.clone();
     let dw = d.clone();
     ok.connect_clicked(move |_| {
         let w = w_adj.value() as u32;
@@ -1960,12 +2235,12 @@ fn new_document_dialog(
         g.history.clear();
         g.selection = None;
         g.floating = None;
+        g.floating_drag = None;
         g.shape_drag_preview = None;
         g.drag_start_doc = None;
         g.modified = false;
         g.bump_document_revision();
         drop(g);
-        sync_floating_panel(&st, &fp);
         zoom_to_fit(&st, &cv);
         refresh_layers_list(&st, &lc, &cv);
         queue_canvas(&cv);
@@ -2210,7 +2485,6 @@ fn build_ui(app: &Application) {
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
     let color_preview_da_cell: ColorPreviewDaCell = Rc::new(RefCell::new(None));
     let tool_dd_cell: ToolDdCell = Rc::new(RefCell::new(None));
-    let floating_panel_cell: FloatingPanelCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
     drawing_area.set_hexpand(true);
@@ -2224,24 +2498,7 @@ fn build_ui(app: &Application) {
         draw_canvas(&st_draw, cr);
     });
 
-    let st_tick = state.clone();
-    let cv_tick = canvas_cell.clone();
-    let last_march = Rc::new(RefCell::new(0i64));
-    let lm = last_march.clone();
-    let tick_slot = Rc::new(RefCell::new(None::<gtk::TickCallbackId>));
-    let tick_id = drawing_area.add_tick_callback(move |_w, _clock| {
-        let st = st_tick.borrow();
-        if st.selection.is_some() || st.floating.is_some() {
-            let now = glib::monotonic_time();
-            let mut last = lm.borrow_mut();
-            if now.saturating_sub(*last) >= 50_000 {
-                *last = now;
-                queue_canvas(&cv_tick);
-            }
-        }
-        glib::ControlFlow::Continue
-    });
-    *tick_slot.borrow_mut() = Some(tick_id);
+    let tick_slot: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
 
     let recent_colors_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -2255,6 +2512,14 @@ fn build_ui(app: &Application) {
 
     let preview_da = make_color_preview_area(&state);
     *color_preview_da_cell.borrow_mut() = Some(preview_da.clone());
+
+    setup_canvas_input(
+        &drawing_area,
+        &state,
+        &canvas_cell,
+        &color_preview_da_cell,
+        &recent_colors_flow,
+    );
 
     let layers_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Browse)
@@ -2338,6 +2603,9 @@ fn build_ui(app: &Application) {
             _ => ToolKind::Brush,
         };
         let cur = g.tool;
+        if g.floating.is_some() && cur != ToolKind::Move {
+            commit_floating(&mut g);
+        }
         drop(g);
         if let Some(ref adj) = *sa_dd.borrow() {
             if cur == ToolKind::Pixel && prev != ToolKind::Pixel {
@@ -2484,178 +2752,6 @@ fn build_ui(app: &Application) {
 
     toolbar.append(&zoom_row);
 
-    let fp_suppress = Rc::new(RefCell::new(false));
-    let scale_w_adj = gtk::Adjustment::new(100.0, 1.0, 1000.0, 1.0, 10.0, 0.0);
-    let scale_h_adj = gtk::Adjustment::new(100.0, 1.0, 1000.0, 1.0, 10.0, 0.0);
-    let rot_adj = gtk::Adjustment::new(0.0, -180.0, 180.0, 1.0, 15.0, 0.0);
-    let scale_w_spin = gtk::SpinButton::new(Some(&scale_w_adj), 1.0, 0);
-    let scale_h_spin = gtk::SpinButton::new(Some(&scale_h_adj), 1.0, 0);
-    let rot_spin = gtk::SpinButton::new(Some(&rot_adj), 1.0, 0);
-    scale_w_spin.set_tooltip_text(Some("Horizontal scale (%)"));
-    scale_h_spin.set_tooltip_text(Some("Vertical scale (%)"));
-    rot_spin.set_tooltip_text(Some("Rotation (degrees)"));
-    scale_w_spin.set_width_request(64);
-    scale_h_spin.set_width_request(64);
-    rot_spin.set_width_request(64);
-
-    let st_sw = state.clone();
-    let cv_sw = canvas_cell.clone();
-    let sup_sw = fp_suppress.clone();
-    scale_w_adj.connect_value_changed(move |a| {
-        if *sup_sw.borrow() {
-            return;
-        }
-        let v = (a.value() / 100.0).clamp(0.01, 10.0);
-        if let Some(f) = st_sw.borrow_mut().floating.as_mut() {
-            f.scale_x = v;
-        }
-        queue_canvas(&cv_sw);
-    });
-    let st_sh = state.clone();
-    let cv_sh = canvas_cell.clone();
-    let sup_sh = fp_suppress.clone();
-    scale_h_adj.connect_value_changed(move |a| {
-        if *sup_sh.borrow() {
-            return;
-        }
-        let v = (a.value() / 100.0).clamp(0.01, 10.0);
-        if let Some(f) = st_sh.borrow_mut().floating.as_mut() {
-            f.scale_y = v;
-        }
-        queue_canvas(&cv_sh);
-    });
-    let st_rot = state.clone();
-    let cv_rot = canvas_cell.clone();
-    let sup_rot = fp_suppress.clone();
-    rot_adj.connect_value_changed(move |a| {
-        if *sup_rot.borrow() {
-            return;
-        }
-        if let Some(f) = st_rot.borrow_mut().floating.as_mut() {
-            f.angle_deg = a.value();
-        }
-        queue_canvas(&cv_rot);
-    });
-
-    let flip_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
-        .build();
-    let flip_h_btn = gtk::Button::with_label("Flip H");
-    let flip_v_btn = gtk::Button::with_label("Flip V");
-    flip_h_btn.set_tooltip_text(Some("Mirror horizontally"));
-    flip_v_btn.set_tooltip_text(Some("Mirror vertically"));
-    let rot_ccw_btn = gtk::Button::with_label("-90°");
-    let rot_cw_btn = gtk::Button::with_label("+90°");
-    rot_ccw_btn.set_tooltip_text(Some("Rotate 90° counter-clockwise"));
-    rot_cw_btn.set_tooltip_text(Some("Rotate 90° clockwise"));
-    flip_row.append(&flip_h_btn);
-    flip_row.append(&flip_v_btn);
-    flip_row.append(&rot_ccw_btn);
-    flip_row.append(&rot_cw_btn);
-
-    let st_fh = state.clone();
-    let cv_fh = canvas_cell.clone();
-    flip_h_btn.connect_clicked(move |_| {
-        if let Some(f) = st_fh.borrow_mut().floating.as_mut() {
-            f.flip_h = !f.flip_h;
-        }
-        queue_canvas(&cv_fh);
-    });
-    let st_fv = state.clone();
-    let cv_fv = canvas_cell.clone();
-    flip_v_btn.connect_clicked(move |_| {
-        if let Some(f) = st_fv.borrow_mut().floating.as_mut() {
-            f.flip_v = !f.flip_v;
-        }
-        queue_canvas(&cv_fv);
-    });
-    let st_rccw = state.clone();
-    let cv_rccw = canvas_cell.clone();
-    let sup_r = fp_suppress.clone();
-    let rot_adj_ccw = rot_adj.clone();
-    rot_ccw_btn.connect_clicked(move |_| {
-        let mut g = st_rccw.borrow_mut();
-        let Some(f) = g.floating.as_mut() else {
-            return;
-        };
-        f.angle_deg -= 90.0;
-        let mut a = f.angle_deg % 360.0;
-        if a > 180.0 {
-            a -= 360.0;
-        } else if a < -180.0 {
-            a += 360.0;
-        }
-        f.angle_deg = a;
-        drop(g);
-        *sup_r.borrow_mut() = true;
-        rot_adj_ccw.set_value(a);
-        *sup_r.borrow_mut() = false;
-        queue_canvas(&cv_rccw);
-    });
-    let st_rcw = state.clone();
-    let cv_rcw = canvas_cell.clone();
-    let sup_r2 = fp_suppress.clone();
-    let rot_adj_cw = rot_adj.clone();
-    rot_cw_btn.connect_clicked(move |_| {
-        let mut g = st_rcw.borrow_mut();
-        let Some(f) = g.floating.as_mut() else {
-            return;
-        };
-        f.angle_deg += 90.0;
-        let mut a = f.angle_deg % 360.0;
-        if a > 180.0 {
-            a -= 360.0;
-        } else if a < -180.0 {
-            a += 360.0;
-        }
-        f.angle_deg = a;
-        drop(g);
-        *sup_r2.borrow_mut() = true;
-        rot_adj_cw.set_value(a);
-        *sup_r2.borrow_mut() = false;
-        queue_canvas(&cv_rcw);
-    });
-
-    let fp_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .build();
-    fp_box.append(&make_row("Scale W", scale_w_spin.upcast_ref()));
-    fp_box.append(&make_row("Scale H", scale_h_spin.upcast_ref()));
-    fp_box.append(&make_row("Rotate", rot_spin.upcast_ref()));
-    fp_box.append(&flip_row);
-
-    let fp_revealer = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideDown)
-        .reveal_child(false)
-        .child(&fp_box)
-        .build();
-
-    let fp_frame = gtk::Frame::builder()
-        .label("Floating image")
-        .child(&fp_revealer)
-        .build();
-
-    toolbar.append(&fp_frame);
-
-    *floating_panel_cell.borrow_mut() = Some(FloatingPanel {
-        revealer: fp_revealer.clone(),
-        suppress: fp_suppress,
-        scale_w_adj: scale_w_adj.clone(),
-        scale_h_adj: scale_h_adj.clone(),
-        rot_adj: rot_adj.clone(),
-    });
-
-    setup_canvas_input(
-        &drawing_area,
-        &state,
-        &canvas_cell,
-        &color_preview_da_cell,
-        &recent_colors_flow,
-        &floating_panel_cell,
-    );
-
     let toolbar_spacer = gtk::Box::builder()
         .vexpand(true)
         .build();
@@ -2785,7 +2881,6 @@ fn build_ui(app: &Application) {
         &layers_cell,
         &canvas_cell,
         &tool_dd_cell,
-        &floating_panel_cell,
         &tool_strings,
     );
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
@@ -2818,7 +2913,6 @@ fn build_ui(app: &Application) {
     let st_k = state.clone();
     let lc_k = layers_cell.clone();
     let cv_k = canvas_cell.clone();
-    let fp_k = floating_panel_cell.clone();
     let win_k = window.clone();
     let td_k = tool_dd_cell.clone();
     key.connect_key_pressed(move |_c, keyval, _code, state_m| {
@@ -2844,7 +2938,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::o | gdk::Key::O if ctrl => {
-                open_file(&win_k, &st_k, &lc_k, &cv_k, &fp_k);
+                open_file(&win_k, &st_k, &lc_k, &cv_k);
                 glib::Propagation::Stop
             }
             gdk::Key::s | gdk::Key::S if ctrl => {
@@ -2852,7 +2946,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::n | gdk::Key::N if ctrl => {
-                new_document_dialog(&win_k, &st_k, &lc_k, &cv_k, &fp_k);
+                new_document_dialog(&win_k, &st_k, &lc_k, &cv_k);
                 glib::Propagation::Stop
             }
             gdk::Key::x | gdk::Key::X if ctrl => {
@@ -2865,7 +2959,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::v | gdk::Key::V if ctrl => {
-                try_paste_system_clipboard(&win_k, &st_k, &td_k, &fp_k, &cv_k, &lc_k);
+                try_paste_system_clipboard(&win_k, &st_k, &td_k, &cv_k, &lc_k);
                 glib::Propagation::Stop
             }
             gdk::Key::plus | gdk::Key::equal if ctrl => {
@@ -3085,7 +3179,6 @@ fn build_menu(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
     tool_dd_cell: &ToolDdCell,
-    floating_panel: &FloatingPanelCell,
     tool_strings: &gtk::StringList,
 ) -> gio::Menu {
     let menu = gio::Menu::new();
@@ -3110,23 +3203,21 @@ fn build_menu(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
-    let fp = floating_panel.clone();
     let w = window.clone();
 
     let new_act = gio::SimpleAction::new("new", None);
     new_act.connect_activate(move |_, _| {
-        new_document_dialog(&w, &st, &lc, &cv, &fp);
+        new_document_dialog(&w, &st, &lc, &cv);
     });
     app_add_action(window, &new_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
-    let fp = floating_panel.clone();
     let w = window.clone();
     let open_act = gio::SimpleAction::new("open", None);
     open_act.connect_activate(move |_, _| {
-        open_file(&w, &st, &lc, &cv, &fp);
+        open_file(&w, &st, &lc, &cv);
     });
     app_add_action(window, &open_act);
 
@@ -3197,11 +3288,10 @@ fn build_menu(
     let cv = canvas.clone();
     let td_p = tool_dd_cell.clone();
     let lc_p = layers_cell.clone();
-    let fp_p = floating_panel.clone();
     let w_p = window.clone();
     let paste_act = gio::SimpleAction::new("paste", None);
     paste_act.connect_activate(move |_, _| {
-        try_paste_system_clipboard(&w_p, &st, &td_p, &fp_p, &cv, &lc_p);
+        try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p);
     });
     app_add_action(window, &paste_act);
 

@@ -34,6 +34,27 @@ impl FloatingSelection {
     }
 }
 
+/// Active drag on the floating selection (handles on the marquee, not sidebar).
+#[derive(Clone, Copy, Debug)]
+pub enum FloatingDrag {
+    Move {
+        grab_off_x: f64,
+        grab_off_y: f64,
+    },
+    Rotate {
+        base_angle_deg: f64,
+        start_pointer_rad: f64,
+    },
+    ResizeCorner {
+        dragged_corner: u8,
+        anchor_doc: (f64, f64),
+    },
+    ResizeEdge {
+        edge: u8,
+        anchor_doc: (f64, f64),
+    },
+}
+
 pub struct AppState {
     pub doc: Document,
     pub history: History,
@@ -56,6 +77,8 @@ pub struct AppState {
     pub shape_drag_preview: Option<(ToolKind, f64, f64, f64, f64)>,
     /// When dragging a floating selection: `(pointer_doc_x - float_x, pointer_doc_y - float_y)`.
     pub move_grab_doc: Option<(f64, f64)>,
+    /// Move / rotate / resize via on-canvas handles (Move tool + floating).
+    pub floating_drag: Option<FloatingDrag>,
     pub modified: bool,
     pub tool_keybinds: Vec<(ToolKind, Option<char>)>,
     /// Most recently used foreground colors (straight RGBA), newest first; at most 4 kept.
@@ -111,6 +134,7 @@ impl AppState {
             drag_start_doc: None,
             shape_drag_preview: None,
             move_grab_doc: None,
+            floating_drag: None,
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),
             recent_colors: Vec::new(),
