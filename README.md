@@ -14,9 +14,12 @@ A small raster paint program for the desktop, built with [GTK 4](https://gtk.org
 
 ## Features
 
-- **Layers** with compositing and undo history
-- **Tools**: brush, pixel, eraser, eyedropper, flood fill, line, rectangle, ellipse, rectangular selection (with move), and hand (pan)
-- **Files**: PNG (single flattened image on open; composite on save) and [OpenRaster](https://www.openraster.org/) (`.ora`) for multi-layer round-trip
+- **Layers** with per-layer **opacity**, **visibility**, **blend modes** (Normal, Multiply, Add), compositing, and undo history
+- **Tools**: brush, pixel, eraser, eyedropper, flood fill, line, rectangle, ellipse, rectangular select, magic select (same-color regions), **move** (transform floating selections and similar), and hand (pan)
+- **Files**: **Open** PNG, JPEG, WebP, GIF, BMP, or [OpenRaster](https://www.openraster.org/) (`.ora`). Raster formats load as a single flattened layer; `.ora` keeps layers. **Save** as PNG (composite) or `.ora` for multi-layer round-trip
+- **Palettes**: sidebar with named palettes; import and export hex palette text from the Palette menu
+- **Settings**: custom keyboard shortcuts for tools (Keybinds)
+- **Updates**: official **Linux x86_64** and **Windows x86_64** release bundles can check GitHub Releases from **Settings → Check for Updates…** (including optional self-update where supported)
 
 ## Prebuilt binaries
 
@@ -29,7 +32,7 @@ GitHub Actions builds installable bundles on every run of the **Release build** 
 
 **Windows:** Unzip and run `run-wooly-paint.cmd` (it sets `PATH` and GTK data dirs). If something is still missing, use [MSYS2](https://www.msys2.org/) MinGW64 with `gtk4` / `libadwaita` as described in the zip’s `README.txt`.
 
-**Tagged releases:** Pushing a git tag matching `v*` (for example `v0.1.0`) attaches the same files to a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) automatically.
+**Tagged releases:** Pushing a git tag matching `v*` (for example `v0.1.0`) attaches the same files to a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) automatically. Those builds are what in-app update checks use.
 
 **Package locally** (after `cargo build --release`):
 
