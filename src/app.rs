@@ -3,6 +3,7 @@ use crate::document::{
     Document,
 };
 use crate::state::{AppState, FloatingDrag, FloatingSelection};
+use crate::tool_cursors;
 use crate::tools::{
     clear_rect, copy_rect, draw_ellipse, draw_rect_outline, ellipse_outline_segment_count,
     flood_fill, paste_rect, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
@@ -1461,6 +1462,7 @@ fn setup_canvas_input(
             }
             ToolKind::Hand => {
                 *bws.borrow_mut() = Some((st.pan_x, st.pan_y));
+                tool_cursors::set_canvas_grabbing(&cnv);
             }
             ToolKind::Move => {
                 st.floating_drag = None;
@@ -1748,6 +1750,7 @@ fn setup_canvas_input(
         }
         drop(st);
         queue_canvas(&cv_drag_end);
+        tool_cursors::sync_canvas_tool_cursor(&cnv3, st_drag_end.borrow().tool);
         cnv3.queue_draw();
     });
 
@@ -1755,11 +1758,22 @@ fn setup_canvas_input(
     motion.set_propagation_phase(gtk::PropagationPhase::Capture);
     let st_m = state.clone();
     let cv_m = canvas_cell.clone();
+    let cnv_m = canvas.clone();
+    let middle_pan = Rc::new(std::cell::Cell::new(false));
     let last = Rc::new(RefCell::new(None::<(f64, f64)>));
     let last_c = last.clone();
     motion.connect_motion(move |ec, x, y| {
         let mask = ec.current_event_state();
-        if mask.contains(gdk::ModifierType::BUTTON2_MASK) {
+        let m2 = mask.contains(gdk::ModifierType::BUTTON2_MASK);
+        if middle_pan.get() && !m2 {
+            middle_pan.set(false);
+            tool_cursors::sync_canvas_tool_cursor(&cnv_m, st_m.borrow().tool);
+        }
+        if m2 {
+            if !middle_pan.get() {
+                middle_pan.set(true);
+                tool_cursors::set_canvas_grabbing(&cnv_m);
+            }
             let Some((lx, ly)) = *last_c.borrow() else {
                 *last_c.borrow_mut() = Some((x, y));
                 return;
@@ -2592,6 +2606,7 @@ fn build_ui(app: &Application) {
         &color_preview_da_cell,
         &recent_colors_flow,
     );
+    tool_cursors::sync_canvas_tool_cursor(&drawing_area, state.borrow().tool);
 
     let layers_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Browse)
@@ -2658,6 +2673,7 @@ fn build_ui(app: &Application) {
     let st_dd = state.clone();
     let cv_dd = canvas_cell.clone();
     let sa_dd = size_adj_cell.clone();
+    let da_dd = drawing_area.clone();
     tool_dd.connect_selected_item_notify(move |dd| {
         let mut g = st_dd.borrow_mut();
         let prev = g.tool;
@@ -2686,6 +2702,7 @@ fn build_ui(app: &Application) {
                 adj.set_value(8.0);
             }
         }
+        tool_cursors::sync_canvas_tool_cursor(&da_dd, cur);
         queue_canvas(&cv_dd);
     });
 

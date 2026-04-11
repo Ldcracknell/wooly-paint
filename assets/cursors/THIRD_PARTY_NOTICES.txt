@@ -1,0 +1,7 @@
+Tool cursor SVG sources (rasterized at build time to 32×32 PNG):
+
+ Lucide Icons (lucide-static package), ISC License
+  https://lucide.dev/license
+  https://github.com/lucide-icons/lucide
+
+Files in svg/ are copied from the lucide-static npm package (v0.460.0) on jsDelivr.

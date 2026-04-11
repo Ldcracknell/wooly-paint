@@ -70,3 +70,7 @@ Pass a path to the binary if it is not under `target/release/` or `target/debug/
 ## Windows
 
 Release builds for Windows can embed `src/assets/icon.ico` via the `winres` build dependency when built on Windows with a suitable toolchain.
+
+## Credits
+
+**Tool cursors** use icons from [Lucide](https://lucide.dev/) (via the `lucide-static` package), licensed under the [ISC License](https://lucide.dev/license). SVG sources live in `assets/cursors/svg/` and are rasterized at build time; see `assets/cursors/THIRD_PARTY_NOTICES.txt` for details.

@@ -1,75 +1,101 @@
+//! Rasterize Lucide SVGs (ISC, see assets/cursors/svg).
+//! Hotspots are SVG user-space points (24×24 viewBox) mapped with the same transform as the glyph
+//! so they line up with `widget_to_doc`: brush/eraser = circle center, pencil = tip, shapes = first corner, etc.
+
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let target = env::var("TARGET").expect("TARGET");
-    let profile = env::var("PROFILE").expect("PROFILE");
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("target"));
+/// Total bitmap size (smaller cursors).
+const CURSOR_PX: u32 = 24;
+/// Inset so the icon glyph is visibly smaller than the bitmap.
+const MARGIN: f32 = 4.0;
 
-    let icon_png = manifest_dir.join("src/assets/icon.png");
-    let icon_ico = manifest_dir.join("src/assets/icon.ico");
+fn rasterize(
+    svg_path: &Path,
+    png_path: &Path,
+    hx_svg: f32,
+    hy_svg: f32,
+) -> Result<(i32, i32), String> {
+    let data = fs::read(svg_path).map_err(|e| format!("read {}: {e}", svg_path.display()))?;
+    let tree = usvg::Tree::from_data(&data, &usvg::Options::default())
+        .map_err(|e| format!("parse {}: {e}", svg_path.display()))?;
 
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={}", icon_png.display());
-    println!("cargo:rerun-if-changed={}", icon_ico.display());
-
-    if target.contains("windows") {
-        #[cfg(windows)]
-        if icon_ico.is_file() {
-            let mut res = winres::WindowsResource::new();
-            res.set_icon(icon_ico.to_str().expect("icon path is valid UTF-8"));
-            res.compile().expect("winres: embed icon");
-        }
-        #[cfg(not(windows))]
-        println!(
-            "cargo:warning=Windows target on a non-Windows host: .exe will not embed an icon; build on Windows or use a Windows resource toolchain."
-        );
-    } else if icon_png.is_file() {
-        write_desktop_launcher(
-            &manifest_dir,
-            &target_dir,
-            profile.as_str(),
-            target.as_str(),
-            &icon_png,
-        );
+    let w = tree.size().width() as f32;
+    let h = tree.size().height() as f32;
+    if w <= 0.0 || h <= 0.0 {
+        return Err(format!("bad size {}", svg_path.display()));
     }
+    let inner = CURSOR_PX as f32 - 2.0 * MARGIN;
+    let scale = inner / w.max(h);
+    let tx = MARGIN + (inner - w * scale) * 0.5;
+    let ty = MARGIN + (inner - h * scale) * 0.5;
+    let transform = tiny_skia::Transform::from_translate(tx, ty)
+        .post_concat(tiny_skia::Transform::from_scale(scale, scale));
+
+    let hx_pix_f = tx + hx_svg * scale;
+    let hy_pix_f = ty + hy_svg * scale;
+    let max = (CURSOR_PX - 1) as f32;
+    let hx = hx_pix_f.round().clamp(0.0, max) as i32;
+    let hy = hy_pix_f.round().clamp(0.0, max) as i32;
+
+    let mut pixmap =
+        tiny_skia::Pixmap::new(CURSOR_PX, CURSOR_PX).ok_or_else(|| "pixmap".to_string())?;
+    pixmap.fill(tiny_skia::Color::TRANSPARENT);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    pixmap
+        .save_png(png_path)
+        .map_err(|e| format!("write {}: {e}", png_path.display()))?;
+    Ok((hx, hy))
 }
 
-fn write_desktop_launcher(
-    manifest_dir: &PathBuf,
-    target_dir: &PathBuf,
-    profile: &str,
-    target: &str,
-    icon_png: &PathBuf,
-) {
-    let exe_name = if target.contains("windows") {
-        "wooly-paint.exe"
-    } else {
-        "wooly-paint"
-    };
-    let exe_path = target_dir.join(profile).join(exe_name);
-    let workdir = manifest_dir.to_string_lossy();
-    let exe = exe_path.to_string_lossy();
-    let icon = icon_png.to_string_lossy();
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let svg_dir = Path::new("assets/cursors/svg");
 
-    let desktop = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Version=1.5\n\
-         Name=Wooly Paint\n\
-         Comment=Raster paint\n\
-         Exec={exe}\n\
-         Icon={icon}\n\
-         Path={workdir}\n\
-         Terminal=false\n\
-         Categories=Graphics;2DGraphics;\n\
-         StartupWMClass=dev.woolymelon.WoolyPaint\n"
-    );
+    // (rust stem / png name, svg file, hotspot in SVG user space matching Lucide 24×24 viewBox)
+    let icons: &[(&str, &str, f32, f32)] = &[
+        // Circle stamp center (matches `stamp_circle` around pointer).
+        ("brush", "brush.svg", 10.2, 18.35),
+        // Graphite tip (pencil nib).
+        ("pixel", "pencil.svg", 3.85, 16.18),
+        // Circle stamp center for eraser (same as brush).
+        ("eraser", "eraser.svg", 12.0, 17.6),
+        // Intake tip (path toward m2 22).
+        ("eyedropper", "pipette.svg", 2.35, 21.75),
+        // Pour / fill origin above drip.
+        ("fill", "paint-bucket.svg", 10.5, 9.6),
+        // First endpoint of the slash (matches first click as line start).
+        ("line", "slash.svg", 2.15, 21.85),
+        // Top-left of square stroke (matches first corner of axis-aligned rect).
+        ("rect", "square.svg", 3.0, 3.0),
+        // Top-left of circle’s bounding box (first corner of ellipse drag).
+        ("ellipse", "circle.svg", 2.0, 2.0),
+        // Top-left of dashed marquee.
+        ("select", "square-dashed.svg", 3.0, 3.0),
+        ("move", "move.svg", 12.0, 12.0),
+        // Palm / grab centroid for pan.
+        ("hand", "hand.svg", 12.0, 14.0),
+    ];
 
-    let out = target_dir.join(profile).join("wooly-paint.desktop");
-    fs::write(&out, desktop).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
+    let mut hs = String::from("// @generated by build.rs\n\n");
+
+    println!("cargo:rerun-if-changed=build.rs");
+    for (stem, file, hx_svg, hy_svg) in icons {
+        let svg = svg_dir.join(file);
+        println!("cargo:rerun-if-changed={}", svg.display());
+        let png = out.join(format!("{stem}.png"));
+        match rasterize(&svg, &png, *hx_svg, *hy_svg) {
+            Ok((hx, hy)) => {
+                hs.push_str(&format!(
+                    "pub const HOTSPOT_{}: (i32, i32) = ({hx}, {hy});\n",
+                    stem.to_ascii_uppercase()
+                ));
+            }
+            Err(e) => panic!("cursor rasterize {stem}: {e}"),
+        }
+    }
+
+    fs::write(out.join("cursor_hotspots.rs"), hs).expect("write cursor_hotspots.rs");
 }
