@@ -32,7 +32,7 @@ GitHub Actions builds installable bundles on every run of the **Release build** 
 
 **Windows:** Unzip and run `run-wooly-paint.cmd` (it sets `PATH` and GTK data dirs). If something is still missing, use [MSYS2](https://www.msys2.org/) MinGW64 with `gtk4` / `libadwaita` as described in the zip’s `README.txt`.
 
-**Tagged releases:** Pushing a git tag matching `v*` (for example `v0.1.0`) attaches the same files to a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) automatically. Those builds are what in-app update checks use.
+**Tagged releases:** Pushing a git tag matching `v*` (for example `v1.0.0`) attaches the same files to a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) automatically. Those builds are what in-app update checks use.
 
 **Package locally** (after `cargo build --release`):
 
