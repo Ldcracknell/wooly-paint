@@ -2888,21 +2888,9 @@ fn build_ui(app: &Application) {
     let header = libadwaita::HeaderBar::new();
     header.pack_start(&menubar);
     header.pack_end(&toggle_layers);
-    let title_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
-        .valign(gtk::Align::Center)
-        .build();
-    if let Some(tex) = embedded_app_icon_texture() {
-        let icon = gtk::Image::from_paintable(Some(&tex));
-        icon.set_pixel_size(24);
-        icon.set_valign(gtk::Align::Center);
-        title_row.append(&icon);
-    }
     let window_title = libadwaita::WindowTitle::new("Wooly Paint", "");
     window_title.set_valign(gtk::Align::Center);
-    title_row.append(&window_title);
-    header.set_title_widget(Some(&title_row));
+    header.set_title_widget(Some(&window_title));
 
     let toolbar_view = libadwaita::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
