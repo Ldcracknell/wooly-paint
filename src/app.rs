@@ -5572,7 +5572,7 @@ fn schedule_launch_update_check(window: &libadwaita::ApplicationWindow) {
         std::thread::spawn(move || {
             let result = crate::updater::check_for_update();
             glib::MainContext::default().invoke(move || {
-                if let Ok(Some(info)) = result {
+                if let Ok(Some(crate::updater::UpdateCheckResult::UpdateAvailable(info))) = result {
                     if let Some(win) = win_send.upgrade() {
                         present_update_dialog(&win, info);
                     }
@@ -5603,7 +5603,20 @@ fn run_manual_update_check(window: &libadwaita::ApplicationWindow) {
                 return;
             };
             match result {
-                Ok(Some(info)) => present_update_dialog(&w, info),
+                Ok(Some(crate::updater::UpdateCheckResult::UpdateAvailable(info))) => {
+                    present_update_dialog(&w, info);
+                }
+                Ok(Some(crate::updater::UpdateCheckResult::UpToDate { version })) => {
+                    let body = format!("you are on the latest update ({version})");
+                    let dlg = libadwaita::AlertDialog::new(None, Some(&body));
+                    dlg.add_response("ok", "OK");
+                    dlg.set_default_response(Some("ok"));
+                    dlg.set_close_response("ok");
+                    dlg.connect_response(None, |d, _| {
+                        d.close();
+                    });
+                    dlg.present(Some(&w));
+                }
                 Ok(None) => show_simple_alert(&w, "Up to date", "You are already running the latest release."),
                 Err(e) => show_simple_alert(
                     &w,

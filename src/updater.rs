@@ -40,6 +40,17 @@ pub struct UpdateInfo {
     pub asset_name: String,
 }
 
+/// Outcome of comparing this build to GitHub's latest release.
+#[derive(Debug, Clone)]
+pub enum UpdateCheckResult {
+    UpdateAvailable(UpdateInfo),
+    /// Latest GitHub release tag matches or is older than this build.
+    UpToDate {
+        /// Semver from the release tag (for display).
+        version: Version,
+    },
+}
+
 pub fn packaged_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION must be semver")
 }
@@ -72,8 +83,9 @@ fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
     }
 }
 
-/// `GET /repos/.../releases/latest`. Returns `Ok(None)` when already up to date or no matching asset.
-pub fn check_for_update() -> Result<Option<UpdateInfo>> {
+/// `GET /repos/.../releases/latest`. Returns `Ok(None)` when unsupported or a newer release exists
+/// but has no asset for this platform.
+pub fn check_for_update() -> Result<Option<UpdateCheckResult>> {
     #[cfg(not(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "x86_64")
@@ -98,20 +110,22 @@ pub fn check_for_update() -> Result<Option<UpdateInfo>> {
     let remote_ver = parse_release_version(&release.tag_name)?;
     let current = packaged_version();
     if remote_ver <= current {
-        return Ok(None);
+        return Ok(Some(UpdateCheckResult::UpToDate {
+            version: remote_ver,
+        }));
     }
 
     let Some(asset) = pick_asset(&release.assets) else {
         return Ok(None);
     };
 
-    Ok(Some(UpdateInfo {
+    Ok(Some(UpdateCheckResult::UpdateAvailable(UpdateInfo {
         version: remote_ver,
         tag_name: release.tag_name.clone(),
         release_page_url: release.html_url,
         download_url: asset.browser_download_url.clone(),
         asset_name: asset.name.clone(),
-    }))
+    })))
 }
 
 fn download_bytes(url: &str) -> Result<Vec<u8>> {
