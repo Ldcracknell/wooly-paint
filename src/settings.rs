@@ -6,6 +6,9 @@ use libadwaita::ColorScheme;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Max paths kept in File → Recent Files and in settings.json.
+pub const MAX_RECENT_FILES: usize = 5;
+
 const CONFIG_DIR: &str = "wooly-paint";
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -15,6 +18,8 @@ struct FileSettings {
     color_scheme: String,
     #[serde(default)]
     tool_keybinds: Vec<StoredBind>,
+    #[serde(default)]
+    recent_files: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +124,13 @@ pub fn load_into(state: &mut AppState) -> &'static str {
     if !parsed.tool_keybinds.is_empty() {
         state.tool_keybinds = merge_keybinds(&parsed.tool_keybinds);
     }
+    state.recent_files = parsed
+        .recent_files
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .take(MAX_RECENT_FILES)
+        .collect();
     normalized_theme(parsed.color_scheme.trim())
 }
 
@@ -134,9 +146,15 @@ pub fn persist(state: &AppState) {
             key: k.map(|c| c.to_string()),
         })
         .collect();
+    let recent_files: Vec<String> = state
+        .recent_files
+        .iter()
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect();
     let data = FileSettings {
         color_scheme: theme.to_string(),
         tool_keybinds: binds,
+        recent_files,
     };
     let path = config_path();
     if let Some(parent) = path.parent() {
@@ -145,4 +163,12 @@ pub fn persist(state: &AppState) {
     if let Ok(json) = serde_json::to_string_pretty(&data) {
         let _ = std::fs::write(path, json);
     }
+}
+
+/// Move `path` to the front of the recent list (deduped), cap at [`MAX_RECENT_FILES`], persist.
+pub fn record_recent_open(state: &mut AppState, path: PathBuf) {
+    state.recent_files.retain(|p| p != &path);
+    state.recent_files.insert(0, path);
+    state.recent_files.truncate(MAX_RECENT_FILES);
+    persist(state);
 }

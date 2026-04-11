@@ -10,7 +10,8 @@ winres = "0.1"
 [dependencies]
 gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Raster import: decode to RGBA via `image` (flat files). ORA stays a separate path (layers + zip).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 anyhow = "1.0"
 gdk-pixbuf = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }

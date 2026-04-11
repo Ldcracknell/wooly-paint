@@ -29,7 +29,9 @@ use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
+use gtk::prelude::MenuModelExt;
 
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
@@ -2040,26 +2042,104 @@ fn try_paste_system_clipboard(
     );
 }
 
+fn recent_file_menu_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn refresh_recent_files_menu(menu: &gio::Menu, state: &AppState) {
+    while menu.n_items() > 0 {
+        menu.remove(0);
+    }
+    for path in &state.recent_files {
+        let label = recent_file_menu_label(path);
+        let item = gio::MenuItem::new(Some(&label), None);
+        let ps = path.to_string_lossy();
+        let v = ps.as_ref().to_variant();
+        item.set_action_and_target_value(Some("win.open_recent"), Some(&v));
+        menu.append_item(&item);
+    }
+}
+
+fn open_document_from_path(
+    path: &Path,
+    state: &SharedState,
+    layers_cell: &LayersCell,
+    canvas: &CanvasCell,
+    recent_menu: &gio::Menu,
+) {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let result = if ext.as_deref() == Some("ora") {
+        Document::load_ora(path)
+    } else {
+        Document::load_raster_image(path)
+    };
+    match result {
+        Ok(doc) => {
+            let path_buf = path.to_path_buf();
+            let mut g = state.borrow_mut();
+            g.doc = doc;
+            g.history.clear();
+            g.doc.path = Some(path_buf.clone());
+            g.modified = false;
+            g.selection = None;
+            g.floating = None;
+            g.floating_drag = None;
+            g.shape_drag_preview = None;
+            g.drag_start_doc = None;
+            g.bump_document_revision();
+            crate::settings::record_recent_open(&mut g, path_buf);
+            drop(g);
+            refresh_recent_files_menu(recent_menu, &state.borrow());
+            zoom_to_fit(state, canvas);
+            refresh_layers_list(state, layers_cell, canvas);
+            queue_canvas(canvas);
+        }
+        Err(e) => {
+            eprintln!("Open failed: {e}");
+        }
+    }
+}
+
 fn open_file(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    recent_menu: &gio::Menu,
 ) {
     let all_filter = gtk::FileFilter::new();
-    all_filter.set_name(Some("All supported (*.png, *.ora)"));
-    all_filter.add_pattern("*.png");
-    all_filter.add_pattern("*.ora");
+    all_filter.set_name(Some("All supported images"));
+    for pat in [
+        "*.ora", "*.png", "*.jpg", "*.jpeg", "*.jpe", "*.webp", "*.gif", "*.bmp",
+    ] {
+        all_filter.add_pattern(pat);
+    }
     let png_filter = gtk::FileFilter::new();
-    png_filter.set_name(Some("PNG image (*.png)"));
+    png_filter.set_name(Some("PNG (*.png)"));
     png_filter.add_pattern("*.png");
     let ora_filter = gtk::FileFilter::new();
     ora_filter.set_name(Some("OpenRaster (*.ora)"));
     ora_filter.add_pattern("*.ora");
+    let jpeg_filter = gtk::FileFilter::new();
+    jpeg_filter.set_name(Some("JPEG (*.jpg, *.jpeg)"));
+    for pat in ["*.jpg", "*.jpeg", "*.jpe"] {
+        jpeg_filter.add_pattern(pat);
+    }
+    let webp_filter = gtk::FileFilter::new();
+    webp_filter.set_name(Some("WebP (*.webp)"));
+    webp_filter.add_pattern("*.webp");
 
     let filters = gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&all_filter);
     filters.append(&png_filter);
+    filters.append(&jpeg_filter);
+    filters.append(&webp_filter);
     filters.append(&ora_filter);
 
     let dlg = gtk::FileDialog::builder()
@@ -2071,38 +2151,33 @@ fn open_file(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let recent_m = recent_menu.clone();
     dlg.open(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
             if let Some(path) = file.path() {
-                let result = match path.extension().and_then(|e| e.to_str()) {
-                    Some("ora") => Document::load_ora(&path),
-                    _ => Document::load_png(&path),
-                };
-                match result {
-                    Ok(doc) => {
-                        let mut g = st.borrow_mut();
-                        g.doc = doc;
-                        g.history.clear();
-                        g.doc.path = Some(path);
-                        g.modified = false;
-                        g.selection = None;
-                        g.floating = None;
-                        g.floating_drag = None;
-                        g.shape_drag_preview = None;
-                        g.drag_start_doc = None;
-                        g.bump_document_revision();
-                        drop(g);
-                        zoom_to_fit(&st, &cv);
-                        refresh_layers_list(&st, &lc, &cv);
-                        queue_canvas(&cv);
-                    }
-                    Err(e) => {
-                        eprintln!("Open failed: {e}");
-                    }
-                }
+                open_document_from_path(&path, &st, &lc, &cv, &recent_m);
             }
         }
     });
+}
+
+/// Save to the document's current path. Returns `false` if there is no path or the write fails.
+fn try_save_to_current_path(state: &SharedState) -> bool {
+    let Some(path) = state.borrow().doc.path.clone() else {
+        return false;
+    };
+    let mut g = state.borrow_mut();
+    let result = match path.extension().and_then(|e| e.to_str()) {
+        Some("ora") => g.doc.save_ora(&path),
+        _ => g.doc.save_png(&path),
+    };
+    if let Err(e) = result {
+        eprintln!("Save failed: {e}");
+        false
+    } else {
+        g.modified = false;
+        true
+    }
 }
 
 fn save_file_as(
@@ -2110,6 +2185,7 @@ fn save_file_as(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    on_success: Option<Rc<dyn Fn()>>,
 ) {
     let png_filter = gtk::FileFilter::new();
     png_filter.set_name(Some("PNG image (*.png)"));
@@ -2131,6 +2207,7 @@ fn save_file_as(
     let st = state.clone();
     let cv = canvas.clone();
     let _lc = layers_cell.clone();
+    let on_ok = on_success.clone();
     dlg.save(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
             if let Some(mut path) = file.path() {
@@ -2147,6 +2224,9 @@ fn save_file_as(
                 } else {
                     g.doc.path = Some(path);
                     g.modified = false;
+                    if let Some(cb) = &on_ok {
+                        cb();
+                    }
                 }
                 drop(g);
                 queue_canvas(&cv);
@@ -2161,20 +2241,10 @@ fn save_file(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
 ) {
-    let path_opt = state.borrow().doc.path.clone();
-    if let Some(path) = path_opt {
-        let mut g = state.borrow_mut();
-        let result = match path.extension().and_then(|e| e.to_str()) {
-            Some("ora") => g.doc.save_ora(&path),
-            _ => g.doc.save_png(&path),
-        };
-        if let Err(e) = result {
-            eprintln!("Save failed: {e}");
-        } else {
-            g.modified = false;
-        }
+    if state.borrow().doc.path.is_some() {
+        let _ = try_save_to_current_path(state);
     } else {
-        save_file_as(window, state, layers_cell, canvas);
+        save_file_as(window, state, layers_cell, canvas, None);
     }
 }
 
@@ -2476,6 +2546,8 @@ fn build_ui(app: &Application) {
     let loaded_theme = crate::settings::load_into(&mut initial_state);
     libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(loaded_theme));
     let state: SharedState = Rc::new(RefCell::new(initial_state));
+    let recent_files_menu = Rc::new(gio::Menu::new());
+    refresh_recent_files_menu(&recent_files_menu, &state.borrow());
 
     let st_shutdown = state.clone();
     app.connect_shutdown(move |_| {
@@ -2882,6 +2954,7 @@ fn build_ui(app: &Application) {
         &canvas_cell,
         &tool_dd_cell,
         &tool_strings,
+        recent_files_menu.clone(),
     );
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
 
@@ -2903,6 +2976,7 @@ fn build_ui(app: &Application) {
     let cv_k = canvas_cell.clone();
     let win_k = window.clone();
     let td_k = tool_dd_cell.clone();
+    let recent_k = recent_files_menu.clone();
     key.connect_key_pressed(move |_c, keyval, _code, state_m| {
         let ctrl = state_m.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = state_m.contains(gdk::ModifierType::SHIFT_MASK);
@@ -2926,7 +3000,7 @@ fn build_ui(app: &Application) {
                 glib::Propagation::Stop
             }
             gdk::Key::o | gdk::Key::O if ctrl => {
-                open_file(&win_k, &st_k, &lc_k, &cv_k);
+                open_file(&win_k, &st_k, &lc_k, &cv_k, &recent_k);
                 glib::Propagation::Stop
             }
             gdk::Key::s | gdk::Key::S if ctrl => {
@@ -2999,6 +3073,60 @@ fn build_ui(app: &Application) {
         da_shutdown.unset_draw_func();
         preview_shutdown.unset_draw_func();
         st_shutdown.borrow_mut().release_drawing_caches();
+    });
+
+    let st_close = state.clone();
+    let lc_close = layers_cell.clone();
+    let cv_close = canvas_cell.clone();
+    window.connect_close_request(move |win| {
+        if !st_close.borrow().modified {
+            return glib::Propagation::Proceed;
+        }
+        let dlg = libadwaita::AlertDialog::new(
+            Some("Save changes before closing?"),
+            Some("If you don't save, your changes will be lost."),
+        );
+        dlg.add_responses(&[
+            ("cancel", "Cancel"),
+            ("discard", "Quit without saving"),
+            ("save", "Save and quit"),
+        ]);
+        dlg.set_close_response("cancel");
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
+        dlg.set_response_appearance("save", libadwaita::ResponseAppearance::Suggested);
+
+        let win_parent = win.clone();
+        let win = win.clone();
+        let st = st_close.clone();
+        let lc = lc_close.clone();
+        let cv = cv_close.clone();
+        dlg.choose(Some(&win_parent), None::<&gio::Cancellable>, move |response| {
+            match response.as_str() {
+                "save" => {
+                    if st.borrow().doc.path.is_some() {
+                        if try_save_to_current_path(&st) {
+                            win.close();
+                        }
+                    } else {
+                        let win_done = win.clone();
+                        save_file_as(
+                            &win,
+                            &st,
+                            &lc,
+                            &cv,
+                            Some(Rc::new(move || win_done.close())),
+                        );
+                    }
+                }
+                "discard" => {
+                    st.borrow_mut().modified = false;
+                    win.close();
+                }
+                _ => {}
+            }
+        });
+        glib::Propagation::Stop
     });
 
     window.present();
@@ -3168,14 +3296,15 @@ fn build_menu(
     canvas: &CanvasCell,
     tool_dd_cell: &ToolDdCell,
     tool_strings: &gtk::StringList,
+    recent_menu: Rc<gio::Menu>,
 ) -> gio::Menu {
     let menu = gio::Menu::new();
     let file = gio::Menu::new();
     file.append(Some("New…"), Some("win.new"));
     file.append(Some("Open…"), Some("win.open"));
+    file.append_submenu(Some("Recent Files"), &*recent_menu);
     file.append(Some("Save"), Some("win.save"));
     file.append(Some("Save As…"), Some("win.save_as"));
-    file.append(Some("Quit"), Some("win.quit"));
     menu.append_submenu(Some("_File"), &file);
 
     let settings = gio::Menu::new();
@@ -3203,11 +3332,28 @@ fn build_menu(
     let lc = layers_cell.clone();
     let cv = canvas.clone();
     let w = window.clone();
+    let recent_open = recent_menu.clone();
     let open_act = gio::SimpleAction::new("open", None);
     open_act.connect_activate(move |_, _| {
-        open_file(&w, &st, &lc, &cv);
+        open_file(&w, &st, &lc, &cv, &recent_open);
     });
     app_add_action(window, &open_act);
+
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let recent_pick = recent_menu.clone();
+    let open_recent_act = gio::SimpleAction::new("open_recent", Some(glib::VariantTy::STRING));
+    open_recent_act.connect_activate(move |_, param| {
+        let Some(p) = param else {
+            return;
+        };
+        let Some(s) = p.get::<String>() else {
+            return;
+        };
+        open_document_from_path(Path::new(&s), &st, &lc, &cv, &recent_pick);
+    });
+    app_add_action(window, &open_recent_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
@@ -3225,16 +3371,9 @@ fn build_menu(
     let w = window.clone();
     let save_as_act = gio::SimpleAction::new("save_as", None);
     save_as_act.connect_activate(move |_, _| {
-        save_file_as(&w, &st, &lc, &cv);
+        save_file_as(&w, &st, &lc, &cv, None);
     });
     app_add_action(window, &save_as_act);
-
-    let win_q = window.clone();
-    let quit_act = gio::SimpleAction::new("quit", None);
-    quit_act.connect_activate(move |_, _| {
-        win_q.application().unwrap().quit();
-    });
-    app_add_action(window, &quit_act);
 
     let st = state.clone();
     let cv = canvas.clone();

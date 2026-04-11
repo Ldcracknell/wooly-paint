@@ -1,6 +1,7 @@
 use crate::document::{Document, History};
 use crate::tools::ToolKind;
 use gdk_pixbuf::Pixbuf;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct FloatingSelection {
@@ -83,6 +84,8 @@ pub struct AppState {
     pub tool_keybinds: Vec<(ToolKind, Option<char>)>,
     /// Most recently used foreground colors (straight RGBA), newest first; at most 4 kept.
     pub recent_colors: Vec<[u8; 4]>,
+    /// Recently opened documents (paths), newest first; at most 5 kept.
+    pub recent_files: Vec<PathBuf>,
     /// Bumped when layer pixels, stack, visibility, opacity, or canvas size change (not selection/pan/zoom).
     pub document_visual_revision: u64,
     /// Cached full-document composite (premultiplied RGBA), valid when `composite_cache_at_revision == document_visual_revision`.
@@ -138,6 +141,7 @@ impl AppState {
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),
             recent_colors: Vec::new(),
+            recent_files: Vec::new(),
             document_visual_revision: 0,
             composite_cache_premul: Vec::new(),
             composite_cache_straight: Vec::new(),

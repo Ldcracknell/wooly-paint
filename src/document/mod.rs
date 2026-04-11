@@ -47,7 +47,8 @@ impl Document {
         composite_layers(self.width, self.height, &self.layers)
     }
 
-    pub fn load_png(path: &Path) -> Result<Self> {
+    /// Single-layer import: any raster format enabled on the `image` dependency (not OpenRaster).
+    pub fn load_raster_image(path: &Path) -> Result<Self> {
         let img = image::open(path)
             .with_context(|| format!("open {}", path.display()))?
             .to_rgba8();
