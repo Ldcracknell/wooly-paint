@@ -1,5 +1,6 @@
 # wooly-paint
-this was made entirely with 4.6 and cursor's composer 2 \
+this was made mainly with cursor's composer 2 \
+(and a bit of 4.6 at the start before i ran out of usage) \
 (i have not read a single line of code) \
 this is also completely untested on anything but arch
 
