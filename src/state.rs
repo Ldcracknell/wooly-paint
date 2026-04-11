@@ -1,4 +1,5 @@
 use crate::document::{Document, History};
+use crate::palette::PaletteBook;
 use crate::tools::ToolKind;
 use gdk_pixbuf::Pixbuf;
 use std::path::PathBuf;
@@ -87,11 +88,28 @@ pub enum FloatingDrag {
     },
 }
 
+/// Left vs right mouse button color slots (primary / secondary click).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ColorSlot {
+    #[default]
+    Left,
+    Right,
+}
+
 pub struct AppState {
     pub doc: Document,
     pub history: History,
     pub tool: ToolKind,
+    /// Left mouse button / primary drawing color.
     pub fg: [u8; 4],
+    /// Right mouse button / secondary drawing color.
+    pub bg: [u8; 4],
+    /// GDK button id for the active canvas drag (`BUTTON_PRIMARY` / `BUTTON_SECONDARY`).
+    pub pointer_drag_button: u32,
+    /// Which color the hue/SV picker edits.
+    pub picker_target: ColorSlot,
+    /// Hue for the SV plane and hue strip, 0..1.
+    pub picker_hue: f64,
     pub brush_size: f64,
     pub brush_hardness: f64,
     pub fill_tolerance: u8,
@@ -115,6 +133,8 @@ pub struct AppState {
     pub tool_keybinds: Vec<(ToolKind, Option<char>)>,
     /// Most recently used foreground colors (straight RGBA), newest first; at most 4 kept.
     pub recent_colors: Vec<[u8; 4]>,
+    /// Named palettes (sidebar); first entry is the built-in default.
+    pub palette_book: PaletteBook,
     /// Recently opened documents (paths), newest first; at most 5 kept.
     pub recent_files: Vec<PathBuf>,
     /// Bumped when layer pixels, stack, visibility, opacity, or canvas size change (not selection/pan/zoom).
@@ -131,6 +151,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Paint color for the active pointer drag (left → [`Self::fg`], right → [`Self::bg`]).
+    pub fn active_paint_color(&self) -> [u8; 4] {
+        if self.pointer_drag_button == 3 {
+            self.bg
+        } else {
+            self.fg
+        }
+    }
+
     pub fn default_tool_keybinds() -> Vec<(ToolKind, Option<char>)> {
         vec![
             (ToolKind::Brush, Some('b')),
@@ -154,6 +183,10 @@ impl AppState {
             history: History::new(),
             tool: ToolKind::Brush,
             fg: [0, 0, 0, 255],
+            bg: [255, 255, 255, 255],
+            pointer_drag_button: 1,
+            picker_target: ColorSlot::Left,
+            picker_hue: 0.0,
             brush_size: 8.0,
             brush_hardness: 0.1,
             fill_tolerance: 32,
@@ -173,6 +206,7 @@ impl AppState {
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),
             recent_colors: Vec::new(),
+            palette_book: PaletteBook::new_builtin_only(),
             recent_files: Vec::new(),
             document_visual_revision: 0,
             composite_cache_premul: Vec::new(),

@@ -1,5 +1,6 @@
 //! Persistent app preferences (color theme, tool keybinds) under the XDG config directory.
 
+use crate::palette::{NamedPalette, PaletteBook};
 use crate::state::AppState;
 use crate::tools::ToolKind;
 use libadwaita::ColorScheme;
@@ -20,6 +21,10 @@ struct FileSettings {
     tool_keybinds: Vec<StoredBind>,
     #[serde(default)]
     recent_files: Vec<String>,
+    #[serde(default)]
+    palettes: Vec<NamedPalette>,
+    #[serde(default)]
+    active_palette: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +130,9 @@ pub fn load_into(state: &mut AppState) -> &'static str {
     if !parsed.tool_keybinds.is_empty() {
         state.tool_keybinds = merge_keybinds(&parsed.tool_keybinds);
     }
+    if !parsed.palettes.is_empty() {
+        state.palette_book = PaletteBook::from_loaded(parsed.palettes, parsed.active_palette);
+    }
     state.recent_files = parsed
         .recent_files
         .into_iter()
@@ -156,6 +164,8 @@ pub fn persist(state: &AppState) {
         color_scheme: theme.to_string(),
         tool_keybinds: binds,
         recent_files,
+        palettes: state.palette_book.entries.clone(),
+        active_palette: state.palette_book.active,
     };
     let path = config_path();
     if let Some(parent) = path.parent() {

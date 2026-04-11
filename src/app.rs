@@ -2,7 +2,8 @@ use crate::document::{
     composite_layers_into, premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul,
     Document,
 };
-use crate::state::{AppState, FloatingDrag, FloatingSelection, Selection};
+use crate::palette::{self, PaletteBook};
+use crate::state::{AppState, ColorSlot, FloatingDrag, FloatingSelection, Selection};
 use crate::tool_cursors;
 use crate::tools::{
     clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse, draw_rect_outline,
@@ -20,16 +21,16 @@ use gtk::glib;
 use gtk::glib::prelude::Cast;
 use gtk::glib::ControlFlow;
 #[allow(deprecated)]
-use gtk::prelude::ColorChooserExt;
 use gtk::gio::prelude::ApplicationExt as GioApplicationExt;
 use gtk::prelude::DrawingAreaExtManual;
 use gtk::prelude::EventControllerExt;
 use gtk::prelude::GestureDragExt;
+use gtk::prelude::GestureSingleExt;
 use gtk::prelude::RangeExt;
 use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use gtk::prelude::MenuModelExt;
@@ -468,40 +469,89 @@ fn apply_taskbar_icon(native: &impl gtk::prelude::IsA<gtk::Native>) {
     toplevel.set_icon_list(std::slice::from_ref(&texture));
 }
 
-/// Straight RGBA presets shown in the sidebar (black/white, then rainbow, then grays, brown).
-const SIDEBAR_DEFAULT_COLORS: &[[u8; 4]] = &[
-    [0, 0, 0, 255],
-    [255, 255, 255, 255],
-    [255, 0, 0, 255],
-    [255, 128, 0, 255],
-    [255, 200, 0, 255],
-    [0, 160, 0, 255],
-    [0, 220, 220, 255],
-    [0, 100, 255, 255],
-    [160, 0, 255, 255],
-    [255, 0, 200, 255],
-    [64, 64, 64, 255],
-    [128, 128, 128, 255],
-    [192, 192, 192, 255],
-    [139, 90, 43, 255],
-];
-
-fn fg_to_rgba(fg: [u8; 4]) -> gdk::RGBA {
-    gdk::RGBA::new(
-        fg[0] as f32 / 255.0,
-        fg[1] as f32 / 255.0,
-        fg[2] as f32 / 255.0,
-        fg[3] as f32 / 255.0,
-    )
+fn rgb_bytes_to_hsv(c: [u8; 4]) -> (f64, f64, f64) {
+    let r = c[0] as f64 / 255.0;
+    let g = c[1] as f64 / 255.0;
+    let b = c[2] as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d <= 1e-9 {
+        0.0
+    } else if (max - r).abs() <= 1e-9 {
+        ((g - b) / d + if g < b { 6.0 } else { 0.0 }) / 6.0
+    } else if (max - g).abs() <= 1e-9 {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    let s = if max <= 1e-9 { 0.0 } else { d / max };
+    (h.rem_euclid(1.0), s, max)
 }
 
-fn rgba_to_fg(c: &gdk::RGBA) -> [u8; 4] {
-    [
-        (c.red() * 255.0).round().clamp(0.0, 255.0) as u8,
-        (c.green() * 255.0).round().clamp(0.0, 255.0) as u8,
-        (c.blue() * 255.0).round().clamp(0.0, 255.0) as u8,
-        (c.alpha() * 255.0).round().clamp(0.0, 255.0) as u8,
-    ]
+fn hsv_to_rgb01(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let h = h.rem_euclid(1.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let i = (h * 6.0).floor();
+    let f = h * 6.0 - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    match (i as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+fn u8_chan(x: f64) -> u8 {
+    (x.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn write_slot_rgb(st: &mut AppState, slot: ColorSlot, rgb: (f64, f64, f64)) {
+    let (r, g, b) = rgb;
+    let c = match slot {
+        ColorSlot::Left => &mut st.fg,
+        ColorSlot::Right => &mut st.bg,
+    };
+    let a = c[3];
+    *c = [u8_chan(r), u8_chan(g), u8_chan(b), a];
+}
+
+fn apply_sv_pick(
+    state: &SharedState,
+    sv_area: &gtk::DrawingArea,
+    fg_bg: &gtk::DrawingArea,
+    canvas: &CanvasCell,
+    x: f64,
+    y: f64,
+) {
+    let w = sv_area.width() as f64;
+    let h = sv_area.height() as f64;
+    if w <= 1.0 || h <= 1.0 {
+        return;
+    }
+    let s = (x / w).clamp(0.0, 1.0);
+    let v = 1.0 - (y / h).clamp(0.0, 1.0);
+    let mut g = state.borrow_mut();
+    let hh = g.picker_hue;
+    let slot = g.picker_target;
+    let rgb = hsv_to_rgb01(hh, s, v);
+    write_slot_rgb(&mut g, slot, rgb);
+    drop(g);
+    sv_area.queue_draw();
+    fg_bg.queue_draw();
+    queue_canvas(canvas);
+}
+
+fn sync_hue_adj_ui(sup: &Cell<bool>, adj: &gtk::Adjustment, hue01: f64) {
+    sup.set(true);
+    adj.set_value((hue01.rem_euclid(1.0)) * 360.0);
+    sup.set(false);
 }
 
 fn push_recent_color(st: &mut AppState, fg: [u8; 4]) {
@@ -510,11 +560,27 @@ fn push_recent_color(st: &mut AppState, fg: [u8; 4]) {
     st.recent_colors.truncate(4);
 }
 
-fn swatch_button(fg: [u8; 4]) -> gtk::Button {
-    let da = gtk::DrawingArea::builder()
-        .width_request(24)
-        .height_request(24)
-        .build();
+/// `fill_cell`: use for palette grids — color fills the whole tile and grows with sidebar width.
+fn swatch_button(fg: [u8; 4], fill_cell: bool) -> gtk::Button {
+    let da = if fill_cell {
+        gtk::DrawingArea::builder()
+            .width_request(20)
+            .height_request(26)
+            .hexpand(true)
+            .vexpand(true)
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .build()
+    } else {
+        gtk::DrawingArea::builder()
+            .width_request(22)
+            .height_request(22)
+            .hexpand(false)
+            .vexpand(false)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build()
+    };
     let r = fg[0] as f64 / 255.0;
     let g = fg[1] as f64 / 255.0;
     let b = fg[2] as f64 / 255.0;
@@ -528,33 +594,547 @@ fn swatch_button(fg: [u8; 4]) -> gtk::Button {
         cr.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
         let _ = cr.stroke();
     });
-    let btn = gtk::Button::builder().child(&da).css_classes(["flat"]).build();
+    let btn = if fill_cell {
+        gtk::Button::builder()
+            .child(&da)
+            .css_classes(["flat"])
+            .hexpand(true)
+            .vexpand(true)
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .build()
+    } else {
+        gtk::Button::builder()
+            .child(&da)
+            .css_classes(["flat"])
+            .hexpand(false)
+            .vexpand(false)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build()
+    };
     btn.set_tooltip_text(Some(&format!("RGB {}, {}, {}", fg[0], fg[1], fg[2])));
     btn
 }
 
-fn make_color_preview_area(state: &SharedState) -> gtk::DrawingArea {
+#[derive(Clone)]
+struct PaletteSidebar {
+    flow: gtk::FlowBox,
+    dropdown: gtk::DropDown,
+    strings: gtk::StringList,
+    preview: gtk::DrawingArea,
+    recent: gtk::FlowBox,
+    canvas: CanvasCell,
+    hue_suppress: Rc<Cell<bool>>,
+    hue_adj: gtk::Adjustment,
+    sv_area: gtk::DrawingArea,
+}
+
+fn sync_palette_dropdown_model(book: &PaletteBook, strings: &gtk::StringList, dd: &gtk::DropDown) {
+    let names: Vec<&str> = book.entries.iter().map(|e| e.name.as_str()).collect();
+    strings.splice(0, strings.n_items(), &names);
+    let sel = book.active.min(book.entries.len().saturating_sub(1));
+    dd.set_selected(sel as u32);
+}
+
+fn fill_palette_swatches(ps: &PaletteSidebar, state: &SharedState) {
+    let flow = &ps.flow;
+    while let Some(c) = flow.first_child() {
+        flow.remove(&c);
+    }
+    let colors: Vec<[u8; 4]> = state.borrow().palette_book.active_colors().to_vec();
+    for &col in &colors {
+        let btn = swatch_button(col, true);
+        let st_pal = state.clone();
+        let prev_pal = ps.preview.clone();
+        let cv_pal = ps.canvas.clone();
+        let rf_pal = ps.recent.clone();
+        let sup = ps.hue_suppress.clone();
+        let adj = ps.hue_adj.clone();
+        let sv = ps.sv_area.clone();
+        let gc = gtk::GestureClick::new();
+        gc.set_button(0);
+        gc.connect_pressed(move |gesture, _, _, _| {
+            let btn_id = gesture.current_button();
+            let hue01 = {
+                let mut g = st_pal.borrow_mut();
+                let new_c = if btn_id == gdk::BUTTON_SECONDARY {
+                    g.bg = col;
+                    g.picker_target = ColorSlot::Right;
+                    g.bg
+                } else {
+                    g.fg = col;
+                    g.picker_target = ColorSlot::Left;
+                    push_recent_color(&mut g, col);
+                    g.fg
+                };
+                let (h, _, _) = rgb_bytes_to_hsv(new_c);
+                g.picker_hue = h;
+                h
+            };
+            sync_hue_adj_ui(sup.as_ref(), &adj, hue01);
+            prev_pal.queue_draw();
+            sv.queue_draw();
+            queue_canvas(&cv_pal);
+            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &cv_pal);
+        });
+        btn.add_controller(gc);
+        flow.append(&btn);
+    }
+}
+
+fn refresh_palette_sidebar_full(ps: &PaletteSidebar, state: &SharedState) {
+    let book = state.borrow().palette_book.clone();
+    sync_palette_dropdown_model(&book, &ps.strings, &ps.dropdown);
+    fill_palette_swatches(ps, state);
+}
+
+fn sanitize_palette_filename_base(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "palette".to_string()
+    } else {
+        s
+    }
+}
+
+fn import_palette_file(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    ps: &PaletteSidebar,
+) {
+    let text_filter = gtk::FileFilter::new();
+    text_filter.set_name(Some("Hex palette"));
+    for pat in ["*.hex", "*.txt", "*.pal"] {
+        text_filter.add_pattern(pat);
+    }
+    let all_filter = gtk::FileFilter::new();
+    all_filter.set_name(Some("All files"));
+    all_filter.add_pattern("*");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&text_filter);
+    filters.append(&all_filter);
+    let dlg = gtk::FileDialog::builder()
+        .title("Import palette")
+        .modal(true)
+        .filters(&filters)
+        .default_filter(&text_filter)
+        .build();
+    let st = state.clone();
+    let psc = ps.clone();
+    let w_err = window.clone();
+    dlg.open(Some(window), None::<&gio::Cancellable>, move |res| {
+        if let Ok(file) = res {
+            let Some(path) = file.path() else {
+                return;
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Imported")
+                .to_string();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Read failed: {e}");
+                    return;
+                }
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let colors = match palette::parse_hex_palette_text(&text) {
+                Ok(c) => c,
+                Err(msg) => {
+                    let w = w_err.clone();
+                    glib::idle_add_local_once(move || {
+                        show_simple_alert(&w, "Import failed", &msg);
+                    });
+                    return;
+                }
+            };
+            glib::idle_add_local_once(move || {
+                {
+                    let mut g = st.borrow_mut();
+                    g.palette_book.push_palette(stem, colors);
+                }
+                crate::settings::persist(&st.borrow());
+                refresh_palette_sidebar_full(&psc, &st);
+            });
+        }
+    });
+}
+
+fn export_palette_file(window: &libadwaita::ApplicationWindow, state: &SharedState) {
+    let (default_name, body) = {
+        let g = state.borrow();
+        let name = g.palette_book.active_palette().name.clone();
+        let body = palette::format_hex_palette(g.palette_book.active_colors());
+        (name, body)
+    };
+    let text_filter = gtk::FileFilter::new();
+    text_filter.set_name(Some("Hex text (*.hex)"));
+    text_filter.add_pattern("*.hex");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&text_filter);
+    let initial = format!("{}.hex", sanitize_palette_filename_base(&default_name));
+    let dlg = gtk::FileDialog::builder()
+        .title("Export palette")
+        .modal(true)
+        .filters(&filters)
+        .default_filter(&text_filter)
+        .initial_name(&initial)
+        .build();
+    let w_alert = window.clone();
+    dlg.save(Some(window), None::<&gio::Cancellable>, move |res| {
+        if let Ok(file) = res {
+            let Some(mut path) = file.path() else {
+                return;
+            };
+            if path.extension().is_none() {
+                path.set_extension("hex");
+            }
+            if let Err(e) = std::fs::write(&path, body.as_str()) {
+                let w = w_alert.clone();
+                let es = e.to_string();
+                glib::idle_add_local_once(move || {
+                    show_simple_alert(&w, "Export failed", &es);
+                });
+            }
+        }
+    });
+}
+
+fn manage_palettes_dialog(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    ps: &PaletteSidebar,
+) {
+    let d = libadwaita::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Manage palettes")
+        .default_width(380)
+        .default_height(320)
+        .resizable(true)
+        .build();
+
+    let strings = gtk::StringList::new(&[]);
+    let dd = gtk::DropDown::new(Some(strings.clone()), gtk::Expression::NONE);
+    dd.set_hexpand(true);
+
+    let rename_entry = gtk::Entry::builder()
+        .placeholder_text("New name")
+        .hexpand(true)
+        .build();
+
+    let sync_dd = {
+        let st = state.clone();
+        let strings_c = strings.clone();
+        let dd_c = dd.clone();
+        Rc::new(move || {
+            let book = st.borrow().palette_book.clone();
+            let names: Vec<&str> = book.entries.iter().map(|e| e.name.as_str()).collect();
+            strings_c.splice(0, strings_c.n_items(), &names);
+            let sel = book.active.min(book.entries.len().saturating_sub(1));
+            dd_c.set_selected(sel as u32);
+        })
+    };
+
+    let refresh_main = {
+        let st = state.clone();
+        let psc = ps.clone();
+        Rc::new(move || {
+            refresh_palette_sidebar_full(&psc, &st);
+        })
+    };
+
+    sync_dd();
+
+    let st_sel = state.clone();
+    let ren_sel = rename_entry.clone();
+    dd.connect_selected_notify(move |dropdown| {
+        let i = dropdown.selected() as usize;
+        let g = st_sel.borrow();
+        if let Some(e) = g.palette_book.entries.get(i) {
+            ren_sel.set_text(&e.name);
+        }
+    });
+    let init_name = {
+        let g = state.borrow();
+        g.palette_book
+            .entries
+            .get(g.palette_book.active)
+            .map(|e| e.name.clone())
+    };
+    if let Some(name) = init_name {
+        rename_entry.set_text(&name);
+    }
+
+    let dup_btn = gtk::Button::with_label("Duplicate");
+    let new_btn = gtk::Button::with_label("New empty");
+    let del_btn = gtk::Button::with_label("Delete");
+    let ren_btn = gtk::Button::with_label("Rename");
+
+    let st_d = state.clone();
+    let dd_d = dd.clone();
+    let sync_d = sync_dd.clone();
+    let refresh_d = refresh_main.clone();
+    dup_btn.connect_clicked(move |_| {
+        let i = dd_d.selected() as usize;
+        let ok = {
+            let mut g = st_d.borrow_mut();
+            g.palette_book.duplicate_entry(i)
+        };
+        if ok {
+            crate::settings::persist(&st_d.borrow());
+            sync_d();
+            refresh_d();
+        }
+    });
+
+    let st_n = state.clone();
+    let dd_n = dd.clone();
+    let strings_n = strings.clone();
+    let sync_n = sync_dd.clone();
+    let refresh_n = refresh_main.clone();
+    new_btn.connect_clicked(move |_| {
+        {
+            let mut g = st_n.borrow_mut();
+            g.palette_book.new_empty_swatch();
+        }
+        crate::settings::persist(&st_n.borrow());
+        sync_n();
+        dd_n.set_selected(strings_n.n_items().saturating_sub(1));
+        refresh_n();
+    });
+
+    let st_r = state.clone();
+    let dd_r = dd.clone();
+    let sync_r = sync_dd.clone();
+    let refresh_r = refresh_main.clone();
+    let ren_e = rename_entry.clone();
+    let w_ren = window.clone();
+    ren_btn.connect_clicked(move |_| {
+        let i = dd_r.selected() as usize;
+        let new_name = ren_e.text().to_string();
+        let ok = {
+            let mut g = st_r.borrow_mut();
+            g.palette_book.rename(i, &new_name)
+        };
+        if !ok {
+            show_simple_alert(&w_ren, "Rename failed", "Enter a non-empty name.");
+            return;
+        }
+        crate::settings::persist(&st_r.borrow());
+        sync_r();
+        refresh_r();
+    });
+
+    let st_x = state.clone();
+    let dd_x = dd.clone();
+    let sync_x = sync_dd.clone();
+    let refresh_x = refresh_main.clone();
+    let w_x = window.clone();
+    del_btn.connect_clicked(move |_| {
+        let i = dd_x.selected() as usize;
+        if i == 0 {
+            show_simple_alert(
+                &w_x,
+                "Cannot delete",
+                "The first palette is the built-in default and cannot be removed.",
+            );
+            return;
+        }
+        let removed = {
+            let mut g = st_x.borrow_mut();
+            g.palette_book.remove_at(i)
+        };
+        if !removed {
+            show_simple_alert(&w_x, "Cannot delete", "Keep at least one palette.");
+            return;
+        }
+        crate::settings::persist(&st_x.borrow());
+        sync_x();
+        refresh_x();
+    });
+
+    if state.borrow().palette_book.entries.len() <= 1 {
+        del_btn.set_sensitive(false);
+    }
+
+    let row1 = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    row1.append(&dup_btn);
+    row1.append(&new_btn);
+    row1.append(&del_btn);
+
+    let row2 = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .build();
+    row2.append(&rename_entry);
+    row2.append(&ren_btn);
+
+    let bx = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .spacing(12)
+        .build();
+    bx.append(&gtk::Label::new(Some("Palette")));
+    bx.append(&dd);
+    bx.append(&row1);
+    bx.append(&gtk::Label::new(Some("Rename selected")));
+    bx.append(&row2);
+
+    let close = gtk::Button::with_label("Close");
+    let d_close = d.clone();
+    close.connect_clicked(move |_| d_close.close());
+
+    let btn_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    btn_row.append(&close);
+
+    bx.append(&btn_row);
+    d.set_content(Some(&bx));
+
+    let st_close = state.clone();
+    let psc_close = ps.clone();
+    d.connect_close_request(move |_| {
+        st_close.borrow_mut().palette_book.clamp_active();
+        crate::settings::persist(&st_close.borrow());
+        refresh_palette_sidebar_full(&psc_close, &st_close);
+        glib::Propagation::Proceed
+    });
+
+    d.present();
+}
+
+/// Overlapping squares: back square = secondary (right-click paint), front = primary (left-click paint).
+/// Left-click anywhere swaps primary and secondary. Right-click a square chooses which slot the hue/SV picker edits.
+fn make_fg_bg_selector(
+    state: &SharedState,
+    canvas: &CanvasCell,
+    hue_suppress: &Rc<Cell<bool>>,
+    hue_adj: &gtk::Adjustment,
+    sv_da: &gtk::DrawingArea,
+) -> gtk::DrawingArea {
+    const BG_X: f64 = 2.0;
+    const BG_Y: f64 = 2.0;
+    const SQ: f64 = 26.0;
+    const FG_X: f64 = 18.0;
+    const FG_Y: f64 = 18.0;
+
     let da = gtk::DrawingArea::builder()
-        .width_request(44)
-        .height_request(44)
+        .width_request(50)
+        .height_request(42)
+        .hexpand(false)
+        .vexpand(false)
+        .tooltip_text(
+            "Back = secondary (right-click paint), front = primary (left-click). Left-click: swap colors. Right-click a square: edit that slot in the picker below.",
+        )
         .build();
     let st_draw = state.clone();
-    da.set_draw_func(move |_d, cr, w, h| {
+    da.set_draw_func(move |_d, cr, _w, _h| {
         let st = st_draw.borrow();
         let fg = st.fg;
-        cr.set_source_rgba(
-            fg[0] as f64 / 255.0,
-            fg[1] as f64 / 255.0,
-            fg[2] as f64 / 255.0,
-            fg[3] as f64 / 255.0,
-        );
-        cr.rectangle(0.0, 0.0, w as f64, h as f64);
-        let _ = cr.fill();
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.4);
-        cr.set_line_width(1.0);
-        cr.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
-        let _ = cr.stroke();
+        let bg = st.bg;
+        let pick = st.picker_target;
+        let fill = |cr: &gtk::cairo::Context, c: [u8; 4], x: f64, y: f64, highlight: bool| {
+            cr.set_source_rgba(
+                c[0] as f64 / 255.0,
+                c[1] as f64 / 255.0,
+                c[2] as f64 / 255.0,
+                c[3] as f64 / 255.0,
+            );
+            cr.rectangle(x, y, SQ, SQ);
+            let _ = cr.fill();
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+            cr.set_line_width(1.0);
+            cr.rectangle(x + 0.5, y + 0.5, SQ - 1.0, SQ - 1.0);
+            let _ = cr.stroke();
+            if highlight {
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+                cr.set_line_width(2.0);
+                cr.rectangle(x + 2.0, y + 2.0, SQ - 4.0, SQ - 4.0);
+                let _ = cr.stroke();
+            }
+        };
+        fill(cr, bg, BG_X, BG_Y, pick == ColorSlot::Right);
+        fill(cr, fg, FG_X, FG_Y, pick == ColorSlot::Left);
     });
+
+    let click = gtk::GestureClick::new();
+    let st = state.clone();
+    let cv = canvas.clone();
+    let da_c = da.clone();
+    let sup_c = hue_suppress.clone();
+    let adj_c = hue_adj.clone();
+    let sv_c = sv_da.clone();
+    click.connect_pressed(move |gesture, n_press, x, y| {
+        if n_press != 1 {
+            return;
+        }
+        let btn = gesture.current_button();
+        let x = x as f64;
+        let y = y as f64;
+        let in_left = x >= FG_X && x < FG_X + SQ && y >= FG_Y && y < FG_Y + SQ;
+        let in_right = x >= BG_X && x < BG_X + SQ && y >= BG_Y && y < BG_Y + SQ;
+        let slot_at = if in_left {
+            Some(ColorSlot::Left)
+        } else if in_right {
+            Some(ColorSlot::Right)
+        } else {
+            None
+        };
+        if btn == gdk::BUTTON_PRIMARY {
+            let mut g = st.borrow_mut();
+            let t = g.fg;
+            g.fg = g.bg;
+            g.bg = t;
+            drop(g);
+            da_c.queue_draw();
+            sv_c.queue_draw();
+            queue_canvas(&cv);
+            return;
+        }
+        if btn == gdk::BUTTON_SECONDARY {
+            let Some(slot) = slot_at else {
+                return;
+            };
+            let hue01 = {
+                let mut g = st.borrow_mut();
+                g.picker_target = slot;
+                let c = match slot {
+                    ColorSlot::Left => g.fg,
+                    ColorSlot::Right => g.bg,
+                };
+                let (h, _, _) = rgb_bytes_to_hsv(c);
+                g.picker_hue = h;
+                h
+            };
+            sync_hue_adj_ui(sup_c.as_ref(), &adj_c, hue01);
+            da_c.queue_draw();
+            sv_c.queue_draw();
+        }
+    });
+    da.add_controller(click);
     da
 }
 
@@ -568,94 +1148,31 @@ fn refresh_recent_swatch_row(
         flow.remove(&c);
     }
     let recents: Vec<[u8; 4]> = state.borrow().recent_colors.clone();
-    for fg in recents {
-        let btn = swatch_button(fg);
+    for col in recents {
+        let btn = swatch_button(col, false);
         let st = state.clone();
         let prev = preview_da.clone();
         let cv2 = cv.clone();
         let flow2 = flow.clone();
-        btn.connect_clicked(move |_| {
+        let gc = gtk::GestureClick::new();
+        gc.set_button(0);
+        gc.connect_pressed(move |gesture, _, _, _| {
             {
                 let mut g = st.borrow_mut();
-                g.fg = fg;
-                push_recent_color(&mut g, fg);
+                if gesture.current_button() == gdk::BUTTON_SECONDARY {
+                    g.bg = col;
+                } else {
+                    g.fg = col;
+                    push_recent_color(&mut g, col);
+                }
             }
             prev.queue_draw();
             queue_canvas(&cv2);
             refresh_recent_swatch_row(&flow2, &st, &prev, &cv2);
         });
+        btn.add_controller(gc);
         flow.append(&btn);
     }
-}
-
-#[allow(deprecated)]
-fn present_custom_color_dialog(
-    parent: &libadwaita::ApplicationWindow,
-    state: &SharedState,
-    preview_da: &gtk::DrawingArea,
-    recent_flow: &gtk::FlowBox,
-    cv: &CanvasCell,
-) {
-    let win = libadwaita::Window::builder()
-        .transient_for(parent)
-        .modal(true)
-        .title("Custom color")
-        .default_width(420)
-        .default_height(460)
-        .resizable(true)
-        .build();
-
-    let chooser = gtk::ColorChooserWidget::new();
-    chooser.set_use_alpha(true);
-    chooser.set_show_editor(true);
-    chooser.set_rgba(&fg_to_rgba(state.borrow().fg));
-
-    let outer = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-    outer.append(&chooser);
-
-    let btn_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
-    let cancel = gtk::Button::with_label("Cancel");
-    let ok = gtk::Button::with_label("OK");
-    btn_row.append(&cancel);
-    btn_row.append(&ok);
-    outer.append(&btn_row);
-    win.set_content(Some(&outer));
-
-    let st_ok = state.clone();
-    let prev_ok = preview_da.clone();
-    let rf_ok = recent_flow.clone();
-    let cv_ok = cv.clone();
-    let w_ok = win.clone();
-    let ch_ok = chooser.clone();
-    ok.connect_clicked(move |_| {
-        let c = ch_ok.rgba();
-        let fg = rgba_to_fg(&c);
-        {
-            let mut g = st_ok.borrow_mut();
-            g.fg = fg;
-            push_recent_color(&mut g, fg);
-        }
-        prev_ok.queue_draw();
-        queue_canvas(&cv_ok);
-        refresh_recent_swatch_row(&rf_ok, &st_ok, &prev_ok, &cv_ok);
-        w_ok.close();
-    });
-
-    let w_cancel = win.clone();
-    cancel.connect_clicked(move |_| w_cancel.close());
-
-    win.present();
 }
 
 fn zoom_to_fit(state: &SharedState, canvas_cell: &CanvasCell) {
@@ -1031,8 +1548,13 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
 }
 
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
-    let (w, h, pan_x, pan_y, zoom, floating, selection, shape_preview, fg, shape_filled, brush_size, brush_hardness) = {
+    let (w, h, pan_x, pan_y, zoom, floating, selection, shape_preview, shape_preview_color, shape_filled, brush_size, brush_hardness) = {
         let st = state.borrow();
+        let preview_c = if st.shape_drag_preview.is_some() {
+            st.active_paint_color()
+        } else {
+            st.fg
+        };
         (
             st.doc.width,
             st.doc.height,
@@ -1042,7 +1564,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             st.floating.clone(),
             st.selection.clone(),
             st.shape_drag_preview,
-            st.fg,
+            preview_c,
             st.shape_filled,
             st.brush_size,
             st.brush_hardness,
@@ -1229,7 +1751,18 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        draw_shape_drag_preview(cr, tool, x0, y0, x1, y1, fg, shape_filled, brush_size, brush_hardness);
+        draw_shape_drag_preview(
+            cr,
+            tool,
+            x0,
+            y0,
+            x1,
+            y1,
+            shape_preview_color,
+            shape_filled,
+            brush_size,
+            brush_hardness,
+        );
         cr.restore().unwrap();
     }
 }
@@ -1296,6 +1829,12 @@ fn paint_brush_drag_sample(
         *last_sample.borrow_mut() = Some((wx, wy));
         return false;
     };
+    let eraser = st.tool == ToolKind::Eraser;
+    let paint_color = if eraser {
+        st.fg
+    } else {
+        st.active_paint_color()
+    };
     let layer = match st.doc.active_layer_mut() {
         Some(l) => l,
         None => return false,
@@ -1311,12 +1850,21 @@ fn paint_brush_drag_sample(
                 cy,
                 radius,
                 st.brush_hardness,
-                st.fg,
-                st.tool == ToolKind::Eraser,
+                paint_color,
+                eraser,
             );
         }
         ToolKind::Pixel => {
-            stroke_line_square(layer, lx, ly, cx, cy, st.brush_size, st.fg, false);
+            stroke_line_square(
+                layer,
+                lx,
+                ly,
+                cx,
+                cy,
+                st.brush_size,
+                paint_color,
+                false,
+            );
         }
         _ => return false,
     }
@@ -1395,6 +1943,7 @@ fn setup_canvas_input(
     let move_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
 
     let drag = gtk::GestureDrag::new();
+    drag.set_button(0);
     let drag_brush_tick = drag.clone();
     let st_drag_begin = state.clone();
     let cv_drag = canvas_cell.clone();
@@ -1405,9 +1954,15 @@ fn setup_canvas_input(
     let mws_b = move_widget_start.clone();
     let cb_drag = color_preview_da_cell.clone();
     let recent_drag = recent_swatches.clone();
-    drag.connect_drag_begin(move |_g, wx, wy| {
+    drag.connect_drag_begin(move |gesture, wx, wy| {
         cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
+        let btn = gesture.current_button();
+        st.pointer_drag_button = if btn == 0 {
+            gdk::BUTTON_PRIMARY
+        } else {
+            btn
+        };
         if st.floating.is_some() && st.tool != ToolKind::Move {
             commit_floating(&mut st);
         }
@@ -1416,8 +1971,12 @@ fn setup_canvas_input(
         let mut start_brush_paint_tick = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser => {
-                let color = st.fg;
                 let eraser = st.tool == ToolKind::Eraser;
+                let color = if eraser {
+                    st.fg
+                } else {
+                    st.active_paint_color()
+                };
                 let radius = st.brush_size * 0.5;
                 let hardness = st.brush_hardness;
                 st.brush_stroke_in_progress = true;
@@ -1434,7 +1993,7 @@ fn setup_canvas_input(
                 start_brush_paint_tick = true;
             }
             ToolKind::Pixel => {
-                let color = st.fg;
+                let color = st.active_paint_color();
                 let size = st.brush_size;
                 st.brush_stroke_in_progress = true;
                 st.begin_stroke_undo();
@@ -1450,7 +2009,7 @@ fn setup_canvas_input(
                 start_brush_paint_tick = true;
             }
             ToolKind::Fill => {
-                let fg = st.fg;
+                let fg = st.active_paint_color();
                 let tol = st.fill_tolerance;
                 let dw = st.doc.width;
                 let dh = st.doc.height;
@@ -1488,8 +2047,12 @@ fn setup_canvas_input(
                     dx.floor() as i32,
                     dy.floor() as i32,
                 );
-                st.fg = c;
-                push_recent_color(&mut st, c);
+                if st.pointer_drag_button == gdk::BUTTON_SECONDARY {
+                    st.bg = c;
+                } else {
+                    st.fg = c;
+                    push_recent_color(&mut st, c);
+                }
                 eyedrop_updated = true;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
@@ -1790,7 +2353,7 @@ fn setup_canvas_input(
                     let cur_wy = start_wy + oy;
                     let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
                     let tool = st.tool;
-                    let color = st.fg;
+                    let color = st.active_paint_color();
                     let filled = st.shape_filled;
                     let r = st.brush_size * 0.5;
                     let h = st.brush_hardness;
@@ -2851,16 +3414,122 @@ fn build_ui(app: &Application) {
 
     let recent_colors_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .homogeneous(true)
-        .max_children_per_line(2)
-        .row_spacing(4)
-        .column_spacing(4)
-        .hexpand(false)
+        .homogeneous(false)
+        .max_children_per_line(4)
+        .row_spacing(2)
+        .column_spacing(2)
+        .hexpand(true)
         .halign(gtk::Align::Start)
         .build();
 
-    let preview_da = make_color_preview_area(&state);
-    *color_preview_da_cell.borrow_mut() = Some(preview_da.clone());
+    let hue_suppress = Rc::new(Cell::new(false));
+    let picker_hue_adj = gtk::Adjustment::new(0.0, 0.0, 360.0, 1.0, 10.0, 0.0);
+    {
+        let mut g = state.borrow_mut();
+        let (h, _, _) = rgb_bytes_to_hsv(g.fg);
+        g.picker_hue = h;
+    }
+    sync_hue_adj_ui(
+        hue_suppress.as_ref(),
+        &picker_hue_adj,
+        state.borrow().picker_hue,
+    );
+
+    let sv_da = gtk::DrawingArea::builder()
+        .width_request(168)
+        .height_request(140)
+        .hexpand(true)
+        .vexpand(false)
+        .build();
+    let st_svd = state.clone();
+    sv_da.set_draw_func(move |_d, cr, w, h| {
+        let hh = st_svd.borrow().picker_hue;
+        let w = w as i32;
+        let h = h as i32;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        for py in 0..h {
+            let v = 1.0 - (py as f64 + 0.5) / h as f64;
+            for px in 0..w {
+                let s = (px as f64 + 0.5) / w as f64;
+                let (r, g, b) = hsv_to_rgb01(hh, s, v);
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(px as f64, py as f64, 1.0, 1.0);
+                let _ = cr.fill();
+            }
+        }
+    });
+
+    let fg_bg_da = make_fg_bg_selector(
+        &state,
+        &canvas_cell,
+        &hue_suppress,
+        &picker_hue_adj,
+        &sv_da,
+    );
+    *color_preview_da_cell.borrow_mut() = Some(fg_bg_da.clone());
+
+    let st_hue = state.clone();
+    let sv_hue = sv_da.clone();
+    let fg_hue = fg_bg_da.clone();
+    let cv_hue = canvas_cell.clone();
+    let sup_hue = hue_suppress.clone();
+    picker_hue_adj.connect_value_changed(move |adj| {
+        if sup_hue.get() {
+            return;
+        }
+        let mut g = st_hue.borrow_mut();
+        g.picker_hue = adj.value() / 360.0;
+        let slot = g.picker_target;
+        let c = match slot {
+            ColorSlot::Left => g.fg,
+            ColorSlot::Right => g.bg,
+        };
+        let (_, s, v) = rgb_bytes_to_hsv(c);
+        let rgb = hsv_to_rgb01(g.picker_hue, s, v);
+        write_slot_rgb(&mut g, slot, rgb);
+        drop(g);
+        sv_hue.queue_draw();
+        fg_hue.queue_draw();
+        queue_canvas(&cv_hue);
+    });
+
+    let sv_painting = Rc::new(Cell::new(false));
+    let sv_g = gtk::GestureClick::new();
+    let sv_paint_on = sv_painting.clone();
+    let st_press = state.clone();
+    let sv_press = sv_da.clone();
+    let fg_press = fg_bg_da.clone();
+    let cv_press = canvas_cell.clone();
+    sv_g.connect_pressed(move |_, _, x, y| {
+        sv_paint_on.set(true);
+        apply_sv_pick(&st_press, &sv_press, &fg_press, &cv_press, x, y);
+    });
+    let sv_paint_m = sv_painting.clone();
+    let st_m = state.clone();
+    let sv_m = sv_da.clone();
+    let fg_m = fg_bg_da.clone();
+    let cv_m = canvas_cell.clone();
+    let sv_motion = gtk::EventControllerMotion::new();
+    sv_motion.connect_motion(move |ec, x, y| {
+        if !sv_paint_m.get() {
+            return;
+        }
+        if !ec
+            .current_event_state()
+            .contains(gdk::ModifierType::BUTTON1_MASK)
+        {
+            return;
+        }
+        apply_sv_pick(&st_m, &sv_m, &fg_m, &cv_m, x, y);
+    });
+    let sv_paint_off = sv_painting.clone();
+    sv_g.connect_released(move |_, _, _, _| {
+        sv_paint_off.set(false);
+    });
+    sv_da.add_controller(sv_g);
+    sv_da.add_controller(sv_motion);
 
     setup_canvas_input(
         &drawing_area,
@@ -2935,7 +3604,6 @@ fn build_ui(app: &Application) {
     let tool_dd = gtk::DropDown::new(Some(tool_strings.clone()), gtk::Expression::NONE);
     *tool_dd_cell.borrow_mut() = Some(tool_dd.clone());
     tool_dd.set_hexpand(false);
-    tool_dd.set_width_request(160);
 
     let size_adj_cell: Rc<RefCell<Option<gtk::Adjustment>>> = Rc::new(RefCell::new(None));
     let st_dd = state.clone();
@@ -3034,60 +3702,64 @@ fn build_ui(app: &Application) {
         st_f.borrow_mut().shape_filled = c.is_active();
     });
 
-    let toolbar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(6)
-        .margin_end(6)
-        .hexpand(false)
-        .build();
+    tool_dd.set_width_request(148);
+    hard_scale.set_hexpand(true);
+    hard_scale.set_width_request(120);
+    size_spin.set_width_request(64);
+    tol_spin.set_width_request(64);
 
-    let make_row = |label: &str, widget: &gtk::Widget| -> gtk::Box {
-        let row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .hexpand(false)
-            .build();
-        let lbl = gtk::Label::builder()
-            .label(label)
-            .xalign(0.0)
-            .width_request(36)
-            .build();
-        lbl.add_css_class("dim-label");
-        row.append(&lbl);
-        row.append(widget);
-        row
+    let opt_lbl = |text: &'static str| -> gtk::Label {
+        let l = gtk::Label::new(Some(text));
+        l.add_css_class("dim-label");
+        l.set_valign(gtk::Align::Center);
+        l
     };
-    tool_dd.set_width_request(100);
-    hard_scale.set_width_request(100);
-    size_spin.set_width_request(80);
-    tol_spin.set_width_request(80);
+    let vsep = || gtk::Separator::new(gtk::Orientation::Vertical);
 
-    toolbar.append(&make_row("Tool", tool_dd.upcast_ref()));
-    toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    toolbar.append(&make_row("Size", size_spin.upcast_ref()));
-    toolbar.append(&make_row("Hardness", hard_scale.upcast_ref()));
-    toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    toolbar.append(&make_row("Fill tol", tol_spin.upcast_ref()));
-    toolbar.append(&fill_check);
-    toolbar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-    let zoom_row = gtk::Box::builder()
+    let options_bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
-        .hexpand(false)
+        .spacing(8)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(10)
+        .margin_end(10)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
         .build();
+
+    tool_dd.set_valign(gtk::Align::Center);
+    size_spin.set_valign(gtk::Align::Center);
+    hard_scale.set_valign(gtk::Align::Center);
+    tol_spin.set_valign(gtk::Align::Center);
+    fill_check.set_valign(gtk::Align::Center);
+
+    options_bar.append(&opt_lbl("Tool"));
+    options_bar.append(&tool_dd);
+    options_bar.append(&vsep());
+    options_bar.append(&opt_lbl("Size"));
+    options_bar.append(&size_spin);
+    options_bar.append(&vsep());
+    options_bar.append(&opt_lbl("Hardness"));
+    options_bar.append(&hard_scale);
+    options_bar.append(&vsep());
+    options_bar.append(&opt_lbl("Fill tol"));
+    options_bar.append(&tol_spin);
+    options_bar.append(&vsep());
+    options_bar.append(&fill_check);
+    options_bar.append(&vsep());
+
     let zoom_out_btn = gtk::Button::from_icon_name("zoom-out-symbolic");
     let zoom_fit_btn = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
     let zoom_in_btn = gtk::Button::from_icon_name("zoom-in-symbolic");
     zoom_out_btn.set_tooltip_text(Some("Zoom out (Ctrl+−)"));
     zoom_fit_btn.set_tooltip_text(Some("Zoom to fit (Ctrl+0)"));
     zoom_in_btn.set_tooltip_text(Some("Zoom in (Ctrl++)"));
-    zoom_row.append(&zoom_out_btn);
-    zoom_row.append(&zoom_fit_btn);
-    zoom_row.append(&zoom_in_btn);
+    zoom_out_btn.set_valign(gtk::Align::Center);
+    zoom_fit_btn.set_valign(gtk::Align::Center);
+    zoom_in_btn.set_valign(gtk::Align::Center);
+    options_bar.append(&zoom_out_btn);
+    options_bar.append(&zoom_fit_btn);
+    options_bar.append(&zoom_in_btn);
 
     let st_zo = state.clone();
     let cv_zo = canvas_cell.clone();
@@ -3108,91 +3780,109 @@ fn build_ui(app: &Application) {
         queue_canvas(&cv_zi);
     });
 
-    toolbar.append(&zoom_row);
-
-    let toolbar_spacer = gtk::Box::builder()
+    let color_sidebar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(4)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
+        .width_request(212)
+        .hexpand(false)
         .vexpand(true)
         .build();
-    toolbar.append(&toolbar_spacer);
 
-    let palette_label = gtk::Label::builder()
-        .label("Default colors")
-        .xalign(0.0)
-        .halign(gtk::Align::Start)
-        .hexpand(false)
+    let palette_strings = gtk::StringList::new(&[]);
+    let palette_dd = gtk::DropDown::new(Some(palette_strings.clone()), gtk::Expression::NONE);
+    palette_dd.set_hexpand(true);
+    palette_dd.set_halign(gtk::Align::Fill);
+    palette_dd.set_valign(gtk::Align::Center);
+
+    let palette_top = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
         .build();
-    palette_label.add_css_class("dim-label");
-    toolbar.append(&palette_label);
+    palette_top.append(&fg_bg_da);
+    palette_top.append(&palette_dd);
+    color_sidebar.append(&palette_top);
 
     let palette_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
-        .max_children_per_line(2)
-        .row_spacing(4)
-        .column_spacing(4)
-        .hexpand(false)
-        .halign(gtk::Align::Start)
+        .max_children_per_line(4)
+        .row_spacing(0)
+        .column_spacing(0)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::Start)
         .build();
-    for &fg in SIDEBAR_DEFAULT_COLORS {
-        let btn = swatch_button(fg);
-        let st_pal = state.clone();
-        let prev_pal = preview_da.clone();
-        let cv_pal = canvas_cell.clone();
-        let rf_pal = recent_colors_flow.clone();
-        btn.connect_clicked(move |_| {
-            {
-                let mut g = st_pal.borrow_mut();
-                g.fg = fg;
-                push_recent_color(&mut g, fg);
-            }
-            prev_pal.queue_draw();
-            queue_canvas(&cv_pal);
-            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &cv_pal);
-        });
-        palette_flow.append(&btn);
-    }
-    toolbar.append(&palette_flow);
+    let palette_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .max_content_height(520)
+               .child(&palette_flow)
+        .build();
+    color_sidebar.append(&palette_scroll);
+
+    let hue_lbl = gtk::Label::new(Some("Hue"));
+    hue_lbl.add_css_class("dim-label");
+    hue_lbl.set_halign(gtk::Align::Start);
+    color_sidebar.append(&hue_lbl);
+    let hue_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&picker_hue_adj));
+    hue_scale.set_draw_value(false);
+    hue_scale.set_hexpand(true);
+    color_sidebar.append(&hue_scale);
+    color_sidebar.append(&sv_da);
+
+    let palette_sidebar = PaletteSidebar {
+        flow: palette_flow.clone(),
+        dropdown: palette_dd.clone(),
+        strings: palette_strings.clone(),
+        preview: fg_bg_da.clone(),
+        recent: recent_colors_flow.clone(),
+        canvas: canvas_cell.clone(),
+        hue_suppress: hue_suppress.clone(),
+        hue_adj: picker_hue_adj.clone(),
+        sv_area: sv_da.clone(),
+    };
+    refresh_palette_sidebar_full(&palette_sidebar, &state);
+
+    let st_pdd = state.clone();
+    let psc_pal = palette_sidebar.clone();
+    palette_dd.connect_selected_notify(move |dd| {
+        let i = dd.selected() as usize;
+        let mut g = st_pdd.borrow_mut();
+        if i >= g.palette_book.entries.len() {
+            return;
+        }
+        if g.palette_book.active == i {
+            return;
+        }
+        g.palette_book.active = i;
+        drop(g);
+        crate::settings::persist(&st_pdd.borrow());
+        fill_palette_swatches(&psc_pal, &st_pdd);
+    });
 
     let recent_label = gtk::Label::builder()
         .label("Last used")
         .xalign(0.0)
-        .margin_top(6)
+        .margin_top(4)
         .halign(gtk::Align::Start)
         .hexpand(false)
         .build();
     recent_label.add_css_class("dim-label");
-    toolbar.append(&recent_label);
-    toolbar.append(&recent_colors_flow);
-
-    let current_label = gtk::Label::builder()
-        .label("Custom color")
-        .xalign(0.0)
-        .margin_top(6)
-        .halign(gtk::Align::Start)
-        .hexpand(false)
-        .build();
-    current_label.add_css_class("dim-label");
-    toolbar.append(&current_label);
-
-    let preview_btn = gtk::Button::builder()
-        .child(&preview_da)
-        .halign(gtk::Align::Start)
-        .build();
-    preview_btn.set_tooltip_text(Some("Open color editor…"));
-    let w_col = window.clone();
-    let st_col = state.clone();
-    let prev_col = preview_da.clone();
-    let rf_col = recent_colors_flow.clone();
-    let cv_col = canvas_cell.clone();
-    preview_btn.connect_clicked(move |_| {
-        present_custom_color_dialog(&w_col, &st_col, &prev_col, &rf_col, &cv_col);
-    });
-    toolbar.append(&preview_btn);
+    color_sidebar.append(&recent_label);
+    color_sidebar.append(&recent_colors_flow);
 
     refresh_recent_swatch_row(
         &recent_colors_flow,
         &state,
-        &preview_da,
+        &fg_bg_da,
         &canvas_cell,
     );
 
@@ -3201,7 +3891,7 @@ fn build_ui(app: &Application) {
         .vexpand(true)
         .hexpand(true)
         .build();
-    editor.append(&toolbar);
+    editor.append(&color_sidebar);
     editor.append(&drawing_area);
 
     let revealer = gtk::Revealer::builder()
@@ -3241,6 +3931,7 @@ fn build_ui(app: &Application) {
         &tool_dd_cell,
         &tool_strings,
         recent_files_menu.clone(),
+        palette_sidebar.clone(),
     );
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
 
@@ -3253,6 +3944,7 @@ fn build_ui(app: &Application) {
 
     let toolbar_view = libadwaita::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
+    toolbar_view.add_top_bar(&options_bar);
     toolbar_view.set_content(Some(&split));
     window.set_content(Some(&toolbar_view));
 
@@ -3359,7 +4051,7 @@ fn build_ui(app: &Application) {
 
     let st_shutdown = state.clone();
     let da_shutdown = drawing_area.clone();
-    let preview_shutdown = preview_da.clone();
+    let preview_shutdown = fg_bg_da.clone();
     let tick_shutdown = tick_slot.clone();
     app.connect_shutdown(move |_app| {
         if let Some(h) = tick_shutdown.borrow_mut().take() {
@@ -3592,6 +4284,7 @@ fn build_menu(
     tool_dd_cell: &ToolDdCell,
     tool_strings: &gtk::StringList,
     recent_menu: Rc<gio::Menu>,
+    palette_sidebar: PaletteSidebar,
 ) -> gio::Menu {
     let menu = gio::Menu::new();
     let file = gio::Menu::new();
@@ -3617,6 +4310,11 @@ fn build_menu(
     theme.append(Some("_Light"), Some("win.color_scheme('light')"));
     theme.append(Some("_Dark"), Some("win.color_scheme('dark')"));
     settings.append_submenu(Some("Color _theme"), &theme);
+    let pal_menu = gio::Menu::new();
+    pal_menu.append(Some("Import hex…"), Some("win.palette_import"));
+    pal_menu.append(Some("Export hex…"), Some("win.palette_export"));
+    pal_menu.append(Some("Manage palettes…"), Some("win.palette_manage"));
+    settings.append_submenu(Some("_Palettes"), &pal_menu);
     menu.append_submenu(Some("_Settings"), &settings);
 
     let st = state.clone();
@@ -3838,6 +4536,32 @@ fn build_menu(
         queue_canvas(&cv);
     });
     app_add_action(window, &zf_act);
+
+    let st = state.clone();
+    let w_pi = window.clone();
+    let ps_i = palette_sidebar.clone();
+    let palette_import_act = gio::SimpleAction::new("palette_import", None);
+    palette_import_act.connect_activate(move |_, _| {
+        import_palette_file(&w_pi, &st, &ps_i);
+    });
+    app_add_action(window, &palette_import_act);
+
+    let st = state.clone();
+    let w_pe = window.clone();
+    let palette_export_act = gio::SimpleAction::new("palette_export", None);
+    palette_export_act.connect_activate(move |_, _| {
+        export_palette_file(&w_pe, &st);
+    });
+    app_add_action(window, &palette_export_act);
+
+    let st = state.clone();
+    let w_pm = window.clone();
+    let ps_m = palette_sidebar.clone();
+    let palette_manage_act = gio::SimpleAction::new("palette_manage", None);
+    palette_manage_act.connect_activate(move |_, _| {
+        manage_palettes_dialog(&w_pm, &st, &ps_m);
+    });
+    app_add_action(window, &palette_manage_act);
 
     menu
 }

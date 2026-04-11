@@ -1,5 +1,6 @@
 mod app;
 mod document;
+mod palette;
 mod settings;
 mod state;
 mod tool_cursors;
