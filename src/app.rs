@@ -4819,8 +4819,9 @@ fn build_ui(app: &Application) {
     let hard_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&hard_adj));
     hard_scale.set_direction(gtk::TextDirection::Ltr);
     hard_scale.set_inverted(true);
-    hard_scale.set_hexpand(true);
+    hard_scale.set_hexpand(false);
     hard_scale.set_width_request(120);
+    hard_scale.set_halign(gtk::Align::Start);
     let st_h = state.clone();
     hard_adj.connect_value_changed(move |a| {
         st_h.borrow_mut().brush_hardness = 1.1 - a.value();
@@ -4851,8 +4852,6 @@ fn build_ui(app: &Application) {
     });
 
     tool_dd.set_width_request(148);
-    hard_scale.set_hexpand(true);
-    hard_scale.set_width_request(120);
     size_spin.set_width_request(64);
     tol_spin.set_width_request(64);
 
