@@ -152,27 +152,29 @@ fn main() {
     let svg_dir = Path::new("assets/cursors/svg");
 
     // (rust stem / png name, svg file, hotspot in SVG user space matching Lucide 24×24 viewBox)
+    // Coordinates are tuned against the rasterized 24×24 PNG (margin + scale in `rasterize`), not
+    // raw path math only — so the visible dab / tip / corner lines up with `widget_to_doc`.
     let icons: &[(&str, &str, f32, f32)] = &[
-        // Circle stamp center (matches `stamp_circle` around pointer).
-        ("brush", "brush.svg", 10.2, 18.35),
-        // Graphite tip (pencil nib).
-        ("pixel", "pencil.svg", 3.85, 16.18),
-        // Circle stamp center for eraser (same as brush).
-        ("eraser", "eraser.svg", 12.0, 17.6),
-        // Intake tip (path toward m2 22).
-        ("eyedropper", "pipette.svg", 2.35, 21.75),
+        // Center of the bristle blob in the bitmap (not handle geometry in SVG space).
+        ("brush", "brush.svg", 3.0, 18.0),
+        // Pencil nib tip (`floor` doc cell under the tip for `stamp_square`).
+        ("pixel", "pencil.svg", 0.0, 19.5),
+        // Eraser pad centroid in the raster.
+        ("eraser", "eraser.svg", 10.5, 16.5),
+        // Intake tip at path origin m2 22.
+        ("eyedropper", "pipette.svg", 2.0, 22.0),
         // Pour / fill origin above drip.
         ("fill", "paint-bucket.svg", 10.5, 9.6),
-        // First endpoint of the slash (matches first click as line start).
-        ("line", "slash.svg", 2.15, 21.85),
-        // Top-left of square stroke (matches first corner of axis-aligned rect).
-        ("rect", "square.svg", 3.0, 3.0),
-        // Top-left of circle’s bounding box (first corner of ellipse drag).
-        ("ellipse", "circle.svg", 2.0, 2.0),
-        // Top-left of dashed marquee.
-        ("select", "square-dashed.svg", 3.0, 3.0),
-        // Star / sparkles centroid (magic wand “active” point).
-        ("wand", "wand.svg", 15.0, 9.0),
+        // Slash endpoint at (2,22) — first click anchors the line here.
+        ("line", "slash.svg", 2.0, 22.0),
+        // Outer top-left of the square stroke in the bitmap (~1px inset from centerline at (3,3)).
+        ("rect", "square.svg", 2.0, 2.0),
+        // Outer top-left of the circle stroke (fractional coords so 24px raster rounds to (4,4)).
+        ("ellipse", "circle.svg", 0.6, 0.6),
+        // Marquee corner aligned with rect cursor.
+        ("select", "square-dashed.svg", 2.0, 2.0),
+        // Tip of wand shaft (path `m3 21 9-9` → (12,12)), not the sparkles centroid.
+        ("wand", "wand.svg", 12.0, 12.0),
         ("move", "move.svg", 12.0, 12.0),
         // Palm / grab centroid for pan.
         ("hand", "hand.svg", 12.0, 14.0),
