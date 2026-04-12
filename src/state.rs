@@ -125,6 +125,8 @@ pub struct AppState {
     pub zoom: f64,
     pub pan_x: f64,
     pub pan_y: f64,
+    /// When true, draw 1×1 pixel cell lines over the canvas (document space).
+    pub show_pixel_grid: bool,
     pub selection: Option<Selection>,
     pub clipboard: Option<(i32, i32, Vec<u8>)>,
     pub floating: Option<FloatingSelection>,
@@ -209,6 +211,7 @@ impl AppState {
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
+            show_pixel_grid: false,
             selection: None,
             clipboard: None,
             floating: None,

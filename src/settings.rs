@@ -25,6 +25,8 @@ struct FileSettings {
     palettes: Vec<NamedPalette>,
     #[serde(default)]
     active_palette: usize,
+    #[serde(default)]
+    show_pixel_grid: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -149,6 +151,7 @@ pub fn load_into(state: &mut AppState) -> &'static str {
     if state.palette_book.merge_missing_builtin_presets() {
         persist(state);
     }
+    state.show_pixel_grid = parsed.show_pixel_grid;
     state.recent_files = parsed
         .recent_files
         .into_iter()
@@ -182,6 +185,7 @@ pub fn persist(state: &AppState) {
         recent_files,
         palettes: state.palette_book.entries.clone(),
         active_palette: state.palette_book.active,
+        show_pixel_grid: state.show_pixel_grid,
     };
     let path = config_path();
     if let Some(parent) = path.parent() {

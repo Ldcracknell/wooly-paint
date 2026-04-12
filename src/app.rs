@@ -2106,6 +2106,7 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
             crc.fill().unwrap();
             let p = gtk::cairo::SurfacePattern::create(surf);
             p.set_extend(gtk::cairo::Extend::Repeat);
+            p.set_filter(gtk::cairo::Filter::Nearest);
             *slot = Some(p);
         }
         f(slot.as_ref().unwrap());
@@ -2244,7 +2245,19 @@ fn region_mask_outline_path(cr: &gtk::cairo::Context, mask: &[u8], rw: u32, rh: 
 }
 
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
-    let (w, h, pan_x, pan_y, zoom, shape_preview, shape_preview_color, shape_filled, brush_size, brush_hardness) = {
+    let (
+        w,
+        h,
+        pan_x,
+        pan_y,
+        zoom,
+        show_pixel_grid,
+        shape_preview,
+        shape_preview_color,
+        shape_filled,
+        brush_size,
+        brush_hardness,
+    ) = {
         let st = state.borrow();
         let preview_c = if st.shape_drag_preview.is_some() {
             st.active_paint_color()
@@ -2257,6 +2270,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
             st.pan_x,
             st.pan_y,
             st.zoom,
+            st.show_pixel_grid,
             st.shape_drag_preview,
             preview_c,
             st.shape_filled,
@@ -2359,14 +2373,41 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
     cr.rectangle(0.0, 0.0, w as f64, h as f64);
     cr.clip();
     with_transparency_checker_pattern(|pat| {
+        cr.save().unwrap();
+        cr.set_antialias(gtk::cairo::Antialias::None);
         cr.set_source(pat).unwrap();
         cr.paint().unwrap();
+        cr.restore().unwrap();
     });
     cr.set_source_surface(composite_surface.as_ref(), 0.0, 0.0)
         .expect("set_source_surface composite");
     cr.source().set_filter(gtk::cairo::Filter::Nearest);
     cr.paint().unwrap();
     cr.restore().unwrap();
+
+    if show_pixel_grid {
+        cr.save().unwrap();
+        cr.translate(pan_x, pan_y);
+        cr.scale(zoom, zoom);
+        cr.rectangle(0.0, 0.0, w as f64, h as f64);
+        cr.clip();
+        let lw = 1.0 / zoom.max(0.001);
+        cr.set_line_width(lw);
+        cr.set_antialias(gtk::cairo::Antialias::None);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.28);
+        for x in 0..=w {
+            let xf = x as f64;
+            cr.move_to(xf, 0.0);
+            cr.line_to(xf, h as f64);
+        }
+        for y in 0..=h {
+            let yf = y as f64;
+            cr.move_to(0.0, yf);
+            cr.line_to(w as f64, yf);
+        }
+        cr.stroke().unwrap();
+        cr.restore().unwrap();
+    }
 
     let floating_pixbuf = {
         let mut st = state.borrow_mut();
@@ -5748,6 +5789,7 @@ fn build_menu(
     canvas_menu.append(Some("Flip X"), Some("win.canvas_flip_x"));
     canvas_menu.append(Some("Flip Y"), Some("win.canvas_flip_y"));
     canvas_menu.append(Some("Rotate 90deg"), Some("win.canvas_rotate_cw"));
+    canvas_menu.append(Some("Pixel grid"), Some("win.show_pixel_grid"));
     menu.append_submenu(Some("_Canvas"), &canvas_menu);
 
     let settings = gio::Menu::new();
@@ -5874,6 +5916,27 @@ fn build_menu(
         refresh_after_canvas_change(&st, &lc, &cv, true);
     });
     app_add_action(window, &canvas_rotate_act);
+
+    let st_grid = state.clone();
+    let cv_grid = canvas.clone();
+    let initial_grid = state.borrow().show_pixel_grid;
+    let pixel_grid_act = gio::SimpleAction::new_stateful(
+        "show_pixel_grid",
+        None,
+        &initial_grid.to_variant(),
+    );
+    pixel_grid_act.connect_activate(move |action, _| {
+        let current = action
+            .state()
+            .and_then(|v| v.get::<bool>())
+            .unwrap_or(false);
+        let new_state = !current;
+        action.set_state(&new_state.to_variant());
+        st_grid.borrow_mut().show_pixel_grid = new_state;
+        queue_canvas(&cv_grid);
+        crate::settings::persist(&st_grid.borrow());
+    });
+    app_add_action(window, &pixel_grid_act);
 
     let st = state.clone();
     let cv = canvas.clone();
