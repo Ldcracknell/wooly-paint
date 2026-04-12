@@ -5660,7 +5660,7 @@ fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::up
     let dlg = libadwaita::AlertDialog::new(
         Some("Update available"),
         Some(&format!(
-            "Version {} is available (you are on {}). Download and replace this installation with the latest portable build?",
+            "Version {} is available (you are on v{})",
             info.version,
             cur
         )),
