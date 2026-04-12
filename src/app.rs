@@ -89,13 +89,6 @@ fn doc_point_in_floating(doc_x: f64, doc_y: f64, f: &FloatingSelection) -> bool 
     lx >= -1e-3 && ly >= -1e-3 && lx <= f.w as f64 + 1e-3 && ly <= f.h as f64 + 1e-3
 }
 
-fn flip_scale_signs(f: &FloatingSelection) -> (f64, f64) {
-    (
-        if f.flip_h { -1.0 } else { 1.0 },
-        if f.flip_v { -1.0 } else { 1.0 },
-    )
-}
-
 fn floating_transform_center(f: &FloatingSelection) -> (f64, f64) {
     let fw = f.w.max(1) as f64;
     let fh = f.h.max(1) as f64;
@@ -238,7 +231,8 @@ fn apply_floating_resize_corner(
     let uy_d = dy - fh * 0.5;
     let dux = ux_d - ux_a;
     let duy = uy_d - uy_a;
-    let (fh_s, fv_s) = flip_scale_signs(f);
+    let mut fh_s = if f.flip_h { -1.0 } else { 1.0 };
+    let mut fv_s = if f.flip_v { -1.0 } else { 1.0 };
     let vx = p_doc.0 - anchor_doc.0;
     let vy = p_doc.1 - anchor_doc.1;
     let (wx, wy) = rot_dist_inv(f.angle_deg, vx, vy);
@@ -246,10 +240,22 @@ fn apply_floating_resize_corner(
     let mut sx = f.scale_x;
     let mut sy = f.scale_y;
     if dux.abs() > eps {
-        sx = (wx / (fh_s * dux)).clamp(0.02, 100.0);
+        let mut raw = wx / (fh_s * dux);
+        if raw < 0.0 {
+            f.flip_h = !f.flip_h;
+            fh_s = -fh_s;
+            raw = -raw;
+        }
+        sx = raw.clamp(0.02, 100.0);
     }
     if duy.abs() > eps {
-        sy = (wy / (fv_s * duy)).clamp(0.02, 100.0);
+        let mut raw = wy / (fv_s * duy);
+        if raw < 0.0 {
+            f.flip_v = !f.flip_v;
+            fv_s = -fv_s;
+            raw = -raw;
+        }
+        sy = raw.clamp(0.02, 100.0);
     }
     let sxu_x = sx * fh_s * ux_a;
     let sxu_y = sy * fv_s * uy_a;
@@ -270,7 +276,8 @@ fn apply_floating_resize_edge(
 ) {
     let fw = f.w.max(1) as f64;
     let fh = f.h.max(1) as f64;
-    let (fh_s, fv_s) = flip_scale_signs(f);
+    let mut fh_s = if f.flip_h { -1.0 } else { 1.0 };
+    let mut fv_s = if f.flip_v { -1.0 } else { 1.0 };
     let vx = p_doc.0 - anchor_doc.0;
     let vy = p_doc.1 - anchor_doc.1;
     let (wx, wy) = rot_dist_inv(f.angle_deg, vx, vy);
@@ -285,19 +292,43 @@ fn apply_floating_resize_edge(
     };
     match edge % 4 {
         0 => {
-            sy = (-wy / (fv_s * fh)).clamp(0.02, 100.0);
+            let mut raw = -wy / (fv_s * fh);
+            if raw < 0.0 {
+                f.flip_v = !f.flip_v;
+                fv_s = -fv_s;
+                raw = -raw;
+            }
+            sy = raw.clamp(0.02, 100.0);
         }
         1 => {
             if fw.abs() > eps {
-                sx = (wx / (fh_s * fw)).clamp(0.02, 100.0);
+                let mut raw = wx / (fh_s * fw);
+                if raw < 0.0 {
+                    f.flip_h = !f.flip_h;
+                    fh_s = -fh_s;
+                    raw = -raw;
+                }
+                sx = raw.clamp(0.02, 100.0);
             }
         }
         2 => {
-            sy = (wy / (fv_s * fh)).clamp(0.02, 100.0);
+            let mut raw = wy / (fv_s * fh);
+            if raw < 0.0 {
+                f.flip_v = !f.flip_v;
+                fv_s = -fv_s;
+                raw = -raw;
+            }
+            sy = raw.clamp(0.02, 100.0);
         }
         _ => {
             if fw.abs() > eps {
-                sx = (wx / (fh_s * (-fw))).clamp(0.02, 100.0);
+                let mut raw = wx / (fh_s * (-fw));
+                if raw < 0.0 {
+                    f.flip_h = !f.flip_h;
+                    fh_s = -fh_s;
+                    raw = -raw;
+                }
+                sx = raw.clamp(0.02, 100.0);
             }
         }
     }
