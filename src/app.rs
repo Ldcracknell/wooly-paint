@@ -5841,6 +5841,7 @@ fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::up
                         });
                     }
                 });
+                d.close();
             }
             "release" => {
                 let launcher = gtk::UriLauncher::new(&release_url);
@@ -5850,9 +5851,10 @@ fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::up
                     }
                 });
             }
-            _ => {}
+            _ => {
+                d.close();
+            }
         }
-        d.close();
     });
     dlg.present(Some(parent));
 }
