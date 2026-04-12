@@ -11,14 +11,111 @@ const CURSOR_PX: u32 = 24;
 /// Inset so the icon glyph is visibly smaller than the bitmap.
 const MARGIN: f32 = 4.0;
 
+/// Lucide cursors use `stroke-width="2"` on the root; draw a wider white stroke underneath for contrast on black.
+const CURSOR_OUTLINE_STROKE: &str = "5";
+
+/// Duplicate each stroked shape with a white underlay (no filters).
+fn inject_cursor_stroke_halo(svg: &str) -> String {
+    let Some(svg_start) = svg.find("<svg") else {
+        return svg.to_string();
+    };
+    let after_open = &svg[svg_start..];
+    let Some(gt_rel) = after_open.find('>') else {
+        return svg.to_string();
+    };
+    let body_start = svg_start + gt_rel + 1;
+    let Some(close_pos) = svg.rfind("</svg>") else {
+        return svg.to_string();
+    };
+    let body = &svg[body_start..close_pos];
+    let new_body = svg_body_insert_stroke_outlines(body);
+    let mut out = String::with_capacity(svg.len() + new_body.len());
+    out.push_str(&svg[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&svg[close_pos..]);
+    out
+}
+
+fn svg_body_insert_stroke_outlines(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() * 2);
+    let mut i = 0usize;
+    while i < body.len() {
+        let rest = &body[i..];
+        if rest.starts_with("<path") {
+            let stripped = &rest[5..];
+            let idx = stripped
+                .find("/>")
+                .unwrap_or_else(|| panic!("cursor svg: expected path `/>` after byte {i}"));
+            let inner = &stripped[..idx];
+            let orig_len = 5 + idx + 2;
+            out.push_str("  <path");
+            out.push_str(inner);
+            out.push_str(" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"");
+            out.push_str(CURSOR_OUTLINE_STROKE);
+            out.push_str("\" stroke-linecap=\"round\" stroke-linejoin=\"round\" />");
+            out.push('\n');
+            out.push_str(&rest[..orig_len]);
+            i += orig_len;
+        } else if rest.starts_with("<circle") {
+            let stripped = &rest[7..];
+            let idx = stripped
+                .find("/>")
+                .unwrap_or_else(|| panic!("cursor svg: expected circle `/>` after byte {i}"));
+            let inner = &stripped[..idx];
+            let orig_len = 7 + idx + 2;
+            out.push_str("  <circle");
+            out.push_str(inner);
+            out.push_str(" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"");
+            out.push_str(CURSOR_OUTLINE_STROKE);
+            out.push_str("\" />");
+            out.push('\n');
+            out.push_str(&rest[..orig_len]);
+            i += orig_len;
+        } else if rest.starts_with("<rect") {
+            let stripped = &rest[5..];
+            let idx = stripped
+                .find("/>")
+                .unwrap_or_else(|| panic!("cursor svg: expected rect `/>` after byte {i}"));
+            let inner = &stripped[..idx];
+            let orig_len = 5 + idx + 2;
+            out.push_str("  <rect");
+            out.push_str(inner);
+            out.push_str(" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"");
+            out.push_str(CURSOR_OUTLINE_STROKE);
+            out.push_str("\" />");
+            out.push('\n');
+            out.push_str(&rest[..orig_len]);
+            i += orig_len;
+        } else {
+            match rest.find('<') {
+                Some(0) => {
+                    out.push('<');
+                    i += 1;
+                }
+                Some(n) => {
+                    out.push_str(&rest[..n]);
+                    i += n;
+                }
+                None => {
+                    out.push_str(rest);
+                    i = body.len();
+                }
+            }
+        }
+    }
+    out
+}
+
 fn rasterize(
     svg_path: &Path,
     png_path: &Path,
     hx_svg: f32,
     hy_svg: f32,
 ) -> Result<(i32, i32), String> {
-    let data = fs::read(svg_path).map_err(|e| format!("read {}: {e}", svg_path.display()))?;
-    let tree = usvg::Tree::from_data(&data, &usvg::Options::default())
+    let raw = fs::read_to_string(svg_path).map_err(|e| format!("read {}: {e}", svg_path.display()))?;
+    let svg = inject_cursor_stroke_halo(&raw);
+    let data = svg.as_bytes();
+    let tree = usvg::Tree::from_data(data, &usvg::Options::default())
         .map_err(|e| format!("parse {}: {e}", svg_path.display()))?;
 
     let w = tree.size().width() as f32;
