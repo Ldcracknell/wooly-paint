@@ -78,15 +78,35 @@ fn blend_premul_pixel(dst: &mut [u8; 4], src: [u8; 4]) {
         .clamp(0.0, 255.0) as u8;
 }
 
-/// `color` straight RGBA; composites with existing premultiplied canvas.
-pub fn stamp_circle(
+/// Falloff LUT for a fixed hardness; building it is expensive, so reuse across many stamps
+/// (filled shapes, polyline dabs) instead of recomputing inside each [`stamp_circle`].
+struct BrushFalloffCache {
+    lut: [f64; 256],
+    lift_scale: f64,
+}
+
+impl BrushFalloffCache {
+    fn new(hardness: f64) -> Self {
+        let hard = hardness.clamp(0.0, 1.0);
+        let gamma = 0.42 + 19.5 * hard * hard;
+        let mut lut = [0f64; 256];
+        for (i, slot) in lut.iter_mut().enumerate() {
+            let u = i as f64 / 255.0;
+            *slot = u.powf(gamma);
+        }
+        let lift_scale = (1.0 - hard) * 0.22;
+        Self { lut, lift_scale }
+    }
+}
+
+fn stamp_circle_with_falloff(
     layer: &mut Layer,
     cx: f64,
     cy: f64,
     radius: f64,
-    hardness: f64,
     color: [u8; 4],
     eraser: bool,
+    falloff: &BrushFalloffCache,
 ) {
     if radius <= 0.0 {
         return;
@@ -95,14 +115,6 @@ pub fn stamp_circle(
     let h = layer.height as i32;
     let r = radius.max(0.5);
     let r2 = r * r;
-    let hard = hardness.clamp(0.0, 1.0);
-    let gamma = 0.42 + 19.5 * hard * hard;
-    let mut falloff_lut = [0f64; 256];
-    for (i, slot) in falloff_lut.iter_mut().enumerate() {
-        let u = i as f64 / 255.0;
-        *slot = u.powf(gamma);
-    }
-    let lift_scale = (1.0 - hard) * 0.22;
     let inv_r = 1.0 / r;
     let x0 = (cx - r - 1.0).floor() as i32;
     let y0 = (cy - r - 1.0).floor() as i32;
@@ -124,8 +136,8 @@ pub fn stamp_circle(
                 continue;
             }
             let ui = (u * 255.0 + 0.5).clamp(0.0, 255.0) as usize;
-            let body = falloff_lut[ui];
-            let lift = lift_scale * u;
+            let body = falloff.lut[ui];
+            let lift = falloff.lift_scale * u;
             let a_straight = (body + lift).min(1.0);
             let alpha: f64 = a_straight * color[3] as f64 / 255.0;
             if alpha <= 0.0 {
@@ -156,6 +168,23 @@ pub fn stamp_circle(
             }
         }
     }
+}
+
+/// `color` straight RGBA; composites with existing premultiplied canvas.
+pub fn stamp_circle(
+    layer: &mut Layer,
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    hardness: f64,
+    color: [u8; 4],
+    eraser: bool,
+) {
+    if radius <= 0.0 {
+        return;
+    }
+    let falloff = BrushFalloffCache::new(hardness);
+    stamp_circle_with_falloff(layer, cx, cy, radius, color, eraser, &falloff);
 }
 
 fn brush_stroke_step(radius: f64, hardness: f64) -> f64 {
@@ -207,11 +236,12 @@ pub fn stroke_line(
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
         return;
     }
+    let falloff = BrushFalloffCache::new(hardness);
     for i in 0..=n {
         let t = i as f64 / n as f64;
         let x = x0 + dx * t;
         let y = y0 + dy * t;
-        stamp_circle(layer, x, y, radius, hardness, color, eraser);
+        stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff);
     }
 }
 
@@ -596,6 +626,7 @@ pub fn draw_rect_outline(
             .max(brush_min_step(radius, hardness))
             .max(radius * 0.22)
             .max(0.75);
+        let falloff = BrushFalloffCache::new(hardness);
         let mut y = min_y.floor();
         let y1 = max_y.ceil();
         let x0f = min_x;
@@ -609,7 +640,7 @@ pub fn draw_rect_outline(
                 let px = x + 0.5;
                 let py = y + 0.5;
                 if px >= x0f && px <= x1f && py >= y0f && py <= y1f {
-                    stamp_circle(layer, px, py, radius, hardness, color, eraser);
+                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff);
                 }
                 x += step;
             }
@@ -673,6 +704,7 @@ pub fn draw_ellipse(
             .max(brush_min_step(radius, hardness))
             .max(radius * 0.18)
             .max(0.75);
+        let falloff = BrushFalloffCache::new(hardness);
         let y_end = y_max.min(h) as f64;
         let x_end = x_max.min(w) as f64;
         let mut y = y_min.max(0) as f64;
@@ -684,7 +716,7 @@ pub fn draw_ellipse(
                 let nx = (px - cx) / rx;
                 let ny = (py - cy) / ry;
                 if nx * nx + ny * ny <= 1.0 {
-                    stamp_circle(layer, px, py, radius, hardness, color, eraser);
+                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff);
                 }
                 x += step;
             }
@@ -692,11 +724,12 @@ pub fn draw_ellipse(
         }
     } else {
         let n = ellipse_outline_segment_count(rx, ry, radius, hardness);
+        let falloff = BrushFalloffCache::new(hardness);
         for i in 0..=n {
             let t = std::f64::consts::TAU * i as f64 / n as f64;
             let px = cx + rx * t.cos();
             let py = cy + ry * t.sin();
-            stamp_circle(layer, px, py, radius, hardness, color, eraser);
+            stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff);
         }
     }
 }
