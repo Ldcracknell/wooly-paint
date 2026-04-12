@@ -459,6 +459,18 @@ fn tool_label(tool: ToolKind, key: Option<char>) -> String {
     }
 }
 
+/// Minimum width for the tool [`gtk::DropDown`] so every option fits at the widget font without truncation.
+fn tool_dropdown_width_request(dropdown: &gtk::DropDown, labels: &[String]) -> i32 {
+    const DROPDOWN_CHROME_PX: i32 = 52;
+    let mut max_label_px = 0i32;
+    for text in labels {
+        let layout = dropdown.create_pango_layout(Some(text.as_str()));
+        let (w, _) = layout.pixel_size();
+        max_label_px = max_label_px.max(w);
+    }
+    max_label_px + DROPDOWN_CHROME_PX
+}
+
 fn refresh_tool_labels(state: &SharedState, sl: &gtk::StringList) {
     let labels: Vec<String> = {
         let st = state.borrow();
@@ -2037,7 +2049,7 @@ fn draw_shape_drag_preview(
             let rh = max_y - min_y;
             cr.rectangle(min_x, min_y, rw, rh);
             if shape_filled && rw > 0.0 && rh > 0.0 {
-                cr.set_source_rgba(r, g, b, (a * 0.35).min(1.0));
+                cr.set_source_rgba(r, g, b, a);
                 cr.fill_preserve().unwrap();
                 cr.set_source_rgba(r, g, b, a);
                 cr.stroke().unwrap();
@@ -2062,7 +2074,7 @@ fn draw_shape_drag_preview(
             }
             cr.close_path();
             if shape_filled {
-                cr.set_source_rgba(r, g, b, (a * 0.35).min(1.0));
+                cr.set_source_rgba(r, g, b, a);
                 cr.fill_preserve().unwrap();
                 cr.set_source_rgba(r, g, b, a);
                 cr.stroke().unwrap();
@@ -5104,7 +5116,7 @@ fn build_ui(app: &Application) {
         st_f.borrow_mut().shape_filled = c.is_active();
     });
 
-    tool_dd.set_width_request(148);
+    tool_dd.set_width_request(tool_dropdown_width_request(&tool_dd, &labels));
     size_spin.set_width_request(64);
     tol_spin.set_width_request(64);
 
