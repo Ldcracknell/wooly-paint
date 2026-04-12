@@ -147,7 +147,29 @@ fn rasterize(
     Ok((hx, hy))
 }
 
+fn windows_target() -> bool {
+    env::var_os("CARGO_CFG_TARGET_OS")
+        .is_some_and(|v| v == "windows")
+}
+
+/// Embed `src/assets/icon.ico` so the `.exe` has a shell icon when pinned or when the app is not running.
+fn embed_windows_exe_icon() {
+    println!("cargo:rerun-if-changed=src/assets/icon.ico");
+    let mut res = winres::WindowsResource::new();
+    res.set_icon("src/assets/icon.ico");
+    if let Err(e) = res.compile() {
+        panic!(
+            "Windows resource compile failed: {e}\n\
+             Install the Windows SDK (rc.exe) or MinGW windres on PATH."
+        );
+    }
+}
+
 fn main() {
+    if windows_target() {
+        embed_windows_exe_icon();
+    }
+
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let svg_dir = Path::new("assets/cursors/svg");
 

@@ -32,7 +32,7 @@ use gtk::prelude::ToggleButtonExt;
 use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use gtk::prelude::ListItemExt;
 use gtk::prelude::MenuModelExt;
@@ -429,11 +429,35 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
     Some((min_ix, min_iy, rw, rh, premul))
 }
 
+const APP_APPLICATION_ID: &str = "dev.woolymelon.WoolyPaint";
+
+/// Windows groups the taskbar button and pinned shortcut by AppUserModelID. Without this, the
+/// shell often falls back to a generic identity and the pinned icon vanishes when the app exits.
+#[cfg(windows)]
+fn set_windows_app_user_model_id(app_id: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(appid: *const u16) -> i32;
+    }
+
+    let mut wide: Vec<u16> = OsStr::new(app_id).encode_wide().collect();
+    wide.push(0);
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(wide.as_ptr());
+    }
+}
+
 pub fn run() -> gtk::glib::ExitCode {
+    #[cfg(windows)]
+    set_windows_app_user_model_id(APP_APPLICATION_ID);
+
     libadwaita::init().expect("libadwaita init");
     apply_libadwaita_theme_from_disk_early();
     let app = Application::builder()
-        .application_id("dev.woolymelon.WoolyPaint")
+        .application_id(APP_APPLICATION_ID)
         .build();
 
     app.connect_activate(build_ui);
@@ -1134,6 +1158,40 @@ fn refresh_palette_sidebar_full(ps: &PaletteSidebar, state: &SharedState) {
     fill_palette_swatches(ps, state);
 }
 
+/// GTK file dialogs default to the process working directory; on Windows that is often
+/// `System32` when the app is launched from a shortcut. Prefer the document folder,
+/// a recent file's folder, then the standard Documents directory.
+fn file_dialog_initial_folder(doc_path: Option<&Path>, recent_files: &[PathBuf]) -> gio::File {
+    let try_parent = |p: &Path| -> Option<gio::File> {
+        let parent = p.parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        Some(gio::File::for_path(parent))
+    };
+
+    if let Some(p) = doc_path {
+        if let Some(f) = try_parent(p) {
+            return f;
+        }
+    }
+    for recent in recent_files {
+        if let Some(f) = try_parent(recent) {
+            return f;
+        }
+    }
+    if let Some(d) = glib::user_special_dir(glib::UserDirectory::Documents) {
+        return gio::File::for_path(d);
+    }
+    if let Some(h) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+    {
+        return gio::File::for_path(h);
+    }
+    gio::File::for_path(".")
+}
+
 fn sanitize_palette_filename_base(name: &str) -> String {
     let s: String = name
         .chars()
@@ -1168,11 +1226,16 @@ fn import_palette_file(
     let filters = gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&text_filter);
     filters.append(&all_filter);
+    let initial_folder = {
+        let g = state.borrow();
+        file_dialog_initial_folder(g.doc.path.as_deref(), &g.recent_files)
+    };
     let dlg = gtk::FileDialog::builder()
         .title("Import palette")
         .modal(true)
         .filters(&filters)
         .default_filter(&text_filter)
+        .initial_folder(&initial_folder)
         .build();
     let st = state.clone();
     let psc = ps.clone();
@@ -1230,11 +1293,16 @@ fn export_palette_file(window: &libadwaita::ApplicationWindow, state: &SharedSta
     let filters = gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&text_filter);
     let initial = format!("{}.hex", sanitize_palette_filename_base(&default_name));
+    let initial_folder = {
+        let g = state.borrow();
+        file_dialog_initial_folder(g.doc.path.as_deref(), &g.recent_files)
+    };
     let dlg = gtk::FileDialog::builder()
         .title("Export palette")
         .modal(true)
         .filters(&filters)
         .default_filter(&text_filter)
+        .initial_folder(&initial_folder)
         .initial_name(&initial)
         .build();
     let w_alert = window.clone();
@@ -3731,11 +3799,16 @@ fn open_file(
     filters.append(&webp_filter);
     filters.append(&ora_filter);
 
+    let initial_folder = {
+        let g = state.borrow();
+        file_dialog_initial_folder(g.doc.path.as_deref(), &g.recent_files)
+    };
     let dlg = gtk::FileDialog::builder()
         .title("Open image")
         .modal(true)
         .filters(&filters)
         .default_filter(&all_filter)
+        .initial_folder(&initial_folder)
         .build();
     let st = state.clone();
     let lc = layers_cell.clone();
@@ -3787,11 +3860,16 @@ fn save_file_as(
     filters.append(&png_filter);
     filters.append(&ora_filter);
 
+    let initial_folder = {
+        let g = state.borrow();
+        file_dialog_initial_folder(g.doc.path.as_deref(), &g.recent_files)
+    };
     let dlg = gtk::FileDialog::builder()
         .title("Save image")
         .modal(true)
         .filters(&filters)
         .default_filter(&png_filter)
+        .initial_folder(&initial_folder)
         .build();
     let st = state.clone();
     let cv = canvas.clone();
