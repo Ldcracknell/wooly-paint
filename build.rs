@@ -11,6 +11,14 @@ const CURSOR_PX: u32 = 24;
 /// Inset so the icon glyph is visibly smaller than the bitmap.
 const MARGIN: f32 = 4.0;
 
+/// Header / popover menu icons (square PNG — wide textures get scaled down by GTK and look tiny).
+const MENU_ICON_PX: u32 = 32;
+const MENU_ICON_MARGIN: f32 = 3.5;
+/// Foreground on light Adwaita chrome.
+const MENU_STROKE_LIGHT_UI: &str = "#241f31";
+/// Foreground on dark Adwaita chrome.
+const MENU_STROKE_DARK_UI: &str = "#f6f5f4";
+
 /// Lucide cursors use `stroke-width="2"` on the root; draw a wider white stroke underneath for contrast on black.
 const CURSOR_OUTLINE_STROKE: &str = "5";
 
@@ -147,6 +155,35 @@ fn rasterize(
     Ok((hx, hy))
 }
 
+fn rasterize_menu_svg(svg_path: &Path, png_path: &Path, stroke_hex: &str) -> Result<(), String> {
+    let raw = fs::read_to_string(svg_path).map_err(|e| format!("read {}: {e}", svg_path.display()))?;
+    let svg = raw.replace("currentColor", stroke_hex);
+    let tree = usvg::Tree::from_data(svg.as_bytes(), &usvg::Options::default())
+        .map_err(|e| format!("parse {}: {e}", svg_path.display()))?;
+
+    let w = tree.size().width() as f32;
+    let h = tree.size().height() as f32;
+    if w <= 0.0 || h <= 0.0 {
+        return Err(format!("bad size {}", svg_path.display()));
+    }
+    let inner = MENU_ICON_PX as f32 - 2.0 * MENU_ICON_MARGIN;
+    let scale = inner / w.max(h);
+    let tx = MENU_ICON_MARGIN + (inner - w * scale) * 0.5;
+    let ty = MENU_ICON_MARGIN + (inner - h * scale) * 0.5;
+    let transform = tiny_skia::Transform::from_translate(tx, ty)
+        .post_concat(tiny_skia::Transform::from_scale(scale, scale));
+
+    let mut pixmap = tiny_skia::Pixmap::new(MENU_ICON_PX, MENU_ICON_PX)
+        .ok_or_else(|| "menu pixmap".to_string())?;
+    pixmap.fill(tiny_skia::Color::TRANSPARENT);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    pixmap
+        .save_png(png_path)
+        .map_err(|e| format!("write {}: {e}", png_path.display()))?;
+    Ok(())
+}
+
 fn windows_target() -> bool {
     env::var_os("CARGO_CFG_TARGET_OS")
         .is_some_and(|v| v == "windows")
@@ -221,4 +258,47 @@ fn main() {
     }
 
     fs::write(out.join("cursor_hotspots.rs"), hs).expect("write cursor_hotspots.rs");
+
+    let menu_svg_dir = Path::new("assets/menu/svg");
+    let menu_out = out.join("menu");
+    fs::create_dir_all(&menu_out).expect("menu out dir");
+    println!("cargo:rerun-if-changed=assets/menu/svg");
+
+    let menu_icons: &[(&str, &str)] = &[
+        ("file", "files.svg"),
+        ("new", "file-plus.svg"),
+        ("open", "folder-open.svg"),
+        ("recent", "history.svg"),
+        ("save", "save.svg"),
+        ("save_as", "file-up.svg"),
+        ("canvas", "image.svg"),
+        ("resize", "maximize-2.svg"),
+        ("flip_x", "flip-horizontal-2.svg"),
+        ("flip_y", "flip-vertical-2.svg"),
+        ("rotate", "rotate-cw.svg"),
+        ("grid", "grid-3x3.svg"),
+        ("settings", "settings.svg"),
+        ("keybinds", "keyboard.svg"),
+        ("updates", "updates.svg"),
+        ("theme", "sun-moon.svg"),
+        ("theme_default", "monitor.svg"),
+        ("theme_light", "sun.svg"),
+        ("theme_dark", "moon.svg"),
+        ("palettes", "palette.svg"),
+        ("import_hex", "file-down.svg"),
+        ("export_hex", "file-up.svg"),
+        ("manage_palettes", "library.svg"),
+        ("image", "image.svg"),
+    ];
+
+    for (alias, file) in menu_icons {
+        let svg = menu_svg_dir.join(file);
+        println!("cargo:rerun-if-changed={}", svg.display());
+        let light = menu_out.join(format!("{alias}_light.png"));
+        let dark = menu_out.join(format!("{alias}_dark.png"));
+        rasterize_menu_svg(&svg, &light, MENU_STROKE_LIGHT_UI)
+            .unwrap_or_else(|e| panic!("menu icon {alias} light: {e}"));
+        rasterize_menu_svg(&svg, &dark, MENU_STROKE_DARK_UI)
+            .unwrap_or_else(|e| panic!("menu icon {alias} dark: {e}"));
+    }
 }

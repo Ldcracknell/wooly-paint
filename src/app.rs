@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use gtk::prelude::ListItemExt;
 use gtk::prelude::MenuModelExt;
+use gtk::prelude::PopoverExt;
 
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
@@ -542,6 +543,10 @@ fn install_app_css() {
         }}
         drawingarea.canvas-chrome {{
           background-color: {hex};
+        }}
+        /* Flat GtkPopoverMenu (Canvas) still allocates a StackSidebar column; hide it. */
+        popover.wp-menubar-canvas-popover stacksidebar {{
+          min-width: 0;
         }}
         ",
         hex = CANVAS_CHROME_HEX
@@ -4012,6 +4017,193 @@ fn try_paste_system_clipboard(
     );
 }
 
+fn menu_ui_dark() -> bool {
+    libadwaita::StyleManager::default().is_dark()
+}
+
+/// Two leading spaces on header menubar menu labels (extra separation after icons).
+fn menu_label_with_leading_spaces(label: &str) -> String {
+    format!("  {label}")
+}
+
+fn menu_row_with_icon(
+    label: &str,
+    detailed_action: &str,
+    icon_alias: &str,
+    ui_dark: bool,
+) -> gio::MenuItem {
+    let label = menu_label_with_leading_spaces(label);
+    let item = gio::MenuItem::new(Some(&label), Some(detailed_action));
+    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(icon_alias, ui_dark));
+    item
+}
+
+/// Top-level `GtkPopoverMenuBar` section (File / Canvas / Settings): no leading spaces.
+fn menu_root_submenu_row(
+    label: &str,
+    submenu: &gio::Menu,
+    icon_alias: &str,
+    ui_dark: bool,
+) -> gio::MenuItem {
+    let item = gio::MenuItem::new_submenu(Some(label), submenu);
+    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(icon_alias, ui_dark));
+    item
+}
+
+/// Submenu row inside a popover (Recent Files, theme, palettes, …): leading spaces after icon.
+fn menu_submenu_row(
+    label: &str,
+    submenu: &gio::Menu,
+    icon_alias: &str,
+    ui_dark: bool,
+) -> gio::MenuItem {
+    let label = menu_label_with_leading_spaces(label);
+    let item = gio::MenuItem::new_submenu(Some(&label), submenu);
+    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(icon_alias, ui_dark));
+    item
+}
+
+/// Horizontal gap between menu icon and label (px).
+const MENU_ICON_LABEL_GAP_PX: i32 = 28;
+
+/// GTK 4 keeps menu row icon widgets invisible by default; icons are still attached to the model.
+fn reveal_popover_menu_icons(widget: &gtk::Widget) {
+    if let Some(img) = widget.downcast_ref::<gtk::Image>() {
+        img.set_visible(true);
+        if img.paintable().is_some() {
+            img.set_pixel_size(32);
+            img.set_margin_end(MENU_ICON_LABEL_GAP_PX);
+        }
+    }
+    if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
+        pic.set_visible(true);
+        pic.set_margin_end(MENU_ICON_LABEL_GAP_PX);
+    }
+    let mut c = widget.first_child();
+    while let Some(child) = c {
+        reveal_popover_menu_icons(&child);
+        c = child.next_sibling();
+    }
+}
+
+/// `GtkPopoverMenuBar` uses private `item` widgets (not `GtkMenuButton`). Find every `GtkPopover*` in the subtree.
+fn find_first_popover_in_subtree(w: &gtk::Widget) -> Option<gtk::Popover> {
+    if let Some(pm) = w.downcast_ref::<gtk::PopoverMenu>() {
+        return Some(pm.clone().upcast());
+    }
+    if let Some(p) = w.downcast_ref::<gtk::Popover>() {
+        return Some(p.clone());
+    }
+    let mut c = w.first_child();
+    while let Some(ch) = c {
+        if let Some(found) = find_first_popover_in_subtree(&ch) {
+            return Some(found);
+        }
+        c = ch.next_sibling();
+    }
+    None
+}
+
+/// `GtkPopoverMenu` nested layout always includes a `GtkStackSidebar`; for a flat menu (Canvas)
+/// the sidebar is empty but still reserves width. Hide it so rows align with File/Settings.
+fn collapse_canvas_popover_empty_sidebar(pop: &gtk::Popover) {
+    if !pop.has_css_class("wp-menubar-canvas-popover") {
+        return;
+    }
+    fn walk(w: &gtk::Widget) {
+        if let Some(side) = w.downcast_ref::<gtk::StackSidebar>() {
+            side.set_visible(false);
+        }
+        let mut c = w.first_child();
+        while let Some(ch) = c {
+            walk(&ch);
+            c = ch.next_sibling();
+        }
+    }
+    walk(pop.upcast_ref());
+    if let Some(ch) = pop.child() {
+        walk(&ch);
+    }
+}
+
+fn wire_popover_for_menubar_icons(pop: &gtk::Popover) {
+    if pop.has_css_class("wp-menubar-popover-icons-wired") {
+        return;
+    }
+    pop.add_css_class("wp-menubar-popover-icons-wired");
+
+    let pop_for_map = pop.clone();
+    pop.connect_map(move |_| {
+        reveal_popover_menu_icons(pop_for_map.upcast_ref());
+        collapse_canvas_popover_empty_sidebar(&pop_for_map);
+        let p_idle = pop_for_map.clone();
+        glib::idle_add_local_once(move || {
+            reveal_popover_menu_icons(p_idle.upcast_ref());
+            collapse_canvas_popover_empty_sidebar(&p_idle);
+        });
+    });
+
+    if let Some(pm) = pop.downcast_ref::<gtk::PopoverMenu>() {
+        let pm_for_sub = pm.clone();
+        pm.connect_visible_submenu_notify(move |_| {
+            reveal_popover_menu_icons(pm_for_sub.upcast_ref());
+            collapse_canvas_popover_empty_sidebar(pm_for_sub.upcast_ref());
+            let p_idle = pm_for_sub.clone();
+            glib::idle_add_local_once(move || {
+                reveal_popover_menu_icons(p_idle.upcast_ref());
+                collapse_canvas_popover_empty_sidebar(p_idle.upcast_ref());
+            });
+        });
+    }
+}
+
+fn wire_popovers_in_menubar_subtree(w: &gtk::Widget) {
+    if let Some(pm) = w.downcast_ref::<gtk::PopoverMenu>() {
+        wire_popover_for_menubar_icons(pm.upcast_ref());
+    } else if let Some(pop) = w.downcast_ref::<gtk::Popover>() {
+        wire_popover_for_menubar_icons(pop);
+    }
+    let mut c = w.first_child();
+    while let Some(ch) = c {
+        wire_popovers_in_menubar_subtree(&ch);
+        c = ch.next_sibling();
+    }
+}
+
+fn wire_popover_menu_bar_row_icons(menubar: &gtk::PopoverMenuBar) {
+    wire_popovers_in_menubar_subtree(menubar.upcast_ref());
+}
+
+/// Second top-level bar item is Canvas (matches `build_menu_model` order: File, Canvas, Settings).
+fn tag_canvas_menubar_popover(menubar: &gtk::PopoverMenuBar) {
+    let mut c = menubar.first_child();
+    let mut i = 0i32;
+    while let Some(item) = c {
+        item.remove_css_class("wp-menubar-canvas-item");
+        if let Some(pop) = find_first_popover_in_subtree(&item) {
+            pop.remove_css_class("wp-menubar-canvas-popover");
+        }
+        if i == 1 {
+            item.add_css_class("wp-menubar-canvas-item");
+            if let Some(pop) = find_first_popover_in_subtree(&item) {
+                pop.add_css_class("wp-menubar-canvas-popover");
+            }
+        }
+        i += 1;
+        c = item.next_sibling();
+    }
+}
+
+fn setup_header_menubar_popovers(menubar: &gtk::PopoverMenuBar) {
+    tag_canvas_menubar_popover(menubar);
+    wire_popover_menu_bar_row_icons(menubar);
+    let mb = menubar.clone();
+    glib::idle_add_local_once(move || {
+        tag_canvas_menubar_popover(&mb);
+        wire_popover_menu_bar_row_icons(&mb);
+    });
+}
+
 fn recent_file_menu_label(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -4019,16 +4211,17 @@ fn recent_file_menu_label(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn refresh_recent_files_menu(menu: &gio::Menu, state: &AppState) {
+fn refresh_recent_files_menu(menu: &gio::Menu, state: &AppState, ui_dark: bool) {
     while menu.n_items() > 0 {
         menu.remove(0);
     }
     for path in &state.recent_files {
-        let label = recent_file_menu_label(path);
+        let label = menu_label_with_leading_spaces(&recent_file_menu_label(path));
         let item = gio::MenuItem::new(Some(&label), None);
         let ps = path.to_string_lossy();
         let v = ps.as_ref().to_variant();
         item.set_action_and_target_value(Some("win.open_recent"), Some(&v));
+        item.set_icon(&crate::menu_icons::menu_bar_icon_texture("image", ui_dark));
         menu.append_item(&item);
     }
 }
@@ -4065,7 +4258,7 @@ fn open_document_from_path(
             g.bump_document_revision();
             crate::settings::record_recent_open(&mut g, path_buf);
             drop(g);
-            refresh_recent_files_menu(recent_menu, &state.borrow());
+            refresh_recent_files_menu(recent_menu, &state.borrow(), menu_ui_dark());
             zoom_to_fit(state, canvas);
             refresh_layers_list(state, layers_cell, canvas);
             queue_canvas(canvas);
@@ -4646,7 +4839,7 @@ fn build_ui(app: &Application) {
     libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(loaded_theme));
     let state: SharedState = Rc::new(RefCell::new(initial_state));
     let recent_files_menu = Rc::new(gio::Menu::new());
-    refresh_recent_files_menu(&recent_files_menu, &state.borrow());
+    refresh_recent_files_menu(&recent_files_menu, &state.borrow(), menu_ui_dark());
 
     let st_shutdown = state.clone();
     app.connect_shutdown(move |_| {
@@ -5879,7 +6072,7 @@ fn build_ui(app: &Application) {
     split.append(&editor);
     split.append(&revealer);
 
-    let menu_model = build_menu(
+    register_window_menu_actions(
         &window,
         &state,
         &layers_cell,
@@ -5889,7 +6082,23 @@ fn build_ui(app: &Application) {
         recent_files_menu.clone(),
         palette_sidebar.clone(),
     );
+    let menu_model = build_menu_model(menu_ui_dark(), recent_files_menu.as_ref());
     let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
+    setup_header_menubar_popovers(&menubar);
+    let mb_on_map = menubar.clone();
+    menubar.connect_map(move |_| {
+        setup_header_menubar_popovers(&mb_on_map);
+    });
+
+    let mb_theme = menubar.clone();
+    let recent_theme = recent_files_menu.clone();
+    let state_theme = state.clone();
+    libadwaita::StyleManager::default().connect_dark_notify(move |_| {
+        let ui_dark = menu_ui_dark();
+        refresh_recent_files_menu(&recent_theme, &state_theme.borrow(), ui_dark);
+        mb_theme.set_menu_model(Some(&build_menu_model(ui_dark, recent_theme.as_ref())));
+        setup_header_menubar_popovers(&mb_theme);
+    });
 
     let header = libadwaita::HeaderBar::new();
     header.pack_start(&menubar);
@@ -6249,7 +6458,110 @@ fn menu_value_for_color_scheme(scheme: ColorScheme) -> &'static str {
     }
 }
 
-fn build_menu(
+fn build_menu_model(ui_dark: bool, recent_menu: &gio::Menu) -> gio::Menu {
+    let menu = gio::Menu::new();
+
+    let file = gio::Menu::new();
+    file.append_item(&menu_row_with_icon("New…", "win.new", "new", ui_dark));
+    file.append_item(&menu_row_with_icon("Open…", "win.open", "open", ui_dark));
+    file.append_item(&menu_submenu_row("Recent Files", recent_menu, "recent", ui_dark));
+    file.append_item(&menu_row_with_icon("Save", "win.save", "save", ui_dark));
+    file.append_item(&menu_row_with_icon("Save As…", "win.save_as", "save_as", ui_dark));
+    menu.append_item(&menu_root_submenu_row("_File", &file, "file", ui_dark));
+
+    let canvas_menu = gio::Menu::new();
+    canvas_menu.append_item(&menu_row_with_icon(
+        "Resize canvas…",
+        "win.canvas_resize",
+        "resize",
+        ui_dark,
+    ));
+    canvas_menu.append_item(&menu_row_with_icon(
+        "Flip X",
+        "win.canvas_flip_x",
+        "flip_x",
+        ui_dark,
+    ));
+    canvas_menu.append_item(&menu_row_with_icon(
+        "Flip Y",
+        "win.canvas_flip_y",
+        "flip_y",
+        ui_dark,
+    ));
+    canvas_menu.append_item(&menu_row_with_icon(
+        "Rotate",
+        "win.canvas_rotate_cw",
+        "rotate",
+        ui_dark,
+    ));
+    canvas_menu.append_item(&menu_row_with_icon(
+        "Pixel grid",
+        "win.show_pixel_grid",
+        "grid",
+        ui_dark,
+    ));
+    menu.append_item(&menu_root_submenu_row("_Canvas", &canvas_menu, "canvas", ui_dark));
+
+    let settings = gio::Menu::new();
+    settings.append_item(&menu_row_with_icon(
+        "Keybinds…",
+        "win.keybinds",
+        "keybinds",
+        ui_dark,
+    ));
+    settings.append_item(&menu_row_with_icon(
+        "Check for Updates…",
+        "win.check_updates",
+        "updates",
+        ui_dark,
+    ));
+    let theme = gio::Menu::new();
+    theme.append_item(&menu_row_with_icon(
+        "_Default",
+        "win.color_scheme('default')",
+        "theme_default",
+        ui_dark,
+    ));
+    theme.append_item(&menu_row_with_icon(
+        "_Light",
+        "win.color_scheme('light')",
+        "theme_light",
+        ui_dark,
+    ));
+    theme.append_item(&menu_row_with_icon(
+        "_Dark",
+        "win.color_scheme('dark')",
+        "theme_dark",
+        ui_dark,
+    ));
+    settings.append_item(&menu_submenu_row("Color _theme", &theme, "theme", ui_dark));
+
+    let pal_menu = gio::Menu::new();
+    pal_menu.append_item(&menu_row_with_icon(
+        "Import hex…",
+        "win.palette_import",
+        "import_hex",
+        ui_dark,
+    ));
+    pal_menu.append_item(&menu_row_with_icon(
+        "Export hex…",
+        "win.palette_export",
+        "export_hex",
+        ui_dark,
+    ));
+    pal_menu.append_item(&menu_row_with_icon(
+        "Manage palettes…",
+        "win.palette_manage",
+        "manage_palettes",
+        ui_dark,
+    ));
+    settings.append_item(&menu_submenu_row("_Palettes", &pal_menu, "palettes", ui_dark));
+    menu.append_item(&menu_root_submenu_row("_Settings", &settings, "settings", ui_dark));
+
+    menu
+}
+
+fn register_window_menu_actions(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
     layers_cell: &LayersCell,
@@ -6258,39 +6570,7 @@ fn build_menu(
     tool_strings: &gtk::StringList,
     recent_menu: Rc<gio::Menu>,
     palette_sidebar: PaletteSidebar,
-) -> gio::Menu {
-    let menu = gio::Menu::new();
-    let file = gio::Menu::new();
-    file.append(Some("New…"), Some("win.new"));
-    file.append(Some("Open…"), Some("win.open"));
-    file.append_submenu(Some("Recent Files"), &*recent_menu);
-    file.append(Some("Save"), Some("win.save"));
-    file.append(Some("Save As…"), Some("win.save_as"));
-    menu.append_submenu(Some("_File"), &file);
-
-    let canvas_menu = gio::Menu::new();
-    canvas_menu.append(Some("Resize canvas…"), Some("win.canvas_resize"));
-    canvas_menu.append(Some("Flip X"), Some("win.canvas_flip_x"));
-    canvas_menu.append(Some("Flip Y"), Some("win.canvas_flip_y"));
-    canvas_menu.append(Some("Rotate 90deg"), Some("win.canvas_rotate_cw"));
-    canvas_menu.append(Some("Pixel grid"), Some("win.show_pixel_grid"));
-    menu.append_submenu(Some("_Canvas"), &canvas_menu);
-
-    let settings = gio::Menu::new();
-    settings.append(Some("Keybinds…"), Some("win.keybinds"));
-    settings.append(Some("Check for Updates…"), Some("win.check_updates"));
-    let theme = gio::Menu::new();
-    theme.append(Some("_Default"), Some("win.color_scheme('default')"));
-    theme.append(Some("_Light"), Some("win.color_scheme('light')"));
-    theme.append(Some("_Dark"), Some("win.color_scheme('dark')"));
-    settings.append_submenu(Some("Color _theme"), &theme);
-    let pal_menu = gio::Menu::new();
-    pal_menu.append(Some("Import hex…"), Some("win.palette_import"));
-    pal_menu.append(Some("Export hex…"), Some("win.palette_export"));
-    pal_menu.append(Some("Manage palettes…"), Some("win.palette_manage"));
-    settings.append_submenu(Some("_Palettes"), &pal_menu);
-    menu.append_submenu(Some("_Settings"), &settings);
-
+) {
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
@@ -6403,22 +6683,14 @@ fn build_menu(
 
     let st_grid = state.clone();
     let cv_grid = canvas.clone();
-    let initial_grid = state.borrow().show_pixel_grid;
-    let pixel_grid_act = gio::SimpleAction::new_stateful(
-        "show_pixel_grid",
-        None,
-        &initial_grid.to_variant(),
-    );
-    pixel_grid_act.connect_activate(move |action, _| {
-        let current = action
-            .state()
-            .and_then(|v| v.get::<bool>())
-            .unwrap_or(false);
-        let new_state = !current;
-        action.set_state(&new_state.to_variant());
-        st_grid.borrow_mut().show_pixel_grid = new_state;
+    // Plain action: stateful toggles reserve a checkmark column for the entire submenu.
+    let pixel_grid_act = gio::SimpleAction::new("show_pixel_grid", None);
+    pixel_grid_act.connect_activate(move |_, _| {
+        let mut st = st_grid.borrow_mut();
+        st.show_pixel_grid = !st.show_pixel_grid;
+        crate::settings::persist(&st);
+        drop(st);
         queue_canvas(&cv_grid);
-        crate::settings::persist(&st_grid.borrow());
     });
     app_add_action(window, &pixel_grid_act);
 
@@ -6557,8 +6829,6 @@ fn build_menu(
         manage_palettes_dialog(&w_pm, &st, &ps_m);
     });
     app_add_action(window, &palette_manage_act);
-
-    menu
 }
 
 

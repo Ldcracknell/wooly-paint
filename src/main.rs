@@ -1,5 +1,6 @@
 mod app;
 mod document;
+mod menu_icons;
 mod palette;
 mod selection;
 mod settings;
