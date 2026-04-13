@@ -7,6 +7,25 @@ use gtk::glib;
 use gtk::prelude::WidgetExt;
 use std::cell::RefCell;
 
+/// Lucide-derived PNG (same raster as the canvas cursor) for tool dropdown rows.
+pub fn tool_dropdown_icon_texture(tool: ToolKind) -> gdk::Texture {
+    let bytes: &'static [u8] = match tool {
+        ToolKind::Brush => include_bytes!(concat!(env!("OUT_DIR"), "/brush.png")),
+        ToolKind::Pixel => include_bytes!(concat!(env!("OUT_DIR"), "/pixel.png")),
+        ToolKind::Eraser => include_bytes!(concat!(env!("OUT_DIR"), "/eraser.png")),
+        ToolKind::Eyedropper => include_bytes!(concat!(env!("OUT_DIR"), "/eyedropper.png")),
+        ToolKind::Fill => include_bytes!(concat!(env!("OUT_DIR"), "/fill.png")),
+        ToolKind::Line => include_bytes!(concat!(env!("OUT_DIR"), "/line.png")),
+        ToolKind::Rect => include_bytes!(concat!(env!("OUT_DIR"), "/rect.png")),
+        ToolKind::Ellipse => include_bytes!(concat!(env!("OUT_DIR"), "/ellipse.png")),
+        ToolKind::SelectRect => include_bytes!(concat!(env!("OUT_DIR"), "/select.png")),
+        ToolKind::MagicSelect => include_bytes!(concat!(env!("OUT_DIR"), "/wand.png")),
+        ToolKind::Move => include_bytes!(concat!(env!("OUT_DIR"), "/move.png")),
+        ToolKind::Hand => include_bytes!(concat!(env!("OUT_DIR"), "/hand.png")),
+    };
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(bytes)).expect("tool dropdown icon png")
+}
+
 include!(concat!(env!("OUT_DIR"), "/cursor_hotspots.rs"));
 
 pub struct ToolCursorPack {

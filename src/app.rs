@@ -487,6 +487,7 @@ pub fn run() -> gtk::glib::ExitCode {
 
     libadwaita::init().expect("libadwaita init");
     apply_libadwaita_theme_from_disk_early();
+    install_app_css();
     let app = Application::builder()
         .application_id(APP_APPLICATION_ID)
         .build();
@@ -507,29 +508,254 @@ fn apply_libadwaita_theme_from_disk_early() {
     }
 }
 
-fn tool_label(tool: ToolKind, key: Option<char>) -> String {
-    match key {
-        Some(c) => format!("{} ({})", tool.display_name(), c.to_ascii_uppercase()),
-        None => tool.display_name().to_string(),
+/// Dark window chrome behind the canvas; same as [`CANVAS_SURROUND_RGB`] (letterbox fill).
+const CANVAS_CHROME_HEX: &str = "#222226";
+const CANVAS_SURROUND_RGB: (f64, f64, f64) = (
+    0x22 as f64 / 255.0,
+    0x22 as f64 / 255.0,
+    0x26 as f64 / 255.0,
+);
+
+fn install_app_css() {
+    let provider = gtk::CssProvider::new();
+    let css = format!(
+        "
+        button.palette-swatch {{
+          padding: 0;
+          min-width: 0;
+          min-height: 0;
+          border-radius: 0;
+        }}
+        button.palette-swatch:focus:focus-visible {{
+          outline-width: 2px;
+          outline-offset: -2px;
+        }}
+        button.keybind-unassigned {{
+          opacity: 0.55;
+          font-style: italic;
+        }}
+        label.wp-readable-dim {{
+          opacity: 0.92;
+        }}
+        scrolledwindow.palette-grid-frame {{
+          border: 1px solid rgba(0, 0, 0, 0.88);
+        }}
+        drawingarea.canvas-chrome {{
+          background-color: {hex};
+        }}
+        ",
+        hex = CANVAS_CHROME_HEX
+    );
+    provider.load_from_string(&css);
+    gtk::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("display"),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
+/// Minimum palette swatch edge (px); column count ≈ `floor(flow_width / this)`.
+const PALETTE_CELL_MIN_PX: i32 = 22;
+
+fn sync_palette_flow_columns(flow: &gtk::FlowBox) {
+    let w = flow.width();
+    if w < PALETTE_CELL_MIN_PX {
+        return;
     }
+    let n = (w / PALETTE_CELL_MIN_PX).max(1).min(64) as u32;
+    flow.set_max_children_per_line(n);
+}
+
+fn sync_tool_options_visibility(
+    tool: ToolKind,
+    sep_after_tool: &gtk::Separator,
+    size_lbl: &gtk::Label,
+    size_spin: &gtk::SpinButton,
+    sep_size_hard: &gtk::Separator,
+    hard_lbl: &gtk::Label,
+    hard_scale: &gtk::Scale,
+    sep_before_tol: &gtk::Separator,
+    tol_lbl: &gtk::Label,
+    tol_spin: &gtk::SpinButton,
+    sep_before_filled: &gtk::Separator,
+    fill_check: &gtk::CheckButton,
+) {
+    let show_size = matches!(
+        tool,
+        ToolKind::Brush
+            | ToolKind::Pixel
+            | ToolKind::Eraser
+            | ToolKind::Line
+            | ToolKind::Rect
+            | ToolKind::Ellipse
+    );
+    let show_hard = matches!(
+        tool,
+        ToolKind::Brush | ToolKind::Eraser | ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse
+    );
+    let show_tol = matches!(tool, ToolKind::Fill | ToolKind::MagicSelect);
+    let show_filled = matches!(tool, ToolKind::Rect | ToolKind::Ellipse);
+
+    let any_opts = show_size || show_hard || show_tol || show_filled;
+    sep_after_tool.set_visible(any_opts);
+
+    size_lbl.set_visible(show_size);
+    size_spin.set_visible(show_size);
+    sep_size_hard.set_visible(show_size && show_hard);
+
+    hard_lbl.set_visible(show_hard);
+    hard_scale.set_visible(show_hard);
+
+    let brush_block = show_size || show_hard;
+    sep_before_tol.set_visible(show_tol && brush_block);
+    tol_lbl.set_visible(show_tol);
+    tol_spin.set_visible(show_tol);
+    if show_tol {
+        let tol_text = if tool == ToolKind::MagicSelect {
+            "Magic tol"
+        } else {
+            "Fill tol"
+        };
+        tol_lbl.set_label(tol_text);
+    }
+
+    sep_before_filled.set_visible(show_filled && brush_block);
+    fill_check.set_visible(show_filled);
+}
+
+/// Row model for the tool [`gtk::DropDown`]: `"{display_name}\\t{key}"` (key = one ASCII letter or empty).
+fn tool_dropdown_model_string(tool: ToolKind, key: Option<char>) -> String {
+    let k = key
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_default();
+    format!("{}\t{}", tool.display_name(), k)
+}
+
+fn tool_for_display_name(name: &str) -> Option<ToolKind> {
+    [
+        ToolKind::Brush,
+        ToolKind::Pixel,
+        ToolKind::Eraser,
+        ToolKind::Eyedropper,
+        ToolKind::Fill,
+        ToolKind::Line,
+        ToolKind::Rect,
+        ToolKind::Ellipse,
+        ToolKind::SelectRect,
+        ToolKind::MagicSelect,
+        ToolKind::Move,
+        ToolKind::Hand,
+    ]
+    .into_iter()
+    .find(|t| t.display_name() == name)
+}
+
+fn tool_dropdown_row_factory() -> gtk::SignalListItemFactory {
+    let f = gtk::SignalListItemFactory::new();
+    f.connect_setup(|_, list_item| {
+        let Some(li) = list_item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let bx = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        let img = gtk::Image::builder()
+            .pixel_size(18)
+            .valign(gtk::Align::Center)
+            .build();
+        let name_lbl = gtk::Label::builder()
+            .xalign(0.0)
+            .valign(gtk::Align::Center)
+            .hexpand(false)
+            .build();
+        let spacer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .hexpand(true)
+            .build();
+        let short_lbl = gtk::Label::builder()
+            .xalign(1.0)
+            .valign(gtk::Align::Center)
+            .hexpand(false)
+            .build();
+        short_lbl.add_css_class("dim-label");
+        bx.append(&img);
+        bx.append(&name_lbl);
+        bx.append(&spacer);
+        bx.append(&short_lbl);
+        li.set_child(Some(&bx));
+    });
+    f.connect_bind(|_, list_item| {
+        let Some(li) = list_item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(bx) = li.child().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let img = bx.first_child().and_downcast::<gtk::Image>();
+        let name_lbl = img
+            .as_ref()
+            .and_then(|im| im.next_sibling())
+            .and_downcast::<gtk::Label>();
+        let short_lbl = name_lbl
+            .as_ref()
+            .and_then(|l| l.next_sibling())
+            .and_then(|w| w.next_sibling())
+            .and_downcast::<gtk::Label>();
+        let (Some(img), Some(name_lbl), Some(short_lbl)) = (img, name_lbl, short_lbl) else {
+            return;
+        };
+        let Some(obj) = li.item() else {
+            return;
+        };
+        let Some(so) = obj.downcast_ref::<gtk::StringObject>() else {
+            return;
+        };
+        let row = so.string();
+        let mut parts = row.as_str().splitn(2, '\t');
+        let disp = parts.next().unwrap_or("");
+        let key_raw = parts.next().unwrap_or("");
+        if let Some(t) = tool_for_display_name(disp) {
+            img.set_paintable(Some(&tool_cursors::tool_dropdown_icon_texture(t)));
+        }
+        name_lbl.set_label(disp);
+        if key_raw.is_empty() {
+            short_lbl.set_label("");
+        } else {
+            short_lbl.set_label(&format!("({key_raw})"));
+        }
+    });
+    f
 }
 
 /// Minimum width for the tool [`gtk::DropDown`] so every option fits at the widget font without truncation.
-fn tool_dropdown_width_request(dropdown: &gtk::DropDown, labels: &[String]) -> i32 {
-    const DROPDOWN_CHROME_PX: i32 = 52;
-    let mut max_label_px = 0i32;
-    for text in labels {
-        let layout = dropdown.create_pango_layout(Some(text.as_str()));
-        let (w, _) = layout.pixel_size();
-        max_label_px = max_label_px.max(w);
+fn tool_dropdown_width_request(dropdown: &gtk::DropDown, model_rows: &[String]) -> i32 {
+    const ICON_GAP_CHROME_PX: i32 = 18 + 8 + 8 + 8 + 52;
+    let mut max_row_px = 0i32;
+    for row in model_rows {
+        let mut parts = row.splitn(2, '\t');
+        let disp = parts.next().unwrap_or("");
+        let k = parts.next().unwrap_or("");
+        let layout_d = dropdown.create_pango_layout(Some(disp));
+        let (wd, _) = layout_d.pixel_size();
+        let wk = if k.is_empty() {
+            0
+        } else {
+            let layout_k = dropdown.create_pango_layout(Some(&format!("({k})")));
+            layout_k.pixel_size().0
+        };
+        max_row_px = max_row_px.max(wd + wk);
     }
-    max_label_px + DROPDOWN_CHROME_PX
+    max_row_px + ICON_GAP_CHROME_PX
 }
 
 fn refresh_tool_labels(state: &SharedState, sl: &gtk::StringList) {
     let labels: Vec<String> = {
         let st = state.borrow();
-        st.tool_keybinds.iter().map(|(t, k)| tool_label(*t, *k)).collect()
+        st.tool_keybinds
+            .iter()
+            .map(|(t, k)| tool_dropdown_model_string(*t, *k))
+            .collect()
     };
     let strs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
     sl.splice(0, sl.n_items(), &strs);
@@ -944,7 +1170,7 @@ fn picker_gradient_spin_row(label: &str, track: &gtk::DrawingArea, spin: &gtk::S
     let l = gtk::Label::new(Some(label));
     l.set_width_request(28);
     l.set_xalign(1.0);
-    l.add_css_class("dim-label");
+    l.add_css_class("wp-readable-dim");
     spin.set_width_request(72);
     spin.set_digits(0);
     row.append(&l);
@@ -965,7 +1191,7 @@ fn swatch_button(fg: [u8; 4], fill_cell: bool) -> gtk::Button {
     let da = if fill_cell {
         gtk::DrawingArea::builder()
             .width_request(20)
-            .height_request(26)
+            .height_request(20)
             .hexpand(true)
             .vexpand(true)
             .halign(gtk::Align::Fill)
@@ -989,15 +1215,20 @@ fn swatch_button(fg: [u8; 4], fill_cell: bool) -> gtk::Button {
         cr.set_source_rgba(r, g, b, a);
         cr.rectangle(0.0, 0.0, w as f64, h as f64);
         let _ = cr.fill();
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+        let wf = w as f64;
+        let hf = h as f64;
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.88);
         cr.set_line_width(1.0);
-        cr.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
+        cr.move_to(wf - 0.5, 0.0);
+        cr.line_to(wf - 0.5, hf);
+        cr.move_to(0.0, hf - 0.5);
+        cr.line_to(wf, hf - 0.5);
         let _ = cr.stroke();
     });
     let btn = if fill_cell {
         gtk::Button::builder()
             .child(&da)
-            .css_classes(["flat"])
+            .css_classes(["flat", "palette-swatch"])
             .hexpand(true)
             .vexpand(true)
             .halign(gtk::Align::Fill)
@@ -1021,7 +1252,7 @@ fn swatch_button(fg: [u8; 4], fill_cell: bool) -> gtk::Button {
 fn palette_add_color_tile_button() -> gtk::Button {
     let da = gtk::DrawingArea::builder()
         .width_request(20)
-        .height_request(26)
+        .height_request(20)
         .hexpand(true)
         .vexpand(true)
         .halign(gtk::Align::Fill)
@@ -1036,9 +1267,12 @@ fn palette_add_color_tile_button() -> gtk::Button {
         cr.set_source_rgba(0.12, 0.12, 0.13, 1.0);
         cr.rectangle(0.0, 0.0, w, h);
         let _ = cr.fill();
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.88);
         cr.set_line_width(1.0);
-        cr.rectangle(0.5, 0.5, w - 1.0, h - 1.0);
+        cr.move_to(w - 0.5, 0.0);
+        cr.line_to(w - 0.5, h);
+        cr.move_to(0.0, h - 0.5);
+        cr.line_to(w, h - 0.5);
         let _ = cr.stroke();
         let cx = w * 0.5;
         let cy = h * 0.5;
@@ -1053,7 +1287,7 @@ fn palette_add_color_tile_button() -> gtk::Button {
     });
     gtk::Button::builder()
         .child(&da)
-        .css_classes(["flat"])
+        .css_classes(["flat", "palette-swatch"])
         .hexpand(true)
         .vexpand(true)
         .halign(gtk::Align::Fill)
@@ -1181,6 +1415,7 @@ fn fill_palette_swatches(ps: &PaletteSidebar, state: &SharedState) {
         }
     });
     flow.append(&add_btn);
+    sync_palette_flow_columns(flow);
 }
 
 fn refresh_palette_sidebar_full(ps: &PaletteSidebar, state: &SharedState) {
@@ -2343,7 +2578,12 @@ fn region_mask_outline_path(cr: &gtk::cairo::Context, mask: &[u8], rw: u32, rh: 
     }
 }
 
-fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context) {
+fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, widget_h: i32) {
+    let (sr, sg, sb) = CANVAS_SURROUND_RGB;
+    cr.set_source_rgb(sr, sg, sb);
+    cr.rectangle(0.0, 0.0, widget_w as f64, widget_h as f64);
+    let _ = cr.fill();
+
     let (
         w,
         h,
@@ -2732,6 +2972,7 @@ fn paint_brush_drag_sample(
         Some(l) => l,
         None => return false,
     };
+    let clip = st.stroke_paint_clip.as_ref();
     match st.tool {
         ToolKind::Brush | ToolKind::Eraser => {
             let radius = st.brush_size * 0.5;
@@ -2745,6 +2986,7 @@ fn paint_brush_drag_sample(
                 st.brush_hardness,
                 paint_color,
                 eraser,
+                clip,
             );
         }
         ToolKind::Pixel => {
@@ -2757,6 +2999,7 @@ fn paint_brush_drag_sample(
                 st.brush_size,
                 paint_color,
                 false,
+                clip,
             );
         }
         _ => return false,
@@ -2869,6 +3112,11 @@ fn setup_canvas_input(
                 if st.doc.active_layer_ref().is_none() {
                     return;
                 }
+                st.stroke_paint_clip = if st.floating.is_none() {
+                    st.selection.clone()
+                } else {
+                    None
+                };
                 let eraser = st.tool == ToolKind::Eraser;
                 let color = if eraser {
                     st.fg
@@ -2882,8 +3130,11 @@ fn setup_canvas_input(
                 st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
+                let held_clip = st.stroke_paint_clip.take();
+                let clip = held_clip.as_ref();
                 let layer = st.doc.active_layer_mut().expect("checked");
-                stamp_circle(layer, dx, dy, radius, hardness, color, eraser);
+                stamp_circle(layer, dx, dy, radius, hardness, color, eraser, clip);
+                st.stroke_paint_clip = held_clip;
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
                 start_brush_paint_tick = true;
@@ -2892,6 +3143,11 @@ fn setup_canvas_input(
                 if st.doc.active_layer_ref().is_none() {
                     return;
                 }
+                st.stroke_paint_clip = if st.floating.is_none() {
+                    st.selection.clone()
+                } else {
+                    None
+                };
                 let color = st.active_paint_color();
                 let size = st.brush_size;
                 st.brush_stroke_in_progress = true;
@@ -2899,8 +3155,11 @@ fn setup_canvas_input(
                 st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
+                let held_clip = st.stroke_paint_clip.take();
+                let clip = held_clip.as_ref();
                 let layer = st.doc.active_layer_mut().expect("checked");
-                stamp_square(layer, dx, dy, size, color, false);
+                stamp_square(layer, dx, dy, size, color, false, clip);
+                st.stroke_paint_clip = held_clip;
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
                 start_brush_paint_tick = true;
@@ -2910,6 +3169,11 @@ fn setup_canvas_input(
                 let tol = st.fill_tolerance;
                 let dw = st.doc.width;
                 let dh = st.doc.height;
+                let fill_clip = if st.floating.is_none() {
+                    st.selection.clone()
+                } else {
+                    None
+                };
                 st.begin_stroke_undo();
                 if let Some(layer) = st.doc.active_layer_mut() {
                     let pv = straight_to_premul(&[fg[0], fg[1], fg[2], fg[3]]);
@@ -2920,6 +3184,7 @@ fn setup_canvas_input(
                         dy.floor().clamp(0.0, dh as f64 - 1.0) as u32,
                         fill,
                         tol,
+                        fill_clip.as_ref(),
                     );
                     st.modified = true;
                 }
@@ -3076,6 +3341,11 @@ fn setup_canvas_input(
                                     ));
                                     st.selection = None;
                                     st.modified = true;
+                                    st.floating_drag = Some(FloatingDrag::Move {
+                                        grab_off_x: dx - sx as f64,
+                                        grab_off_y: dy - sy as f64,
+                                    });
+                                    *mws_b.borrow_mut() = Some((wx, wy));
                                 }
                                 Selection::Region {
                                     width,
@@ -3112,6 +3382,11 @@ fn setup_canvas_input(
                                     ));
                                     st.selection = None;
                                     st.modified = true;
+                                    st.floating_drag = Some(FloatingDrag::Move {
+                                        grab_off_x: dx - bx as f64,
+                                        grab_off_y: dy - by as f64,
+                                    });
+                                    *mws_b.borrow_mut() = Some((wx, wy));
                                 }
                             }
                         }
@@ -3277,11 +3552,17 @@ fn setup_canvas_input(
                 st.commit_stroke_undo();
                 st.clear_stroke_composite_below();
                 st.brush_stroke_in_progress = false;
+                st.stroke_paint_clip = None;
                 st.last_doc_pos = None;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
                 st.shape_drag_preview = None;
                 if let Some((sx, sy)) = st.drag_start_doc {
+                    let shape_clip = if st.floating.is_none() {
+                        st.selection.clone()
+                    } else {
+                        None
+                    };
                     let start_wx = sx * st.zoom + st.pan_x;
                     let start_wy = sy * st.zoom + st.pan_y;
                     let cur_wx = start_wx + ox;
@@ -3297,15 +3578,16 @@ fn setup_canvas_input(
                         Some(l) => l,
                         None => return,
                     };
+                    let clip = shape_clip.as_ref();
                     match tool {
                         ToolKind::Line => {
-                            stroke_line(layer, sx, sy, cx, cy, r, h, color, false);
+                            stroke_line(layer, sx, sy, cx, cy, r, h, color, false, clip);
                         }
                         ToolKind::Rect => {
-                            draw_rect_outline(layer, sx, sy, cx, cy, r, h, color, filled, false);
+                            draw_rect_outline(layer, sx, sy, cx, cy, r, h, color, filled, false, clip);
                         }
                         ToolKind::Ellipse => {
-                            draw_ellipse(layer, sx, sy, cx, cy, r, h, color, filled, false);
+                            draw_ellipse(layer, sx, sy, cx, cy, r, h, color, filled, false, clip);
                         }
                         _ => {}
                     }
@@ -4128,6 +4410,18 @@ fn canvas_resize_dialog(
     d.present();
 }
 
+fn keybind_button_set_key(btn: &gtk::Button, key: Option<char>) {
+    let label = key
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "Unassigned".into());
+    btn.set_label(&label);
+    if key.is_none() {
+        btn.add_css_class("keybind-unassigned");
+    } else {
+        btn.remove_css_class("keybind-unassigned");
+    }
+}
+
 fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, tool_strings: &gtk::StringList) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
@@ -4147,10 +4441,6 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
         .build();
     list.add_css_class("boxed-list");
 
-    fn key_label(k: Option<char>) -> String {
-        k.map(|c| c.to_ascii_uppercase().to_string()).unwrap_or_else(|| "None".into())
-    }
-
     let binds = state.borrow().tool_keybinds.clone();
     for (i, (tool, key)) in binds.iter().enumerate() {
         let row = gtk::Box::builder()
@@ -4166,19 +4456,26 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
             .xalign(0.0)
             .hexpand(true)
             .build();
-        let btn = gtk::Button::with_label(&key_label(*key));
+        let btn = gtk::Button::new();
+        keybind_button_set_key(&btn, *key);
         btn.set_width_request(80);
 
         let ei = editing_idx.clone();
         let btns = buttons.clone();
+        let st_row = state.clone();
         btn.connect_clicked(move |b| {
             if let Some(prev) = *ei.borrow() {
-                let bs = btns.borrow();
-                if let Some(pb) = bs.get(prev) {
-                    pb.remove_css_class("suggested-action");
+                if prev != i {
+                    let bs = btns.borrow();
+                    if let Some(pb) = bs.get(prev) {
+                        pb.remove_css_class("suggested-action");
+                        let k = st_row.borrow().tool_keybinds[prev].1;
+                        keybind_button_set_key(pb, k);
+                    }
                 }
             }
             *ei.borrow_mut() = Some(i);
+            b.remove_css_class("keybind-unassigned");
             b.set_label("…");
             b.add_css_class("suggested-action");
         });
@@ -4230,12 +4527,10 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
         };
 
         if keyval == gdk::Key::Escape {
-            let st = st_key.borrow();
-            let text = key_label(st.tool_keybinds[idx].1);
-            drop(st);
+            let k = st_key.borrow().tool_keybinds[idx].1;
             let bs = btns_key.borrow();
             if let Some(btn) = bs.get(idx) {
-                btn.set_label(&text);
+                keybind_button_set_key(btn, k);
                 btn.remove_css_class("suggested-action");
             }
             *ei_key.borrow_mut() = None;
@@ -4246,7 +4541,7 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
             st_key.borrow_mut().tool_keybinds[idx].1 = None;
             let bs = btns_key.borrow();
             if let Some(btn) = bs.get(idx) {
-                btn.set_label("None");
+                keybind_button_set_key(btn, None);
                 btn.remove_css_class("suggested-action");
             }
             *ei_key.borrow_mut() = None;
@@ -4272,13 +4567,13 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
             if *bind == Some(ch) {
                 *bind = None;
                 if let Some(btn) = bs.get(j) {
-                    btn.set_label("None");
+                    keybind_button_set_key(btn, None);
                 }
             }
         }
         st.tool_keybinds[idx].1 = Some(ch);
         if let Some(btn) = bs.get(idx) {
-            btn.set_label(&ch.to_ascii_uppercase().to_string());
+            keybind_button_set_key(btn, Some(ch));
             btn.remove_css_class("suggested-action");
         }
         *ei_key.borrow_mut() = None;
@@ -4296,7 +4591,7 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
         let bs = btns_reset.borrow();
         for (i, (_, k)) in defaults.iter().enumerate() {
             if let Some(btn) = bs.get(i) {
-                btn.set_label(&key_label(*k));
+                keybind_button_set_key(btn, *k);
                 btn.remove_css_class("suggested-action");
             }
         }
@@ -4363,6 +4658,7 @@ fn build_ui(app: &Application) {
     let tool_dd_cell: ToolDdCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
+    drawing_area.add_css_class("canvas-chrome");
     drawing_area.set_hexpand(true);
     drawing_area.set_vexpand(true);
     drawing_area.set_can_focus(true);
@@ -4370,8 +4666,8 @@ fn build_ui(app: &Application) {
     *canvas_cell.borrow_mut() = Some(drawing_area.clone());
 
     let st_draw = state.clone();
-    drawing_area.set_draw_func(move |_area, cr, _w, _h| {
-        draw_canvas(&st_draw, cr);
+    drawing_area.set_draw_func(move |_area, cr, w, h| {
+        draw_canvas(&st_draw, cr, w, h);
     });
 
     let tick_slot: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
@@ -4519,7 +4815,7 @@ fn build_ui(app: &Application) {
     rgb_panel.set_visible(false);
 
     let alpha_lbl = gtk::Label::new(Some("Alpha"));
-    alpha_lbl.add_css_class("dim-label");
+    alpha_lbl.add_css_class("wp-readable-dim");
     alpha_lbl.set_halign(gtk::Align::Start);
     let alpha_panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -5160,19 +5456,155 @@ fn build_ui(app: &Application) {
         .build();
     layers_sidebar.append(&layers_scroll);
 
-    let labels: Vec<String> = state.borrow().tool_keybinds.iter()
-        .map(|(t, k)| tool_label(*t, *k)).collect();
+    let labels: Vec<String> = state
+        .borrow()
+        .tool_keybinds
+        .iter()
+        .map(|(t, k)| tool_dropdown_model_string(*t, *k))
+        .collect();
     let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
     let tool_strings = gtk::StringList::new(&label_refs);
     let tool_dd = gtk::DropDown::new(Some(tool_strings.clone()), gtk::Expression::NONE);
+    let tool_row_factory = tool_dropdown_row_factory();
+    tool_dd.set_factory(Some(&tool_row_factory));
+    tool_dd.set_list_factory(Some(&tool_row_factory));
     *tool_dd_cell.borrow_mut() = Some(tool_dd.clone());
     tool_dd.set_hexpand(false);
 
     let size_adj_cell: Rc<RefCell<Option<gtk::Adjustment>>> = Rc::new(RefCell::new(None));
+
+    let size_adj = gtk::Adjustment::new(8.0, 1.0, 256.0, 1.0, 8.0, 0.0);
+    size_adj.set_value(state.borrow().brush_size);
+    *size_adj_cell.borrow_mut() = Some(size_adj.clone());
+    let size_spin = gtk::SpinButton::new(Some(&size_adj), 1.0, 0);
+    size_spin.set_width_request(72);
+    let st_sz = state.clone();
+    size_adj.connect_value_changed(move |a| {
+        st_sz.borrow_mut().brush_size = a.value();
+    });
+    let cv_size = canvas_cell.clone();
+    let size_key = gtk::EventControllerKey::new();
+    size_key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    size_key.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            if let Some(ref da) = *cv_size.borrow() { da.grab_focus(); }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    size_spin.add_controller(size_key);
+
+    // Gtk/Adwaita often maps the adjustment *maximum* to the visual left for horizontal scales.
+    // Invert the range (min on the right) and map `hardness = (min+max) - value` so **screen right**
+    // = 100% hard and **screen left** = 10%. Default value 1.0 → thumb on the left (10% hardness).
+    // LTR keeps left/right unmirrored for RTL desktops.
+    let hard_adj = gtk::Adjustment::new(1.0, 0.1, 1.0, 0.01, 0.1, 0.0);
+    hard_adj.set_value(1.1 - state.borrow().brush_hardness);
+    let hard_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&hard_adj));
+    hard_scale.set_direction(gtk::TextDirection::Ltr);
+    hard_scale.set_inverted(true);
+    hard_scale.set_hexpand(false);
+    hard_scale.set_width_request(120);
+    hard_scale.set_halign(gtk::Align::Start);
+    let st_h = state.clone();
+    hard_adj.connect_value_changed(move |a| {
+        st_h.borrow_mut().brush_hardness = 1.1 - a.value();
+    });
+
+    let tol_adj = gtk::Adjustment::new(32.0, 0.0, 255.0, 1.0, 16.0, 0.0);
+    tol_adj.set_value(state.borrow().fill_tolerance as f64);
+    let tol_spin = gtk::SpinButton::new(Some(&tol_adj), 1.0, 0);
+    let st_t = state.clone();
+    tol_adj.connect_value_changed(move |a| {
+        st_t.borrow_mut().fill_tolerance = a.value() as u8;
+    });
+    let cv_tol = canvas_cell.clone();
+    let tol_key = gtk::EventControllerKey::new();
+    tol_key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    tol_key.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+            if let Some(ref da) = *cv_tol.borrow() { da.grab_focus(); }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    tol_spin.add_controller(tol_key);
+
+    let fill_check = gtk::CheckButton::with_label("Filled shape");
+    fill_check.set_active(state.borrow().shape_filled);
+    let st_f = state.clone();
+    fill_check.connect_toggled(move |c| {
+        st_f.borrow_mut().shape_filled = c.is_active();
+    });
+
+    tool_dd.set_width_request(tool_dropdown_width_request(&tool_dd, &labels));
+    size_spin.set_width_request(64);
+    tol_spin.set_width_request(64);
+
+    let opt_lbl = |text: &'static str| -> gtk::Label {
+        let l = gtk::Label::new(Some(text));
+        l.add_css_class("wp-readable-dim");
+        l.set_valign(gtk::Align::Center);
+        l
+    };
+    let vsep = || gtk::Separator::new(gtk::Orientation::Vertical);
+
+    let options_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(10)
+        .margin_end(10)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+
+    tool_dd.set_valign(gtk::Align::Center);
+    size_spin.set_valign(gtk::Align::Center);
+    hard_scale.set_valign(gtk::Align::Center);
+    tol_spin.set_valign(gtk::Align::Center);
+    fill_check.set_valign(gtk::Align::Center);
+
+    let sep_after_tool = vsep();
+    let size_lbl = opt_lbl("Size");
+    let sep_size_hard = vsep();
+    let hard_lbl = opt_lbl("Hardness");
+    let sep_before_tol = vsep();
+    let tol_lbl = gtk::Label::new(Some("Fill tol"));
+    tol_lbl.add_css_class("wp-readable-dim");
+    tol_lbl.set_valign(gtk::Align::Center);
+    let sep_before_filled = vsep();
+
+    options_bar.append(&opt_lbl("Tool"));
+    options_bar.append(&tool_dd);
+    options_bar.append(&sep_after_tool);
+    options_bar.append(&size_lbl);
+    options_bar.append(&size_spin);
+    options_bar.append(&sep_size_hard);
+    options_bar.append(&hard_lbl);
+    options_bar.append(&hard_scale);
+    options_bar.append(&sep_before_tol);
+    options_bar.append(&tol_lbl);
+    options_bar.append(&tol_spin);
+    options_bar.append(&sep_before_filled);
+    options_bar.append(&fill_check);
+
     let st_dd = state.clone();
     let cv_dd = canvas_cell.clone();
     let sa_dd = size_adj_cell.clone();
     let da_dd = drawing_area.clone();
+    let sep_after_tool_c = sep_after_tool.clone();
+    let size_lbl_c = size_lbl.clone();
+    let size_spin_c = size_spin.clone();
+    let sep_size_hard_c = sep_size_hard.clone();
+    let hard_lbl_c = hard_lbl.clone();
+    let hard_scale_c = hard_scale.clone();
+    let sep_before_tol_c = sep_before_tol.clone();
+    let tol_lbl_c = tol_lbl.clone();
+    let tol_spin_c = tol_spin.clone();
+    let sep_before_filled_c = sep_before_filled.clone();
+    let fill_check_c = fill_check.clone();
     tool_dd.connect_selected_item_notify(move |dd| {
         let mut g = st_dd.borrow_mut();
         let prev = g.tool;
@@ -5203,112 +5635,37 @@ fn build_ui(app: &Application) {
             }
         }
         tool_cursors::sync_canvas_tool_cursor(&da_dd, cur);
+        sync_tool_options_visibility(
+            cur,
+            &sep_after_tool_c,
+            &size_lbl_c,
+            &size_spin_c,
+            &sep_size_hard_c,
+            &hard_lbl_c,
+            &hard_scale_c,
+            &sep_before_tol_c,
+            &tol_lbl_c,
+            &tol_spin_c,
+            &sep_before_filled_c,
+            &fill_check_c,
+        );
         queue_canvas(&cv_dd);
     });
 
-    let size_adj = gtk::Adjustment::new(8.0, 1.0, 256.0, 1.0, 8.0, 0.0);
-    *size_adj_cell.borrow_mut() = Some(size_adj.clone());
-    let size_spin = gtk::SpinButton::new(Some(&size_adj), 1.0, 0);
-    size_spin.set_width_request(72);
-    let st_sz = state.clone();
-    size_adj.connect_value_changed(move |a| {
-        st_sz.borrow_mut().brush_size = a.value();
-    });
-    let cv_size = canvas_cell.clone();
-    let size_key = gtk::EventControllerKey::new();
-    size_key.set_propagation_phase(gtk::PropagationPhase::Capture);
-    size_key.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
-            if let Some(ref da) = *cv_size.borrow() { da.grab_focus(); }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    size_spin.add_controller(size_key);
-
-    // Gtk/Adwaita often maps the adjustment *maximum* to the visual left for horizontal scales.
-    // Invert the range (min on the right) and map `hardness = (min+max) - value` so **screen right**
-    // = 100% hard and **screen left** = 10%. Default value 1.0 → thumb on the left (10% hardness).
-    // LTR keeps left/right unmirrored for RTL desktops.
-    let hard_adj = gtk::Adjustment::new(1.0, 0.1, 1.0, 0.01, 0.1, 0.0);
-    let hard_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&hard_adj));
-    hard_scale.set_direction(gtk::TextDirection::Ltr);
-    hard_scale.set_inverted(true);
-    hard_scale.set_hexpand(false);
-    hard_scale.set_width_request(120);
-    hard_scale.set_halign(gtk::Align::Start);
-    let st_h = state.clone();
-    hard_adj.connect_value_changed(move |a| {
-        st_h.borrow_mut().brush_hardness = 1.1 - a.value();
-    });
-
-    let tol_adj = gtk::Adjustment::new(32.0, 0.0, 255.0, 1.0, 16.0, 0.0);
-    let tol_spin = gtk::SpinButton::new(Some(&tol_adj), 1.0, 0);
-    let st_t = state.clone();
-    tol_adj.connect_value_changed(move |a| {
-        st_t.borrow_mut().fill_tolerance = a.value() as u8;
-    });
-    let cv_tol = canvas_cell.clone();
-    let tol_key = gtk::EventControllerKey::new();
-    tol_key.set_propagation_phase(gtk::PropagationPhase::Capture);
-    tol_key.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
-            if let Some(ref da) = *cv_tol.borrow() { da.grab_focus(); }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    tol_spin.add_controller(tol_key);
-
-    let fill_check = gtk::CheckButton::with_label("Filled shape");
-    let st_f = state.clone();
-    fill_check.connect_toggled(move |c| {
-        st_f.borrow_mut().shape_filled = c.is_active();
-    });
-
-    tool_dd.set_width_request(tool_dropdown_width_request(&tool_dd, &labels));
-    size_spin.set_width_request(64);
-    tol_spin.set_width_request(64);
-
-    let opt_lbl = |text: &'static str| -> gtk::Label {
-        let l = gtk::Label::new(Some(text));
-        l.add_css_class("dim-label");
-        l.set_valign(gtk::Align::Center);
-        l
-    };
-    let vsep = || gtk::Separator::new(gtk::Orientation::Vertical);
-
-    let options_bar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_top(2)
-        .margin_bottom(2)
-        .margin_start(10)
-        .margin_end(10)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-
-    tool_dd.set_valign(gtk::Align::Center);
-    size_spin.set_valign(gtk::Align::Center);
-    hard_scale.set_valign(gtk::Align::Center);
-    tol_spin.set_valign(gtk::Align::Center);
-    fill_check.set_valign(gtk::Align::Center);
-
-    options_bar.append(&opt_lbl("Tool"));
-    options_bar.append(&tool_dd);
-    options_bar.append(&vsep());
-    options_bar.append(&opt_lbl("Size"));
-    options_bar.append(&size_spin);
-    options_bar.append(&vsep());
-    options_bar.append(&opt_lbl("Hardness"));
-    options_bar.append(&hard_scale);
-    options_bar.append(&vsep());
-    options_bar.append(&opt_lbl("Fill tol"));
-    options_bar.append(&tol_spin);
-    options_bar.append(&vsep());
-    options_bar.append(&fill_check);
-    options_bar.append(&vsep());
+    sync_tool_options_visibility(
+        state.borrow().tool,
+        &sep_after_tool,
+        &size_lbl,
+        &size_spin,
+        &sep_size_hard,
+        &hard_lbl,
+        &hard_scale,
+        &sep_before_tol,
+        &tol_lbl,
+        &tol_spin,
+        &sep_before_filled,
+        &fill_check,
+    );
 
     let zoom_out_btn = gtk::Button::from_icon_name("zoom-out-symbolic");
     let zoom_fit_btn = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
@@ -5319,9 +5676,16 @@ fn build_ui(app: &Application) {
     zoom_out_btn.set_valign(gtk::Align::Center);
     zoom_fit_btn.set_valign(gtk::Align::Center);
     zoom_in_btn.set_valign(gtk::Align::Center);
-    options_bar.append(&zoom_out_btn);
-    options_bar.append(&zoom_fit_btn);
-    options_bar.append(&zoom_in_btn);
+
+    let zoom_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .margin_end(6)
+        .valign(gtk::Align::Center)
+        .build();
+    zoom_bar.append(&zoom_out_btn);
+    zoom_bar.append(&zoom_fit_btn);
+    zoom_bar.append(&zoom_in_btn);
 
     let st_zo = state.clone();
     let cv_zo = canvas_cell.clone();
@@ -5375,13 +5739,19 @@ fn build_ui(app: &Application) {
     let palette_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
-        .max_children_per_line(4)
+        .max_children_per_line(8)
         .row_spacing(0)
         .column_spacing(0)
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .valign(gtk::Align::Start)
         .build();
+    palette_flow.connect_map(|fb| {
+        sync_palette_flow_columns(fb);
+    });
+    palette_flow.connect_notify(Some("width"), |fb, _| {
+        sync_palette_flow_columns(fb);
+    });
     let palette_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -5389,8 +5759,9 @@ fn build_ui(app: &Application) {
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .max_content_height(520)
-               .child(&palette_flow)
+        .child(&palette_flow)
         .build();
+    palette_scroll.add_css_class("palette-grid-frame");
     color_sidebar.append(&palette_scroll);
 
     color_sidebar.append(&mode_row);
@@ -5398,7 +5769,7 @@ fn build_ui(app: &Application) {
     color_sidebar.append(&rgb_panel);
     color_sidebar.append(&alpha_panel);
     let hex_lbl = gtk::Label::new(Some("Hex"));
-    hex_lbl.add_css_class("dim-label");
+    hex_lbl.add_css_class("wp-readable-dim");
     hex_lbl.set_halign(gtk::Align::Start);
     color_sidebar.append(&hex_lbl);
     color_sidebar.append(&hex_entry);
@@ -5450,7 +5821,7 @@ fn build_ui(app: &Application) {
         .halign(gtk::Align::Start)
         .hexpand(false)
         .build();
-    recent_label.add_css_class("dim-label");
+    recent_label.add_css_class("wp-readable-dim");
     color_sidebar.append(&recent_label);
     color_sidebar.append(&recent_colors_flow);
 
@@ -5522,7 +5893,9 @@ fn build_ui(app: &Application) {
 
     let header = libadwaita::HeaderBar::new();
     header.pack_start(&menubar);
+    // End box uses append: last packed sits at the outer trailing edge (zoom far right).
     header.pack_end(&toggle_layers);
+    header.pack_end(&zoom_bar);
     let window_title = libadwaita::WindowTitle::new("Wooly Paint", "");
     window_title.set_valign(gtk::Align::Center);
     header.set_title_widget(Some(&window_title));

@@ -1,4 +1,13 @@
 use crate::document::Layer;
+use crate::selection::Selection;
+
+#[inline]
+fn clip_allows(clip: Option<&Selection>, ix: i32, iy: i32) -> bool {
+    match clip {
+        None => true,
+        Some(s) => s.contains_point(ix as f64 + 0.5, iy as f64 + 0.5),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
@@ -107,6 +116,7 @@ fn stamp_circle_with_falloff(
     color: [u8; 4],
     eraser: bool,
     falloff: &BrushFalloffCache,
+    clip: Option<&Selection>,
 ) {
     if radius <= 0.0 {
         return;
@@ -141,6 +151,9 @@ fn stamp_circle_with_falloff(
             let a_straight = (body + lift).min(1.0);
             let alpha: f64 = a_straight * color[3] as f64 / 255.0;
             if alpha <= 0.0 {
+                continue;
+            }
+            if !clip_allows(clip, ix, iy) {
                 continue;
             }
             let i = layer.idx(ix as u32, iy as u32);
@@ -179,12 +192,13 @@ pub fn stamp_circle(
     hardness: f64,
     color: [u8; 4],
     eraser: bool,
+    clip: Option<&Selection>,
 ) {
     if radius <= 0.0 {
         return;
     }
     let falloff = BrushFalloffCache::new(hardness);
-    stamp_circle_with_falloff(layer, cx, cy, radius, color, eraser, &falloff);
+    stamp_circle_with_falloff(layer, cx, cy, radius, color, eraser, &falloff, clip);
 }
 
 fn brush_stroke_step(radius: f64, hardness: f64) -> f64 {
@@ -212,12 +226,13 @@ pub fn stroke_line(
     hardness: f64,
     color: [u8; 4],
     eraser: bool,
+    clip: Option<&Selection>,
 ) {
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len = (dx * dx + dy * dy).sqrt();
     if !len.is_finite() || len <= 1e-9 {
-        stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
+        stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
         return;
     }
     let r = radius.max(0.5);
@@ -226,14 +241,14 @@ pub fn stroke_line(
     step = step.min(r * 0.33).max(0.08);
     let n_f = (len / step).ceil();
     if !n_f.is_finite() || n_f <= 0.0 {
-        stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
+        stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
         return;
     }
     // Cap dab count per segment so a single long chord cannot freeze the UI.
     let max_n = (50_000.0 / (0.15 + 0.85 * h * h)) as u64;
     let n = (n_f as u64).min(max_n).min(200_000) as usize;
     if n == 0 {
-        stamp_circle(layer, x0, y0, radius, hardness, color, eraser);
+        stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
         return;
     }
     let falloff = BrushFalloffCache::new(hardness);
@@ -241,7 +256,7 @@ pub fn stroke_line(
         let t = i as f64 / n as f64;
         let x = x0 + dx * t;
         let y = y0 + dy * t;
-        stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff);
+        stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff, clip);
     }
 }
 
@@ -252,6 +267,7 @@ pub fn stamp_square(
     size: f64,
     color: [u8; 4],
     eraser: bool,
+    clip: Option<&Selection>,
 ) {
     if size <= 0.0 {
         return;
@@ -276,6 +292,9 @@ pub fn stamp_square(
 
     for iy in y0.max(0)..y1.min(h) {
         for ix in x0.max(0)..x1.min(w) {
+            if !clip_allows(clip, ix, iy) {
+                continue;
+            }
             let i = layer.idx(ix as u32, iy as u32);
             if eraser {
                 let inv = (1.0 - alpha) as f32;
@@ -335,6 +354,7 @@ pub fn stroke_line_square(
     size: f64,
     color: [u8; 4],
     eraser: bool,
+    clip: Option<&Selection>,
 ) {
     let p0x = x0.floor() as i32;
     let p0y = y0.floor() as i32;
@@ -348,6 +368,7 @@ pub fn stroke_line_square(
             size,
             color,
             eraser,
+            clip,
         );
     });
 }
@@ -502,10 +523,20 @@ pub fn clear_region_masked(layer: &mut Layer, mask: &[u8]) {
     }
 }
 
-pub fn flood_fill(layer: &mut Layer, x: u32, y: u32, fill_premul: [u8; 4], tolerance: u8) {
+pub fn flood_fill(
+    layer: &mut Layer,
+    x: u32,
+    y: u32,
+    fill_premul: [u8; 4],
+    tolerance: u8,
+    clip: Option<&Selection>,
+) {
     let w = layer.width;
     let h = layer.height;
     if x >= w || y >= h {
+        return;
+    }
+    if !clip_allows(clip, x as i32, y as i32) {
         return;
     }
     let start = layer.pixel_premul(x, y);
@@ -530,16 +561,16 @@ pub fn flood_fill(layer: &mut Layer, x: u32, y: u32, fill_premul: [u8; 4], toler
         visited[idx] = true;
         let i = layer.idx(cx, cy);
         layer.pixels[i..i + 4].copy_from_slice(&fill_premul);
-        if cx > 0 {
+        if cx > 0 && clip_allows(clip, (cx - 1) as i32, cy as i32) {
             stack.push((cx - 1, cy));
         }
-        if cx + 1 < w {
+        if cx + 1 < w && clip_allows(clip, (cx + 1) as i32, cy as i32) {
             stack.push((cx + 1, cy));
         }
-        if cy > 0 {
+        if cy > 0 && clip_allows(clip, cx as i32, (cy - 1) as i32) {
             stack.push((cx, cy - 1));
         }
-        if cy + 1 < h {
+        if cy + 1 < h && clip_allows(clip, cx as i32, (cy + 1) as i32) {
             stack.push((cx, cy + 1));
         }
     }
@@ -616,6 +647,7 @@ pub fn draw_rect_outline(
     color: [u8; 4],
     filled: bool,
     eraser: bool,
+    clip: Option<&Selection>,
 ) {
     let min_x = x0.min(x1);
     let max_x = x0.max(x1);
@@ -640,17 +672,61 @@ pub fn draw_rect_outline(
                 let px = x + 0.5;
                 let py = y + 0.5;
                 if px >= x0f && px <= x1f && py >= y0f && py <= y1f {
-                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff);
+                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff, clip);
                 }
                 x += step;
             }
             y += step;
         }
     } else {
-        stroke_line(layer, min_x, min_y, max_x, min_y, radius, hardness, color, eraser);
-        stroke_line(layer, max_x, min_y, max_x, max_y, radius, hardness, color, eraser);
-        stroke_line(layer, max_x, max_y, min_x, max_y, radius, hardness, color, eraser);
-        stroke_line(layer, min_x, max_y, min_x, min_y, radius, hardness, color, eraser);
+        stroke_line(
+            layer,
+            min_x,
+            min_y,
+            max_x,
+            min_y,
+            radius,
+            hardness,
+            color,
+            eraser,
+            clip,
+        );
+        stroke_line(
+            layer,
+            max_x,
+            min_y,
+            max_x,
+            max_y,
+            radius,
+            hardness,
+            color,
+            eraser,
+            clip,
+        );
+        stroke_line(
+            layer,
+            max_x,
+            max_y,
+            min_x,
+            max_y,
+            radius,
+            hardness,
+            color,
+            eraser,
+            clip,
+        );
+        stroke_line(
+            layer,
+            min_x,
+            max_y,
+            min_x,
+            min_y,
+            radius,
+            hardness,
+            color,
+            eraser,
+            clip,
+        );
     }
 }
 
@@ -685,6 +761,7 @@ pub fn draw_ellipse(
     color: [u8; 4],
     filled: bool,
     eraser: bool,
+    clip: Option<&Selection>,
 ) {
     let cx = (x0 + x1) * 0.5;
     let cy = (y0 + y1) * 0.5;
@@ -716,7 +793,7 @@ pub fn draw_ellipse(
                 let nx = (px - cx) / rx;
                 let ny = (py - cy) / ry;
                 if nx * nx + ny * ny <= 1.0 {
-                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff);
+                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff, clip);
                 }
                 x += step;
             }
@@ -729,7 +806,7 @@ pub fn draw_ellipse(
             let t = std::f64::consts::TAU * i as f64 / n as f64;
             let px = cx + rx * t.cos();
             let py = cy + ry * t.sin();
-            stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff);
+            stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff, clip);
         }
     }
 }

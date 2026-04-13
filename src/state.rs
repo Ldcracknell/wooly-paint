@@ -37,43 +37,7 @@ impl FloatingSelection {
     }
 }
 
-/// Rectangular marquee or magic-wand (connected) region in document space.
-#[derive(Clone)]
-pub enum Selection {
-    Rect(i32, i32, i32, i32),
-    /// `mask.len() == width * height`; non-zero = selected (same size as the document when created).
-    Region {
-        width: u32,
-        height: u32,
-        mask: Vec<u8>,
-        /// When set (e.g. magic wand), tight bounds of `mask` to skip a full-mask scan.
-        tight_bbox: Option<(i32, i32, i32, i32)>,
-    },
-}
-
-impl Selection {
-    pub fn contains_point(&self, x: f64, y: f64) -> bool {
-        let xi = x.floor() as i32;
-        let yi = y.floor() as i32;
-        match self {
-            Selection::Rect(sx, sy, sw, sh) => {
-                xi >= *sx && yi >= *sy && xi < sx + sw && yi < sy + sh
-            }
-            Selection::Region {
-                width,
-                height,
-                mask,
-                ..
-            } => {
-                if xi < 0 || yi < 0 || xi >= *width as i32 || yi >= *height as i32 {
-                    return false;
-                }
-                let idx = (yi as u32 * width + xi as u32) as usize;
-                mask.get(idx).copied().unwrap_or(0) != 0
-            }
-        }
-    }
-}
+pub use crate::selection::Selection;
 
 /// Active drag on the floating selection (handles on the marquee, not sidebar).
 #[derive(Clone, Copy, Debug)]
@@ -160,6 +124,8 @@ pub struct AppState {
     pub floating_pixbuf_key: Option<(usize, usize, i32, i32)>,
     /// While true, composite cache is not used (pixels change every event during brush/pixel/eraser stroke).
     pub brush_stroke_in_progress: bool,
+    /// During brush/pixel/eraser stroke: only paint inside this selection (captured at press; `None` = no clip).
+    pub stroke_paint_clip: Option<Selection>,
     /// During brush/pixel/eraser stroke: flattened premul RGBA of layers strictly below
     /// [`Document::active_layer`] at stroke start. Used to avoid recompositing the full stack each frame.
     pub stroke_composite_below: Option<Vec<u8>>,
@@ -234,6 +200,7 @@ impl AppState {
             floating_pixbuf_cache: None,
             floating_pixbuf_key: None,
             brush_stroke_in_progress: false,
+            stroke_paint_clip: None,
             stroke_composite_below: None,
             stroke_composite_active_layer: 0,
             stroke_composite_doc_wh: (0, 0),
