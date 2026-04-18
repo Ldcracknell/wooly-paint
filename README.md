@@ -8,6 +8,7 @@ this is also completely untested on anything but arch
 icon made in its own app lmao
 
 here is the real feature list, rest of the readme is ai:
+
 canvas (obviously)
 tools: brush, pixel, fill (setting for fill tolerance), rectangle and eclipse (setting for fill/outline), select rectangle, magic select (selects all connecting pixels of same colour), move selection, hand to move the canvas, eraser
 selections can be transformed by pulling the corners etc, rotating
