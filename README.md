@@ -7,6 +7,48 @@ this is also completely untested on anything but arch
 ![wooly-paint GUI image](./src/assets/gui-example.png)
 icon made in its own app lmao
 
+here is the real feature list, rest of the readme is ai:
+canvas (obviously)
+tools: brush, pixel, fill (setting for fill tolerance), rectangle and eclipse (setting for fill/outline), select rectangle, magic select (selects all connecting pixels of same colour), move selection, hand to move the canvas, eraser
+selections can be transformed by pulling the corners etc, rotating
+delete key deletes a selection
+when a selection is selected, drawing with brush etc cannot draw outside the selected area
+brush hardness, size
+
+icons for all tools
+white underlay so you can see when over black area of an image
+
+zoom in/out/fit to screen
+
+colour select 
+hsv/rgb + a sliders
+rectangle to preview colour and also move around (idk how to describe look bottom left)
+input for hex value
+
+colour palette
+some defaults
+create own palette and add colours
+import and export hex files for colour palettes
+
+can use 2 colours at once, one on left and right click
+can left/right click in the colour palette or sliders to change their respective
+
+files
+open, save, save as, open 5 most recent accessed
+save to a format which preserves layers
+
+layers
+add, delete, merge layers
+later opacities
+move layers up and down 
+
+custom keybinds for tools
+dark/ light mode
+save settings between sessions
+
+pixel grid overlay
+rotate/flip canvas x and y
+
 # _
 everything below here is ai generated, trust it as much as you like
 # _
