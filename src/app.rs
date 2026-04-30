@@ -1,43 +1,44 @@
 use crate::document::{
-    composite_layers_from_below_into, composite_layers_into, premul_rgba_to_cairo_argb32,
+    composite_layers_from_below_into, composite_layers_from_below_region_into,
+    composite_layers_into, premul_rgba_to_cairo_argb32, premul_rgba_to_cairo_argb32_region,
     premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul, Document,
 };
 use crate::palette::{self, PaletteBook};
 use crate::state::{AppState, ColorSlot, FloatingDrag, FloatingSelection, Selection};
 use crate::tool_cursors;
 use crate::tools::{
-    clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse, draw_rect_outline,
-    ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect, region_tight_bbox_or_hint,
-    sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_spaced,
-    stroke_line_square, stroke_quadratic_spaced, ToolKind,
+    clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse,
+    draw_rect_outline, ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect,
+    region_tight_bbox_or_hint, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
+    stroke_line_spaced, stroke_line_square, stroke_quadratic_spaced, ToolKind,
 };
-use libadwaita::prelude::*;
-use libadwaita::{Application, ColorScheme};
 use gdk_pixbuf::Pixbuf;
 use gtk::gdk;
-use gtk::gdk::prelude::ToplevelExt;
 use gtk::gdk::prelude::GdkCairoContextExt;
+use gtk::gdk::prelude::ToplevelExt;
 use gtk::gio;
+#[allow(deprecated)]
+use gtk::gio::prelude::ApplicationExt as GioApplicationExt;
 use gtk::glib;
 use gtk::glib::prelude::Cast;
 use gtk::glib::ControlFlow;
-#[allow(deprecated)]
-use gtk::gio::prelude::ApplicationExt as GioApplicationExt;
 use gtk::prelude::DrawingAreaExtManual;
+use gtk::prelude::EditableExt;
 use gtk::prelude::EventControllerExt;
 use gtk::prelude::GestureDragExt;
 use gtk::prelude::GestureSingleExt;
-use gtk::prelude::RangeExt;
-use gtk::prelude::EditableExt;
-use gtk::prelude::ToggleButtonExt;
-use gtk::prelude::WidgetExt;
-use gtk::prelude::WidgetExtManual;
-use std::cell::{Cell, RefCell};
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use gtk::prelude::ListItemExt;
 use gtk::prelude::MenuModelExt;
 use gtk::prelude::PopoverExt;
+use gtk::prelude::RangeExt;
+use gtk::prelude::ToggleButtonExt;
+use gtk::prelude::WidgetExt;
+use gtk::prelude::WidgetExtManual;
+use libadwaita::prelude::*;
+use libadwaita::{Application, ColorScheme};
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
@@ -429,7 +430,7 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
         cr.set_operator(gtk::cairo::Operator::Clear);
         cr.paint().ok()?;
-               cr.set_operator(gtk::cairo::Operator::Over);
+        cr.set_operator(gtk::cairo::Operator::Over);
         let fw = f.w.max(1);
         let fh = f.h.max(1);
         let mut src_surf =
@@ -437,13 +438,7 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
         {
             let stride = src_surf.stride() as usize;
             let mut data = src_surf.data().ok()?;
-            premul_rgba_to_cairo_argb32(
-                &mut data,
-                stride,
-                fw as u32,
-                fh as u32,
-                &f.data,
-            );
+            premul_rgba_to_cairo_argb32(&mut data, stride, fw as u32, fh as u32, &f.data);
         }
         let m = floating_image_to_doc_matrix(f);
         cr.translate(-(min_ix as f64), -(min_iy as f64));
@@ -974,10 +969,7 @@ fn sync_picker_from_target_color(
     let hex = if c[3] == 255 {
         format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
     } else {
-        format!(
-            "#{:02x}{:02x}{:02x}{:02x}",
-            c[0], c[1], c[2], c[3]
-        )
+        format!("#{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3])
     };
     hex_entry.set_text(&hex);
     picker_sup.set(false);
@@ -1167,7 +1159,11 @@ fn wire_picker_track_drag(
     da.add_controller(motion);
 }
 
-fn picker_gradient_spin_row(label: &str, track: &gtk::DrawingArea, spin: &gtk::SpinButton) -> gtk::Box {
+fn picker_gradient_spin_row(
+    label: &str,
+    track: &gtk::DrawingArea,
+    spin: &gtk::SpinButton,
+) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -1708,10 +1704,7 @@ fn manage_palettes_dialog(
                 let hex_s = if col[3] == 255 {
                     format!("#{:02x}{:02x}{:02x}", col[0], col[1], col[2])
                 } else {
-                    format!(
-                        "#{:02x}{:02x}{:02x}{:02x}",
-                        col[0], col[1], col[2], col[3]
-                    )
+                    format!("#{:02x}{:02x}{:02x}{:02x}", col[0], col[1], col[2], col[3])
                 };
                 let lbl = gtk::Label::new(Some(&hex_s));
                 lbl.set_hexpand(true);
@@ -2081,23 +2074,33 @@ fn refresh_recent_swatch_row(
 }
 
 fn zoom_to_fit(state: &SharedState, canvas_cell: &CanvasCell) {
-    let Some(ref da) = *canvas_cell.borrow() else { return };
+    let Some(ref da) = *canvas_cell.borrow() else {
+        return;
+    };
     let vw = da.width() as f64;
     let vh = da.height() as f64;
-    if vw <= 0.0 || vh <= 0.0 { return; }
+    if vw <= 0.0 || vh <= 0.0 {
+        return;
+    }
     let mut st = state.borrow_mut();
     let dw = st.doc.width as f64;
     let dh = st.doc.height as f64;
-    if dw <= 0.0 || dh <= 0.0 { return; }
+    if dw <= 0.0 || dh <= 0.0 {
+        return;
+    }
     let pad = 16.0;
-    let z = ((vw - 2.0 * pad) / dw).min((vh - 2.0 * pad) / dh).clamp(0.05, 32.0);
+    let z = ((vw - 2.0 * pad) / dw)
+        .min((vh - 2.0 * pad) / dh)
+        .clamp(0.05, 32.0);
     st.zoom = z;
     st.pan_x = (vw - dw * z) / 2.0;
     st.pan_y = (vh - dh * z) / 2.0;
 }
 
 fn zoom_step(state: &SharedState, canvas_cell: &CanvasCell, factor: f64) {
-    let Some(ref da) = *canvas_cell.borrow() else { return };
+    let Some(ref da) = *canvas_cell.borrow() else {
+        return;
+    };
     let vw = da.width() as f64;
     let vh = da.height() as f64;
     let cx = vw / 2.0;
@@ -2431,7 +2434,8 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
     TRANSPARENCY_CHECKER.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            let surf = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 16, 16).unwrap();
+            let surf =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 16, 16).unwrap();
             let crc = gtk::cairo::Context::new(&surf).unwrap();
             crc.set_source_rgb(0.93, 0.93, 0.93);
             crc.paint().unwrap();
@@ -2629,19 +2633,82 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
 
     let composite_surface = {
         let mut st = state.borrow_mut();
-        let use_cache = !st.brush_stroke_in_progress
+        let cairo_stride = gtk::cairo::Format::ARgb32
+            .stride_for_width(w)
+            .expect("cairo stride");
+        let surface_ready = st
+            .composite_cache_surface
+            .as_ref()
+            .is_some_and(|s| s.width() == w_i && s.height() == h_i && s.stride() == cairo_stride);
+        let cache_ready = st.composite_cache_premul.len() == len
             && st.composite_cache_at_revision == st.document_visual_revision
-            && st.composite_cache_surface.as_ref().is_some_and(|s| {
-                s.width() == w_i && s.height() == h_i
-            });
-        if !use_cache {
+            && surface_ready;
+        let stroke_dirty = if st.brush_stroke_in_progress {
+            st.take_stroke_dirty_rect()
+        } else {
+            None
+        };
+        let use_cache = !st.brush_stroke_in_progress && cache_ready;
+        let use_stroke_cache = st.brush_stroke_in_progress && cache_ready && stroke_dirty.is_none();
+        let use_stroke_region = st.brush_stroke_in_progress
+            && cache_ready
+            && stroke_dirty.is_some()
+            && st.stroke_composite_below_valid();
+
+        if use_stroke_region {
+            let dirty = stroke_dirty.expect("checked");
+            let stroke_active = st.stroke_composite_active_layer;
+            let below = st
+                .stroke_composite_below
+                .take()
+                .expect("stroke composite below");
+            {
+                let AppState {
+                    ref doc,
+                    ref mut composite_cache_premul,
+                    ..
+                } = *st;
+                composite_layers_from_below_region_into(
+                    composite_cache_premul,
+                    doc.width,
+                    doc.height,
+                    &doc.layers,
+                    stroke_active,
+                    &below,
+                    dirty,
+                );
+            }
+            st.stroke_composite_below = Some(below);
+            {
+                let AppState {
+                    ref composite_cache_premul,
+                    ref mut composite_cache_surface,
+                    ref mut composite_cache_at_revision,
+                    document_visual_revision,
+                    ..
+                } = *st;
+                let surf = composite_cache_surface.as_mut().expect("surface");
+                {
+                    let mut data = surf.data().expect("composite surface data");
+                    premul_rgba_to_cairo_argb32_region(
+                        &mut data,
+                        cairo_stride as usize,
+                        w,
+                        h,
+                        composite_cache_premul,
+                        dirty,
+                    );
+                }
+                surf.mark_dirty();
+                *composite_cache_at_revision = document_visual_revision;
+            }
+        } else if !(use_cache || use_stroke_cache) {
             let stroke_active = st.stroke_composite_active_layer;
             let below_temp = if st.brush_stroke_in_progress && st.stroke_composite_below_valid() {
                 st.stroke_composite_below.take()
             } else {
                 None
             };
-            st.composite_cache_surface = None;
             {
                 let AppState {
                     ref doc,
@@ -2676,20 +2743,13 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
                     document_visual_revision,
                     ..
                 } = *st;
-                let cairo_stride = gtk::cairo::Format::ARgb32
-                    .stride_for_width(w)
-                    .expect("cairo stride");
                 let need_new = composite_cache_surface.as_ref().map_or(true, |s| {
                     s.width() != w_i || s.height() != h_i || s.stride() != cairo_stride
                 });
                 if need_new {
                     *composite_cache_surface = Some(
-                        gtk::cairo::ImageSurface::create(
-                            gtk::cairo::Format::ARgb32,
-                            w_i,
-                            h_i,
-                        )
-                        .expect("composite ImageSurface"),
+                        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, w_i, h_i)
+                            .expect("composite ImageSurface"),
                     );
                 }
                 let surf = composite_cache_surface.as_mut().expect("surface");
@@ -2703,6 +2763,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
                         composite_cache_premul,
                     );
                 }
+                surf.mark_dirty();
                 *composite_cache_at_revision = document_visual_revision;
             }
         }
@@ -2957,9 +3018,10 @@ fn paint_brush_drag_sample(
     last_sample: &RefCell<Option<(f64, f64)>>,
 ) -> bool {
     const EPS: f64 = 1e-4;
-    if last_sample.borrow().is_some_and(|(px, py)| {
-        (wx - px).abs() < EPS && (wy - py).abs() < EPS
-    }) {
+    if last_sample
+        .borrow()
+        .is_some_and(|(px, py)| (wx - px).abs() < EPS && (wy - py).abs() < EPS)
+    {
         return false;
     }
     let (cx, cy) = st.widget_to_doc(wx, wy);
@@ -2996,7 +3058,7 @@ fn paint_brush_drag_sample(
         None => return false,
     };
     let clip = st.stroke_paint_clip.as_ref();
-    match tool {
+    let dirty = match tool {
         ToolKind::Brush | ToolKind::Eraser => {
             let (px, py) = smooth_prev.expect("checked");
             let (sx, sy) = if smooth_started {
@@ -3019,23 +3081,13 @@ fn paint_brush_drag_sample(
                 eraser,
                 clip,
                 &mut next_dab_distance,
-            );
+            )
         }
         ToolKind::Pixel => {
-            stroke_line_square(
-                layer,
-                lx,
-                ly,
-                cx,
-                cy,
-                pixel_size,
-                paint_color,
-                false,
-                clip,
-            );
+            stroke_line_square(layer, lx, ly, cx, cy, pixel_size, paint_color, false, clip)
         }
         _ => return false,
-    }
+    };
     st.stroke_next_dab_distance = next_dab_distance;
     if matches!(tool, ToolKind::Brush | ToolKind::Eraser) {
         st.stroke_smooth_prev_doc = Some((lx, ly));
@@ -3044,6 +3096,7 @@ fn paint_brush_drag_sample(
     st.last_doc_pos = Some((cx, cy));
     *last_sample.borrow_mut() = Some((wx, wy));
     st.modified = true;
+    st.add_stroke_dirty_rect(dirty);
     true
 }
 
@@ -3072,7 +3125,7 @@ fn flush_brush_smoothing(st: &mut AppState) -> bool {
         Some(l) => l,
         None => return false,
     };
-    stroke_line_spaced(
+    let dirty = stroke_line_spaced(
         layer,
         sx,
         sy,
@@ -3087,6 +3140,7 @@ fn flush_brush_smoothing(st: &mut AppState) -> bool {
     );
     st.stroke_next_dab_distance = next_dab_distance;
     st.modified = true;
+    st.add_stroke_dirty_rect(dirty);
     true
 }
 
@@ -3176,11 +3230,7 @@ fn setup_canvas_input(
         cnv.grab_focus();
         let mut st = st_drag_begin.borrow_mut();
         let btn = gesture.current_button();
-        st.pointer_drag_button = if btn == 0 {
-            gdk::BUTTON_PRIMARY
-        } else {
-            btn
-        };
+        st.pointer_drag_button = if btn == 0 { gdk::BUTTON_PRIMARY } else { btn };
         if st.floating.is_some() && st.tool != ToolKind::Move {
             commit_floating(&mut st);
         }
@@ -3216,8 +3266,9 @@ fn setup_canvas_input(
                 let held_clip = st.stroke_paint_clip.take();
                 let clip = held_clip.as_ref();
                 let layer = st.doc.active_layer_mut().expect("checked");
-                stamp_circle(layer, dx, dy, radius, hardness, color, eraser, clip);
+                let dirty = stamp_circle(layer, dx, dy, radius, hardness, color, eraser, clip);
                 st.stroke_paint_clip = held_clip;
+                st.add_stroke_dirty_rect(dirty);
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
                 start_brush_paint_tick = true;
@@ -3244,8 +3295,9 @@ fn setup_canvas_input(
                 let held_clip = st.stroke_paint_clip.take();
                 let clip = held_clip.as_ref();
                 let layer = st.doc.active_layer_mut().expect("checked");
-                stamp_square(layer, dx, dy, size, color, false, clip);
+                let dirty = stamp_square(layer, dx, dy, size, color, false, clip);
                 st.stroke_paint_clip = held_clip;
+                st.add_stroke_dirty_rect(dirty);
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
                 start_brush_paint_tick = true;
@@ -3391,7 +3443,10 @@ fn setup_canvas_input(
                             let fh = f.h.max(1) as f64;
                             let (ax, ay) = edge_anchor_local_for_resize(e, fw, fh);
                             let anchor_doc = m.transform_point(ax, ay);
-                            st.floating_drag = Some(FloatingDrag::ResizeEdge { edge: e, anchor_doc });
+                            st.floating_drag = Some(FloatingDrag::ResizeEdge {
+                                edge: e,
+                                anchor_doc,
+                            });
                             *mws_b.borrow_mut() = Some((wx, wy));
                         }
                         FloatPress::Body => {
@@ -3403,7 +3458,7 @@ fn setup_canvas_input(
                         }
                     }
                 }
-                               if st.floating.is_none() {
+                if st.floating.is_none() {
                     if let Some(sel) = st.selection.clone() {
                         if sel.contains_point(dx, dy) {
                             let li = st.doc.active_layer;
@@ -3419,11 +3474,7 @@ fn setup_canvas_input(
                                     st.history.commit_change(li, before);
                                     st.bump_document_revision();
                                     st.floating = Some(FloatingSelection::new_pasted(
-                                        sw,
-                                        sh,
-                                        data,
-                                        sx as f64,
-                                        sy as f64,
+                                        sw, sh, data, sx as f64, sy as f64,
                                     ));
                                     st.selection = None;
                                     st.modified = true;
@@ -3460,11 +3511,7 @@ fn setup_canvas_input(
                                     st.history.commit_change(li, before);
                                     st.bump_document_revision();
                                     st.floating = Some(FloatingSelection::new_pasted(
-                                        bw,
-                                        bh,
-                                        data,
-                                        bx as f64,
-                                        by as f64,
+                                        bw, bh, data, bx as f64, by as f64,
                                     ));
                                     st.selection = None;
                                     st.modified = true;
@@ -3496,13 +3543,7 @@ fn setup_canvas_input(
             if let Some(ref da) = *cb_drag.borrow() {
                 picker_refresh_call(&picker_drag);
                 da.queue_draw();
-                refresh_recent_swatch_row(
-                    &recent_drag,
-                    &st_drag_begin,
-                    da,
-                    &cv_drag,
-                    &picker_drag,
-                );
+                refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &cv_drag, &picker_drag);
             }
         }
         queue_canvas(&cv_drag);
@@ -3674,7 +3715,9 @@ fn setup_canvas_input(
                             stroke_line(layer, sx, sy, cx, cy, r, h, color, false, clip);
                         }
                         ToolKind::Rect => {
-                            draw_rect_outline(layer, sx, sy, cx, cy, r, h, color, filled, false, clip);
+                            draw_rect_outline(
+                                layer, sx, sy, cx, cy, r, h, color, filled, false, clip,
+                            );
                         }
                         ToolKind::Ellipse => {
                             draw_ellipse(layer, sx, sy, cx, cy, r, h, color, filled, false, clip);
@@ -3894,7 +3937,8 @@ fn copy_selection(state: &SharedState) {
     let straight = premul_to_straight_rgba(&data);
     let bytes = glib::Bytes::from_owned(straight);
     let texture = gdk::MemoryTexture::new(
-        sw, sh,
+        sw,
+        sh,
         gdk::MemoryFormat::R8g8b8a8,
         &bytes,
         (sw * 4) as usize,
@@ -4063,43 +4107,36 @@ fn try_paste_system_clipboard(
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
 
-    clipboard.read_texture_async(
-        None::<&gio::Cancellable>,
-        move |result| {
-            match result {
-                Ok(Some(texture)) => {
-                    let png_bytes = texture.save_to_png_bytes();
-                    match image::load_from_memory(&png_bytes) {
-                        Ok(img) => {
-                            let rgba = img.to_rgba8();
-                            let (iw, ih) = rgba.dimensions();
-                            let premul = straight_to_premul(rgba.as_raw());
+    clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| match result {
+        Ok(Some(texture)) => {
+            let png_bytes = texture.save_to_png_bytes();
+            match image::load_from_memory(&png_bytes) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (iw, ih) = rgba.dimensions();
+                    let premul = straight_to_premul(rgba.as_raw());
 
-                            let doc_w = st.borrow().doc.width;
-                            let doc_h = st.borrow().doc.height;
+                    let doc_w = st.borrow().doc.width;
+                    let doc_h = st.borrow().doc.height;
 
-                            if iw > doc_w || ih > doc_h {
-                                show_paste_oversize_dialog(
-                                    &win, &st, &td, &cv, &lc, iw, ih, premul,
-                                );
-                            } else {
-                                paste_image_data(&st, &td, iw, ih, premul);
-                                queue_canvas(&cv);
-                            }
-                        }
-                        Err(_) => {
-                            paste_clipboard_center(&st, &td);
-                            queue_canvas(&cv);
-                        }
+                    if iw > doc_w || ih > doc_h {
+                        show_paste_oversize_dialog(&win, &st, &td, &cv, &lc, iw, ih, premul);
+                    } else {
+                        paste_image_data(&st, &td, iw, ih, premul);
+                        queue_canvas(&cv);
                     }
                 }
-                _ => {
+                Err(_) => {
                     paste_clipboard_center(&st, &td);
                     queue_canvas(&cv);
                 }
             }
-        },
-    );
+        }
+        _ => {
+            paste_clipboard_center(&st, &td);
+            queue_canvas(&cv);
+        }
+    });
 }
 
 fn menu_ui_dark() -> bool {
@@ -4119,7 +4156,9 @@ fn menu_row_with_icon(
 ) -> gio::MenuItem {
     let label = menu_label_with_leading_spaces(label);
     let item = gio::MenuItem::new(Some(&label), Some(detailed_action));
-    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(icon_alias, ui_dark));
+    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(
+        icon_alias, ui_dark,
+    ));
     item
 }
 
@@ -4131,7 +4170,9 @@ fn menu_root_submenu_row(
     ui_dark: bool,
 ) -> gio::MenuItem {
     let item = gio::MenuItem::new_submenu(Some(label), submenu);
-    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(icon_alias, ui_dark));
+    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(
+        icon_alias, ui_dark,
+    ));
     item
 }
 
@@ -4144,7 +4185,9 @@ fn menu_submenu_row(
 ) -> gio::MenuItem {
     let label = menu_label_with_leading_spaces(label);
     let item = gio::MenuItem::new_submenu(Some(&label), submenu);
-    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(icon_alias, ui_dark));
+    item.set_icon(&crate::menu_icons::menu_bar_icon_texture(
+        icon_alias, ui_dark,
+    ));
     item
 }
 
@@ -4700,7 +4743,11 @@ fn keybind_button_set_key(btn: &gtk::Button, key: Option<char>) {
     }
 }
 
-fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, tool_strings: &gtk::StringList) {
+fn keybinds_dialog(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    tool_strings: &gtk::StringList,
+) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
         .modal(true)
@@ -4764,9 +4811,7 @@ fn keybinds_dialog(window: &libadwaita::ApplicationWindow, state: &SharedState, 
         buttons.borrow_mut().push(btn);
     }
 
-    let scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .build();
+    let scroll = gtk::ScrolledWindow::builder().vexpand(true).build();
     scroll.set_child(Some(&list));
 
     let reset_btn = gtk::Button::with_label("Reset defaults");
@@ -4921,7 +4966,8 @@ fn build_ui(app: &Application) {
 
     let mut initial_state = AppState::new();
     let loaded_theme = crate::settings::load_into(&mut initial_state);
-    libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(loaded_theme));
+    libadwaita::StyleManager::default()
+        .set_color_scheme(color_scheme_from_menu_value(loaded_theme));
     let state: SharedState = Rc::new(RefCell::new(initial_state));
     let recent_files_menu = Rc::new(gio::Menu::new());
     refresh_recent_files_menu(&recent_files_menu, &state.borrow(), menu_ui_dark());
@@ -4980,15 +5026,11 @@ fn build_ui(app: &Application) {
 
     let picker_sat_adj = gtk::Adjustment::new(init_s, 0.0, 1.0, 0.01, 0.05, 0.0);
     let picker_val_adj = gtk::Adjustment::new(init_v, 0.0, 1.0, 0.01, 0.05, 0.0);
-    let picker_r_adj =
-        gtk::Adjustment::new(init_slot_color[0] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
-    let picker_g_adj =
-        gtk::Adjustment::new(init_slot_color[1] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
-    let picker_b_adj =
-        gtk::Adjustment::new(init_slot_color[2] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_r_adj = gtk::Adjustment::new(init_slot_color[0] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_g_adj = gtk::Adjustment::new(init_slot_color[1] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_b_adj = gtk::Adjustment::new(init_slot_color[2] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
     let picker_tracks: Rc<RefCell<Vec<gtk::DrawingArea>>> = Rc::new(RefCell::new(Vec::new()));
-    let picker_a_adj =
-        gtk::Adjustment::new(init_slot_color[3] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
+    let picker_a_adj = gtk::Adjustment::new(init_slot_color[3] as f64, 0.0, 255.0, 1.0, 16.0, 0.0);
     let picker_s_disp_adj =
         gtk::Adjustment::new((init_s * 100.0).round(), 0.0, 100.0, 1.0, 10.0, 0.0);
     let picker_v_disp_adj =
@@ -5050,21 +5092,41 @@ fn build_ui(app: &Application) {
         let _ = cr.stroke();
     });
 
-    let fg_bg_da = make_fg_bg_selector(
-        &state,
-        &canvas_cell,
-        &sv_da,
-        &picker_ui_refresh,
-    );
+    let fg_bg_da = make_fg_bg_selector(&state, &canvas_cell, &sv_da, &picker_ui_refresh);
     *color_preview_da_cell.borrow_mut() = Some(fg_bg_da.clone());
 
-    let da_h = make_picker_track(PickerTrackKind::Hue, &state, &picker_hue_adj, &picker_tracks);
-    let da_s = make_picker_track(PickerTrackKind::Sat, &state, &picker_sat_adj, &picker_tracks);
-    let da_v = make_picker_track(PickerTrackKind::Val, &state, &picker_val_adj, &picker_tracks);
+    let da_h = make_picker_track(
+        PickerTrackKind::Hue,
+        &state,
+        &picker_hue_adj,
+        &picker_tracks,
+    );
+    let da_s = make_picker_track(
+        PickerTrackKind::Sat,
+        &state,
+        &picker_sat_adj,
+        &picker_tracks,
+    );
+    let da_v = make_picker_track(
+        PickerTrackKind::Val,
+        &state,
+        &picker_val_adj,
+        &picker_tracks,
+    );
     let da_r = make_picker_track(PickerTrackKind::Red, &state, &picker_r_adj, &picker_tracks);
-    let da_g = make_picker_track(PickerTrackKind::Green, &state, &picker_g_adj, &picker_tracks);
+    let da_g = make_picker_track(
+        PickerTrackKind::Green,
+        &state,
+        &picker_g_adj,
+        &picker_tracks,
+    );
     let da_b = make_picker_track(PickerTrackKind::Blue, &state, &picker_b_adj, &picker_tracks);
-    let da_a = make_picker_track(PickerTrackKind::Alpha, &state, &picker_a_adj, &picker_tracks);
+    let da_a = make_picker_track(
+        PickerTrackKind::Alpha,
+        &state,
+        &picker_a_adj,
+        &picker_tracks,
+    );
 
     let spin_h = gtk::SpinButton::new(Some(&picker_hue_adj), 1.0, 0);
     spin_h.set_digits(0);
@@ -5494,11 +5556,7 @@ fn build_ui(app: &Application) {
             ColorSlot::Left => (g.fg[0], g.fg[1], g.fg[2]),
             ColorSlot::Right => (g.bg[0], g.bg[1], g.bg[2]),
         };
-        let rgb = (
-            r0 as f64 / 255.0,
-            g0 as f64 / 255.0,
-            b0 as f64 / 255.0,
-        );
+        let rgb = (r0 as f64 / 255.0, g0 as f64 / 255.0, b0 as f64 / 255.0);
         let aa = adj.value().round().clamp(0.0, 255.0) as u8;
         write_slot_rgb_a(&mut g, slot, rgb, aa);
         drop(g);
@@ -5639,15 +5697,7 @@ fn build_ui(app: &Application) {
             let mut g = st_press.borrow_mut();
             g.picker_target = picker_target_for_gesture_button(gesture.current_button());
         }
-        apply_sv_pick(
-            &st_press,
-            &sv_press,
-            &fg_press,
-            &cv_press,
-            &pr_press,
-            x,
-            y,
-        );
+        apply_sv_pick(&st_press, &sv_press, &fg_press, &cv_press, &pr_press, x, y);
     });
     let sv_paint_m = sv_painting.clone();
     let st_m = state.clone();
@@ -5765,7 +5815,9 @@ fn build_ui(app: &Application) {
     size_key.set_propagation_phase(gtk::PropagationPhase::Capture);
     size_key.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
-            if let Some(ref da) = *cv_size.borrow() { da.grab_focus(); }
+            if let Some(ref da) = *cv_size.borrow() {
+                da.grab_focus();
+            }
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -5801,7 +5853,9 @@ fn build_ui(app: &Application) {
     tol_key.set_propagation_phase(gtk::PropagationPhase::Capture);
     tol_key.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
-            if let Some(ref da) = *cv_tol.borrow() { da.grab_focus(); }
+            if let Some(ref da) = *cv_tol.borrow() {
+                da.grab_focus();
+            }
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -6282,7 +6336,9 @@ fn build_ui(app: &Application) {
                 if !ctrl {
                     if let Some(ch) = keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
                         let st_ref = st_k.borrow();
-                        let tool = st_ref.tool_keybinds.iter()
+                        let tool = st_ref
+                            .tool_keybinds
+                            .iter()
                             .find(|(_, bind)| *bind == Some(ch))
                             .map(|(t, _)| *t);
                         drop(st_ref);
@@ -6340,8 +6396,10 @@ fn build_ui(app: &Application) {
         let st = st_close.clone();
         let lc = lc_close.clone();
         let cv = cv_close.clone();
-        dlg.choose(Some(&win_parent), None::<&gio::Cancellable>, move |response| {
-            match response.as_str() {
+        dlg.choose(
+            Some(&win_parent),
+            None::<&gio::Cancellable>,
+            move |response| match response.as_str() {
                 "save" => {
                     if st.borrow().doc.path.is_some() {
                         if try_save_to_current_path(&st) {
@@ -6349,13 +6407,7 @@ fn build_ui(app: &Application) {
                         }
                     } else {
                         let win_done = win.clone();
-                        save_file_as(
-                            &win,
-                            &st,
-                            &lc,
-                            &cv,
-                            Some(Rc::new(move || win_done.close())),
-                        );
+                        save_file_as(&win, &st, &lc, &cv, Some(Rc::new(move || win_done.close())));
                     }
                 }
                 "discard" => {
@@ -6363,8 +6415,8 @@ fn build_ui(app: &Application) {
                     win.close();
                 }
                 _ => {}
-            }
-        });
+            },
+        );
         glib::Propagation::Stop
     });
 
@@ -6446,7 +6498,11 @@ fn run_manual_update_check(window: &libadwaita::ApplicationWindow) {
                     });
                     dlg.present(Some(&w));
                 }
-                Ok(None) => show_simple_alert(&w, "Up to date", "You are already running the latest release."),
+                Ok(None) => show_simple_alert(
+                    &w,
+                    "Up to date",
+                    "You are already running the latest release.",
+                ),
                 Err(e) => show_simple_alert(
                     &w,
                     "Update check failed",
@@ -6478,8 +6534,7 @@ fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::up
         Some("Update available"),
         Some(&format!(
             "Version {} is available (you are on v{})",
-            info.version,
-            cur
+            info.version, cur
         )),
     );
     dlg.add_response("later", "Not now");
@@ -6494,33 +6549,31 @@ fn present_update_dialog(parent: &libadwaita::ApplicationWindow, info: crate::up
     let download_info = info;
     let win_send = glib::SendWeakRef::from(parent.downgrade());
 
-    dlg.connect_response(None, move |d, response| {
-        match response {
-            "download" => {
-                let ii = download_info.clone();
-                let ws = win_send.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = crate::updater::download_and_apply(&ii) {
-                        glib::MainContext::default().invoke(move || {
-                            if let Some(w) = ws.upgrade() {
-                                show_update_error(&w, &e.to_string());
-                            }
-                        });
-                    }
-                });
-                d.close();
-            }
-            "release" => {
-                let launcher = gtk::UriLauncher::new(&release_url);
-                launcher.launch(Some(&parent_for_uri), None::<&gio::Cancellable>, |res| {
-                    if let Err(e) = res {
-                        eprintln!("Could not open release page: {e}");
-                    }
-                });
-            }
-            _ => {
-                d.close();
-            }
+    dlg.connect_response(None, move |d, response| match response {
+        "download" => {
+            let ii = download_info.clone();
+            let ws = win_send.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::updater::download_and_apply(&ii) {
+                    glib::MainContext::default().invoke(move || {
+                        if let Some(w) = ws.upgrade() {
+                            show_update_error(&w, &e.to_string());
+                        }
+                    });
+                }
+            });
+            d.close();
+        }
+        "release" => {
+            let launcher = gtk::UriLauncher::new(&release_url);
+            launcher.launch(Some(&parent_for_uri), None::<&gio::Cancellable>, |res| {
+                if let Err(e) = res {
+                    eprintln!("Could not open release page: {e}");
+                }
+            });
+        }
+        _ => {
+            d.close();
         }
     });
     dlg.present(Some(parent));
@@ -6549,9 +6602,19 @@ fn build_menu_model(ui_dark: bool, recent_menu: &gio::Menu) -> gio::Menu {
     let file = gio::Menu::new();
     file.append_item(&menu_row_with_icon("New…", "win.new", "new", ui_dark));
     file.append_item(&menu_row_with_icon("Open…", "win.open", "open", ui_dark));
-    file.append_item(&menu_submenu_row("Recent Files", recent_menu, "recent", ui_dark));
+    file.append_item(&menu_submenu_row(
+        "Recent Files",
+        recent_menu,
+        "recent",
+        ui_dark,
+    ));
     file.append_item(&menu_row_with_icon("Save", "win.save", "save", ui_dark));
-    file.append_item(&menu_row_with_icon("Save As…", "win.save_as", "save_as", ui_dark));
+    file.append_item(&menu_row_with_icon(
+        "Save As…",
+        "win.save_as",
+        "save_as",
+        ui_dark,
+    ));
     menu.append_item(&menu_root_submenu_row("_File", &file, "file", ui_dark));
 
     let canvas_menu = gio::Menu::new();
@@ -6585,7 +6648,12 @@ fn build_menu_model(ui_dark: bool, recent_menu: &gio::Menu) -> gio::Menu {
         "grid",
         ui_dark,
     ));
-    menu.append_item(&menu_root_submenu_row("_Canvas", &canvas_menu, "canvas", ui_dark));
+    menu.append_item(&menu_root_submenu_row(
+        "_Canvas",
+        &canvas_menu,
+        "canvas",
+        ui_dark,
+    ));
 
     let settings = gio::Menu::new();
     settings.append_item(&menu_row_with_icon(
@@ -6640,8 +6708,18 @@ fn build_menu_model(ui_dark: bool, recent_menu: &gio::Menu) -> gio::Menu {
         "manage_palettes",
         ui_dark,
     ));
-    settings.append_item(&menu_submenu_row("_Palettes", &pal_menu, "palettes", ui_dark));
-    menu.append_item(&menu_root_submenu_row("_Settings", &settings, "settings", ui_dark));
+    settings.append_item(&menu_submenu_row(
+        "_Palettes",
+        &pal_menu,
+        "palettes",
+        ui_dark,
+    ));
+    menu.append_item(&menu_root_submenu_row(
+        "_Settings",
+        &settings,
+        "settings",
+        ui_dark,
+    ));
 
     menu
 }
@@ -6842,7 +6920,8 @@ fn register_window_menu_actions(
     });
     app_add_action(window, &check_act);
 
-    let initial_theme = menu_value_for_color_scheme(libadwaita::StyleManager::default().color_scheme());
+    let initial_theme =
+        menu_value_for_color_scheme(libadwaita::StyleManager::default().color_scheme());
     let theme_act = gio::SimpleAction::new_stateful(
         "color_scheme",
         Some(glib::VariantTy::STRING),
@@ -6856,7 +6935,8 @@ fn register_window_menu_actions(
         let Some(s) = p.get::<String>() else {
             return;
         };
-        libadwaita::StyleManager::default().set_color_scheme(color_scheme_from_menu_value(s.as_str()));
+        libadwaita::StyleManager::default()
+            .set_color_scheme(color_scheme_from_menu_value(s.as_str()));
         act.set_state(p);
         crate::settings::persist(&st_theme.borrow());
     });
@@ -6915,7 +6995,6 @@ fn register_window_menu_actions(
     });
     app_add_action(window, &palette_manage_act);
 }
-
 
 fn app_add_action(window: &libadwaita::ApplicationWindow, action: &gio::SimpleAction) {
     window.add_action(action);

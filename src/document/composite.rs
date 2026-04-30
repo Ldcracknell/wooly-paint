@@ -21,7 +21,12 @@ pub fn composite_layers_into(out: &mut [u8], width: u32, height: u32, layers: &[
         }
         debug_assert_eq!(layer.width, width);
         debug_assert_eq!(layer.height, height);
-        blend_layer_premul(out, &layer.pixels, layer.opacity.clamp(0.0, 1.0), layer.blend);
+        blend_layer_premul(
+            out,
+            &layer.pixels,
+            layer.opacity.clamp(0.0, 1.0),
+            layer.blend,
+        );
     }
 }
 
@@ -44,7 +49,12 @@ pub fn composite_layers_prefix_into(
         }
         debug_assert_eq!(layer.width, width);
         debug_assert_eq!(layer.height, height);
-        blend_layer_premul(out, &layer.pixels, layer.opacity.clamp(0.0, 1.0), layer.blend);
+        blend_layer_premul(
+            out,
+            &layer.pixels,
+            layer.opacity.clamp(0.0, 1.0),
+            layer.blend,
+        );
     }
 }
 
@@ -82,7 +92,89 @@ pub fn composite_layers_from_below_into(
         }
         debug_assert_eq!(layer.width, width);
         debug_assert_eq!(layer.height, height);
-        blend_layer_premul(out, &layer.pixels, layer.opacity.clamp(0.0, 1.0), layer.blend);
+        blend_layer_premul(
+            out,
+            &layer.pixels,
+            layer.opacity.clamp(0.0, 1.0),
+            layer.blend,
+        );
+    }
+}
+
+fn clipped_region(
+    width: u32,
+    height: u32,
+    rect: (i32, i32, i32, i32),
+) -> Option<(usize, usize, usize, usize)> {
+    let (x, y, w, h) = rect;
+    let x0 = x.max(0).min(width as i32);
+    let y0 = y.max(0).min(height as i32);
+    let x1 = (x + w).max(0).min(width as i32);
+    let y1 = (y + h).max(0).min(height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        None
+    } else {
+        Some((
+            x0 as usize,
+            y0 as usize,
+            (x1 - x0) as usize,
+            (y1 - y0) as usize,
+        ))
+    }
+}
+
+/// Recompute one full-document rectangle from a cached "below active layer" composite.
+pub fn composite_layers_from_below_region_into(
+    out: &mut [u8],
+    width: u32,
+    height: u32,
+    layers: &[Layer],
+    active: usize,
+    below: &[u8],
+    rect: (i32, i32, i32, i32),
+) {
+    let len = (width * height * 4) as usize;
+    assert_eq!(out.len(), len);
+    assert_eq!(below.len(), len);
+    let Some((x, y, rw, rh)) = clipped_region(width, height, rect) else {
+        return;
+    };
+    let stride = width as usize * 4;
+    let row_bytes = rw * 4;
+
+    for row in y..y + rh {
+        let start = row * stride + x * 4;
+        out[start..start + row_bytes].copy_from_slice(&below[start..start + row_bytes]);
+    }
+
+    if let Some(layer) = layers.get(active) {
+        if layer.visible && layer.opacity > 0.0 {
+            debug_assert_eq!(layer.width, width);
+            debug_assert_eq!(layer.height, height);
+            blend_layer_premul_region(
+                out,
+                &layer.pixels,
+                width,
+                (x, y, rw, rh),
+                layer.opacity.clamp(0.0, 1.0),
+                layer.blend,
+            );
+        }
+    }
+    for layer in layers.iter().skip(active.saturating_add(1)) {
+        if !layer.visible || layer.opacity <= 0.0 {
+            continue;
+        }
+        debug_assert_eq!(layer.width, width);
+        debug_assert_eq!(layer.height, height);
+        blend_layer_premul_region(
+            out,
+            &layer.pixels,
+            width,
+            (x, y, rw, rh),
+            layer.opacity.clamp(0.0, 1.0),
+            layer.blend,
+        );
     }
 }
 
@@ -194,6 +286,44 @@ pub fn blend_layer_premul(dst: &mut [u8], src: &[u8], opacity: f32, mode: BlendM
     }
 }
 
+fn blend_layer_premul_region(
+    dst: &mut [u8],
+    src: &[u8],
+    width: u32,
+    rect: (usize, usize, usize, usize),
+    opacity: f32,
+    mode: BlendMode,
+) {
+    let op = opacity.clamp(0.0, 1.0);
+    if op <= 0.0 {
+        return;
+    }
+    let (x, y, rw, rh) = rect;
+    let stride = width as usize * 4;
+    let row_bytes = rw * 4;
+    if mode == BlendMode::Normal {
+        let op_q = (op * 255.0 + 0.5) as u32;
+        if op_q == 0 {
+            return;
+        }
+        for row in y..y + rh {
+            let start = row * stride + x * 4;
+            let end = start + row_bytes;
+            for (d, s) in dst[start..end].chunks_mut(4).zip(src[start..end].chunks(4)) {
+                blend_premul_normal_px(d, s, op_q);
+            }
+        }
+    } else {
+        for row in y..y + rh {
+            let start = row * stride + x * 4;
+            let end = start + row_bytes;
+            for (d, s) in dst[start..end].chunks_mut(4).zip(src[start..end].chunks(4)) {
+                blend_premul_multiply_add_px(d, s, op, mode);
+            }
+        }
+    }
+}
+
 /// Pack premultiplied RGBA (`width`×`height`, row stride `width * 4`) into Cairo
 /// `Format::ARgb32` memory (BGRA premultiplied). `dst_stride` must come from
 /// `Format::ARgb32.stride_for_width(width)`.
@@ -222,6 +352,34 @@ pub fn premul_rgba_to_cairo_argb32(
         }
         if dst_stride > src_stride {
             dst[d0 + src_stride..d0 + dst_stride].fill(0);
+        }
+    }
+}
+
+pub fn premul_rgba_to_cairo_argb32_region(
+    dst: &mut [u8],
+    dst_stride: usize,
+    width: u32,
+    height: u32,
+    src: &[u8],
+    rect: (i32, i32, i32, i32),
+) {
+    let Some((x, y, rw, rh)) = clipped_region(width, height, rect) else {
+        return;
+    };
+    let src_stride = width as usize * 4;
+    assert!(src.len() >= src_stride * height as usize);
+    assert!(dst.len() >= dst_stride * height as usize);
+    for row in y..y + rh {
+        let s0 = row * src_stride + x * 4;
+        let d0 = row * dst_stride + x * 4;
+        for col in 0..rw {
+            let si = s0 + col * 4;
+            let di = d0 + col * 4;
+            dst[di] = src[si + 2];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si];
+            dst[di + 3] = src[si + 3];
         }
     }
 }
@@ -310,6 +468,53 @@ mod tests {
         composite_layers_into(&mut full, w, h, &layers_edited);
 
         assert_eq!(inc, full);
+    }
+
+    #[test]
+    fn incremental_region_from_below_matches_full_composite_region() {
+        let w = 8u32;
+        let h = 8u32;
+        let mut bottom = Layer::new(w, h, "bottom");
+        bottom.pixels.fill(0);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                bottom.pixels[i..i + 4].copy_from_slice(&[40 + x as u8, 20 + y as u8, 0, 180]);
+            }
+        }
+        let mut top = Layer::new(w, h, "top");
+        top.pixels.fill(0);
+        let layers = vec![bottom, top];
+
+        let mut below = vec![0u8; (w * h * 4) as usize];
+        composite_layers_prefix_into(&mut below, w, h, &layers, 1);
+
+        let mut layers_edited = layers.clone();
+        for y in 2..6 {
+            for x in 1..5 {
+                let i = ((y * w + x) * 4) as usize;
+                layers_edited[1].pixels[i..i + 4].copy_from_slice(&[0, 120, 0, 160]);
+            }
+        }
+
+        let mut region = below.clone();
+        composite_layers_from_below_region_into(
+            &mut region,
+            w,
+            h,
+            &layers_edited,
+            1,
+            &below,
+            (1, 2, 4, 4),
+        );
+
+        let mut full = vec![0u8; (w * h * 4) as usize];
+        composite_layers_into(&mut full, w, h, &layers_edited);
+        for y in 2..6 {
+            let start = ((y * w + 1) * 4) as usize;
+            let end = ((y * w + 5) * 4) as usize;
+            assert_eq!(&region[start..end], &full[start..end]);
+        }
     }
 
     #[test]

@@ -136,6 +136,8 @@ pub struct AppState {
     pub stroke_composite_below: Option<Vec<u8>>,
     pub stroke_composite_active_layer: usize,
     pub stroke_composite_doc_wh: (u32, u32),
+    /// Document-space pixels touched since the last canvas composite update.
+    pub stroke_dirty_rect: Option<(i32, i32, i32, i32)>,
 }
 
 impl AppState {
@@ -212,6 +214,7 @@ impl AppState {
             stroke_composite_below: None,
             stroke_composite_active_layer: 0,
             stroke_composite_doc_wh: (0, 0),
+            stroke_dirty_rect: None,
         }
     }
 
@@ -231,6 +234,7 @@ impl AppState {
     pub fn clear_stroke_composite_below(&mut self) {
         self.stroke_composite_below = None;
         self.stroke_composite_doc_wh = (0, 0);
+        self.stroke_dirty_rect = None;
     }
 
     /// True when incremental stroke compositing matches the current document and active layer.
@@ -249,6 +253,30 @@ impl AppState {
     /// Invalidate composite cache (call after any change that affects flattened pixels or layer stack).
     pub fn bump_document_revision(&mut self) {
         self.document_visual_revision = self.document_visual_revision.wrapping_add(1);
+    }
+
+    pub fn add_stroke_dirty_rect(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+        let Some((x, y, w, h)) = rect else {
+            return;
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let incoming = (x, y, w, h);
+        self.stroke_dirty_rect = Some(match self.stroke_dirty_rect {
+            None => incoming,
+            Some((ax, ay, aw, ah)) => {
+                let x0 = ax.min(x);
+                let y0 = ay.min(y);
+                let x1 = (ax + aw).max(x + w);
+                let y1 = (ay + ah).max(y + h);
+                (x0, y0, x1 - x0, y1 - y0)
+            }
+        });
+    }
+
+    pub fn take_stroke_dirty_rect(&mut self) -> Option<(i32, i32, i32, i32)> {
+        self.stroke_dirty_rect.take()
     }
 
     /// Drop GPU-adjacent composite caches on application shutdown so heap blocks are freed before exit.

@@ -71,20 +71,48 @@ fn straight_to_premul_rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     ]
 }
 
-fn blend_premul_pixel(dst: &mut [u8; 4], src: [u8; 4]) {
-    let sa = src[3] as f32 / 255.0;
-    if sa <= 0.0 {
+pub type DirtyRect = (i32, i32, i32, i32);
+
+fn union_dirty(a: Option<DirtyRect>, b: Option<DirtyRect>) -> Option<DirtyRect> {
+    match (a, b) {
+        (None, r) | (r, None) => r,
+        (Some((ax, ay, aw, ah)), Some((bx, by, bw, bh))) => {
+            let x0 = ax.min(bx);
+            let y0 = ay.min(by);
+            let x1 = (ax + aw).max(bx + bw);
+            let y1 = (ay + ah).max(by + bh);
+            Some((x0, y0, x1 - x0, y1 - y0))
+        }
+    }
+}
+
+fn clip_dirty_to_layer(layer: &Layer, x: i32, y: i32, w: i32, h: i32) -> Option<DirtyRect> {
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(layer.width as i32);
+    let y1 = (y + h).min(layer.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        None
+    } else {
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+}
+
+#[inline]
+fn blend_premul_pixel_int(dst: &mut [u8], src: [u8; 4]) {
+    let sa = src[3] as u32;
+    if sa == 0 {
         return;
     }
-    let inv = 1.0 - sa;
-    for i in 0..3 {
-        dst[i] = (src[i] as f32 + dst[i] as f32 * inv)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-    }
-    dst[3] = ((sa + dst[3] as f32 / 255.0 * inv) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
+    let inv = 255 - sa;
+    dst[0] = (src[0] as u32 + (dst[0] as u32 * inv + 127) / 255).min(255) as u8;
+    dst[1] = (src[1] as u32 + (dst[1] as u32 * inv + 127) / 255).min(255) as u8;
+    dst[2] = (src[2] as u32 + (dst[2] as u32 * inv + 127) / 255).min(255) as u8;
+    dst[3] = (sa + (dst[3] as u32 * inv + 127) / 255).min(255) as u8;
+}
+
+fn blend_premul_pixel(dst: &mut [u8; 4], src: [u8; 4]) {
+    blend_premul_pixel_int(dst, src);
 }
 
 /// Falloff LUT for a fixed hardness; building it is expensive, so reuse across many stamps
@@ -108,6 +136,111 @@ impl BrushFalloffCache {
     }
 }
 
+const BRUSH_SUBPIXEL_STEPS: usize = 4;
+const BRUSH_SUBPIXEL_MASKS: usize = BRUSH_SUBPIXEL_STEPS * BRUSH_SUBPIXEL_STEPS;
+
+struct BrushStampMask {
+    rel_x0: i32,
+    rel_y0: i32,
+    width: i32,
+    height: i32,
+    alpha: Vec<u8>,
+}
+
+impl BrushStampMask {
+    fn new(
+        radius: f64,
+        color_alpha: u8,
+        falloff: &BrushFalloffCache,
+        qx: usize,
+        qy: usize,
+    ) -> Self {
+        let r = radius.max(0.5);
+        let r2 = r * r;
+        let inv_r = 1.0 / r;
+        let cx = (qx as f64 + 0.5) / BRUSH_SUBPIXEL_STEPS as f64;
+        let cy = (qy as f64 + 0.5) / BRUSH_SUBPIXEL_STEPS as f64;
+        let x0 = (cx - r - 1.0).floor() as i32;
+        let y0 = (cy - r - 1.0).floor() as i32;
+        let x1 = (cx + r + 1.0).ceil() as i32;
+        let y1 = (cy + r + 1.0).ceil() as i32;
+        let width = (x1 - x0).max(0);
+        let height = (y1 - y0).max(0);
+        let mut alpha = vec![0u8; (width * height) as usize];
+
+        for row in 0..height {
+            let iy = y0 + row;
+            for col in 0..width {
+                let ix = x0 + col;
+                let dx = ix as f64 + 0.5 - cx;
+                let dy = iy as f64 + 0.5 - cy;
+                let d2 = dx * dx + dy * dy;
+                if d2 > r2 {
+                    continue;
+                }
+                let u = (1.0 - d2.sqrt() * inv_r).clamp(0.0, 1.0);
+                if u <= 0.0 {
+                    continue;
+                }
+                let ui = (u * 255.0 + 0.5).clamp(0.0, 255.0) as usize;
+                let body = falloff.lut[ui];
+                let lift = falloff.lift_scale * u;
+                let a_straight = (body + lift).min(1.0);
+                let aq = (a_straight * color_alpha as f64).round().clamp(0.0, 255.0) as u8;
+                alpha[(row * width + col) as usize] = aq;
+            }
+        }
+
+        Self {
+            rel_x0: x0,
+            rel_y0: y0,
+            width,
+            height,
+            alpha,
+        }
+    }
+}
+
+struct BrushStampCache {
+    radius: f64,
+    color_alpha: u8,
+    falloff: BrushFalloffCache,
+    masks: Vec<Option<BrushStampMask>>,
+}
+
+impl BrushStampCache {
+    fn new(radius: f64, hardness: f64, color_alpha: u8) -> Self {
+        Self {
+            radius,
+            color_alpha,
+            falloff: BrushFalloffCache::new(hardness),
+            masks: (0..BRUSH_SUBPIXEL_MASKS).map(|_| None).collect(),
+        }
+    }
+
+    fn quantized_index(cx: f64, cy: f64) -> (usize, usize, usize) {
+        let fx = (cx - cx.floor()).clamp(0.0, 0.999_999);
+        let fy = (cy - cy.floor()).clamp(0.0, 0.999_999);
+        let qx = (fx * BRUSH_SUBPIXEL_STEPS as f64) as usize;
+        let qy = (fy * BRUSH_SUBPIXEL_STEPS as f64) as usize;
+        (qy * BRUSH_SUBPIXEL_STEPS + qx, qx, qy)
+    }
+
+    fn mask(&mut self, cx: f64, cy: f64) -> &BrushStampMask {
+        let (idx, qx, qy) = Self::quantized_index(cx, cy);
+        if self.masks[idx].is_none() {
+            self.masks[idx] = Some(BrushStampMask::new(
+                self.radius,
+                self.color_alpha,
+                &self.falloff,
+                qx,
+                qy,
+            ));
+        }
+        self.masks[idx].as_ref().expect("brush mask inserted")
+    }
+}
+
 fn stamp_circle_with_falloff(
     layer: &mut Layer,
     cx: f64,
@@ -115,42 +248,27 @@ fn stamp_circle_with_falloff(
     radius: f64,
     color: [u8; 4],
     eraser: bool,
-    falloff: &BrushFalloffCache,
+    cache: &mut BrushStampCache,
     clip: Option<&Selection>,
-) {
+) -> Option<DirtyRect> {
     if radius <= 0.0 {
-        return;
+        return None;
     }
     let w = layer.width as i32;
     let h = layer.height as i32;
-    let r = radius.max(0.5);
-    let r2 = r * r;
-    let inv_r = 1.0 / r;
-    let x0 = (cx - r - 1.0).floor() as i32;
-    let y0 = (cy - r - 1.0).floor() as i32;
-    let x1 = (cx + r + 1.0).ceil() as i32;
-    let y1 = (cy + r + 1.0).ceil() as i32;
     let base = straight_to_premul_rgba(color[0], color[1], color[2], color[3]);
+    let mask = cache.mask(cx, cy);
+    let x0 = cx.floor() as i32 + mask.rel_x0;
+    let y0 = cy.floor() as i32 + mask.rel_y0;
+    let x1 = x0 + mask.width;
+    let y1 = y0 + mask.height;
+    let dirty = clip_dirty_to_layer(layer, x0, y0, mask.width, mask.height);
 
     for iy in y0.max(0)..y1.min(h) {
+        let mask_row = (iy - y0) * mask.width;
         for ix in x0.max(0)..x1.min(w) {
-            let dx = ix as f64 + 0.5 - cx;
-            let dy = iy as f64 + 0.5 - cy;
-            let d2 = dx * dx + dy * dy;
-            if d2 > r2 {
-                continue;
-            }
-            let d = d2.sqrt();
-            let u = (1.0 - d * inv_r).clamp(0.0, 1.0);
-            if u <= 0.0 {
-                continue;
-            }
-            let ui = (u * 255.0 + 0.5).clamp(0.0, 255.0) as usize;
-            let body = falloff.lut[ui];
-            let lift = falloff.lift_scale * u;
-            let a_straight = (body + lift).min(1.0);
-            let alpha: f64 = a_straight * color[3] as f64 / 255.0;
-            if alpha <= 0.0 {
+            let aq = mask.alpha[(mask_row + ix - x0) as usize];
+            if aq == 0 {
                 continue;
             }
             if !clip_allows(clip, ix, iy) {
@@ -158,29 +276,23 @@ fn stamp_circle_with_falloff(
             }
             let i = layer.idx(ix as u32, iy as u32);
             if eraser {
-                let inv = (1.0 - alpha) as f32;
+                let inv = 255u32 - aq as u32;
                 for c in 0..4 {
                     layer.pixels[i + c] =
-                        (layer.pixels[i + c] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+                        ((layer.pixels[i + c] as u32 * inv + 127) / 255).min(255) as u8;
                 }
             } else {
                 let src = [
-                    (base[0] as f64 * alpha).round() as u8,
-                    (base[1] as f64 * alpha).round() as u8,
-                    (base[2] as f64 * alpha).round() as u8,
-                    (base[3] as f64 * alpha).round() as u8,
+                    ((base[0] as u32 * aq as u32 + 127) / 255).min(255) as u8,
+                    ((base[1] as u32 * aq as u32 + 127) / 255).min(255) as u8,
+                    ((base[2] as u32 * aq as u32 + 127) / 255).min(255) as u8,
+                    ((base[3] as u32 * aq as u32 + 127) / 255).min(255) as u8,
                 ];
-                let mut p = [
-                    layer.pixels[i],
-                    layer.pixels[i + 1],
-                    layer.pixels[i + 2],
-                    layer.pixels[i + 3],
-                ];
-                blend_premul_pixel(&mut p, src);
-                layer.pixels[i..i + 4].copy_from_slice(&p);
+                blend_premul_pixel_int(&mut layer.pixels[i..i + 4], src);
             }
         }
     }
+    dirty
 }
 
 /// `color` straight RGBA; composites with existing premultiplied canvas.
@@ -193,20 +305,27 @@ pub fn stamp_circle(
     color: [u8; 4],
     eraser: bool,
     clip: Option<&Selection>,
-) {
+) -> Option<DirtyRect> {
     if radius <= 0.0 {
-        return;
+        return None;
     }
-    let falloff = BrushFalloffCache::new(hardness);
-    stamp_circle_with_falloff(layer, cx, cy, radius, color, eraser, &falloff, clip);
+    let mut cache = BrushStampCache::new(radius, hardness, color[3]);
+    stamp_circle_with_falloff(layer, cx, cy, radius, color, eraser, &mut cache, clip)
 }
 
 fn brush_stroke_step(radius: f64, hardness: f64) -> f64 {
     let h = hardness.clamp(0.0, 1.0);
     let base = (radius * 0.35).max(0.5);
     let tight = 0.04 + 0.96 * h * h;
-    let soft_cap = 0.18 + 1.6 * h * h;
-    (base * tight).min(soft_cap).max(0.03)
+    let mut step = base * tight;
+    if h < 0.25 {
+        // Very soft brushes reveal individual dabs unless spacing is dense, but a fixed
+        // sub-pixel cap makes huge brushes do massive redundant work.
+        let large_brush_relief = (radius.max(0.5) - 12.0).max(0.0) * 0.08;
+        let soft_cap = 0.18 + large_brush_relief + 6.0 * h * h;
+        step = step.min(soft_cap);
+    }
+    step.max(0.05)
 }
 
 /// Minimum spacing between dab centers: softer brushes need denser dabs, but an absolute floor
@@ -219,7 +338,17 @@ fn brush_min_step(radius: f64, hardness: f64) -> f64 {
 
 fn brush_spacing(radius: f64, hardness: f64) -> f64 {
     let r = radius.max(0.5);
-    brush_stroke_step(radius, hardness).min(r * 0.33).max(0.05)
+    let h = hardness.clamp(0.0, 1.0);
+    let large_soft_floor = if h < 0.25 {
+        let ramp = ((r - 12.0) / 20.0).clamp(0.0, 1.0);
+        brush_min_step(radius, hardness) * ramp
+    } else {
+        0.0
+    };
+    brush_stroke_step(radius, hardness)
+        .max(large_soft_floor)
+        .min(r * 0.33)
+        .max(0.05)
 }
 
 pub fn stroke_line(
@@ -233,35 +362,37 @@ pub fn stroke_line(
     color: [u8; 4],
     eraser: bool,
     clip: Option<&Selection>,
-) {
+) -> Option<DirtyRect> {
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len = (dx * dx + dy * dy).sqrt();
     if !len.is_finite() || len <= 1e-9 {
-        stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
-        return;
+        return stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
     }
     let h = hardness.clamp(0.0, 1.0);
     let step = brush_spacing(radius, hardness);
     let n_f = (len / step).ceil();
     if !n_f.is_finite() || n_f <= 0.0 {
-        stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
-        return;
+        return stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
     }
     // Cap dab count per segment so a single long chord cannot freeze the UI.
     let max_n = (50_000.0 / (0.15 + 0.85 * h * h)) as u64;
     let n = (n_f as u64).min(max_n).min(200_000) as usize;
     if n == 0 {
-        stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
-        return;
+        return stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
     }
-    let falloff = BrushFalloffCache::new(hardness);
+    let mut cache = BrushStampCache::new(radius, hardness, color[3]);
+    let mut dirty = None;
     for i in 0..=n {
         let t = i as f64 / n as f64;
         let x = x0 + dx * t;
         let y = y0 + dy * t;
-        stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff, clip);
+        dirty = union_dirty(
+            dirty,
+            stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &mut cache, clip),
+        );
     }
+    dirty
 }
 
 pub fn stroke_line_spaced(
@@ -276,12 +407,12 @@ pub fn stroke_line_spaced(
     eraser: bool,
     clip: Option<&Selection>,
     next_dab_distance: &mut f64,
-) {
+) -> Option<DirtyRect> {
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len = (dx * dx + dy * dy).sqrt();
     if !len.is_finite() || len <= 1e-9 {
-        return;
+        return None;
     }
 
     let spacing = brush_spacing(radius, hardness);
@@ -289,16 +420,21 @@ pub fn stroke_line_spaced(
         *next_dab_distance = spacing;
     }
 
-    let falloff = BrushFalloffCache::new(hardness);
+    let mut cache = BrushStampCache::new(radius, hardness, color[3]);
+    let mut dirty = None;
     let mut d = *next_dab_distance;
     while d <= len {
         let t = d / len;
         let x = x0 + dx * t;
         let y = y0 + dy * t;
-        stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff, clip);
+        dirty = union_dirty(
+            dirty,
+            stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &mut cache, clip),
+        );
         d += spacing;
     }
     *next_dab_distance = d - len;
+    dirty
 }
 
 pub fn stroke_quadratic_spaced(
@@ -315,13 +451,13 @@ pub fn stroke_quadratic_spaced(
     eraser: bool,
     clip: Option<&Selection>,
     next_dab_distance: &mut f64,
-) {
+) -> Option<DirtyRect> {
     let chord = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
     let control_net = ((cx - x0).powi(2) + (cy - y0).powi(2)).sqrt()
         + ((x1 - cx).powi(2) + (y1 - cy).powi(2)).sqrt();
     let approx_len = (chord + control_net) * 0.5;
     if !approx_len.is_finite() || approx_len <= 1e-9 {
-        return;
+        return None;
     }
 
     let spacing = brush_spacing(radius, hardness);
@@ -330,7 +466,8 @@ pub fn stroke_quadratic_spaced(
     }
 
     let subdivisions = (approx_len / (spacing * 0.5)).ceil().clamp(4.0, 4096.0) as usize;
-    let falloff = BrushFalloffCache::new(hardness);
+    let mut cache = BrushStampCache::new(radius, hardness, color[3]);
+    let mut dirty = None;
     let mut remaining = *next_dab_distance;
     let mut px = x0;
     let mut py = y0;
@@ -347,15 +484,18 @@ pub fn stroke_quadratic_spaced(
             let mut d = remaining;
             while d <= seg_len {
                 let u = d / seg_len;
-                stamp_circle_with_falloff(
-                    layer,
-                    px + sx * u,
-                    py + sy * u,
-                    radius,
-                    color,
-                    eraser,
-                    &falloff,
-                    clip,
+                dirty = union_dirty(
+                    dirty,
+                    stamp_circle_with_falloff(
+                        layer,
+                        px + sx * u,
+                        py + sy * u,
+                        radius,
+                        color,
+                        eraser,
+                        &mut cache,
+                        clip,
+                    ),
                 );
                 d += spacing;
             }
@@ -366,6 +506,7 @@ pub fn stroke_quadratic_spaced(
     }
 
     *next_dab_distance = remaining;
+    dirty
 }
 
 pub fn stamp_square(
@@ -376,9 +517,9 @@ pub fn stamp_square(
     color: [u8; 4],
     eraser: bool,
     clip: Option<&Selection>,
-) {
+) -> Option<DirtyRect> {
     if size <= 0.0 {
-        return;
+        return None;
     }
     let mut s = size.floor() as i32;
     if s < 1 {
@@ -395,8 +536,9 @@ pub fn stamp_square(
     let base = straight_to_premul_rgba(color[0], color[1], color[2], color[3]);
     let alpha = color[3] as f64 / 255.0;
     if alpha <= 0.0 {
-        return;
+        return None;
     }
+    let dirty = clip_dirty_to_layer(layer, x0, y0, s, s);
 
     for iy in y0.max(0)..y1.min(h) {
         for ix in x0.max(0)..x1.min(w) {
@@ -428,6 +570,7 @@ pub fn stamp_square(
             }
         }
     }
+    dirty
 }
 
 fn bresenham_visit(mut x0: i32, mut y0: i32, x1: i32, y1: i32, mut visit: impl FnMut(i32, i32)) {
@@ -463,22 +606,27 @@ pub fn stroke_line_square(
     color: [u8; 4],
     eraser: bool,
     clip: Option<&Selection>,
-) {
+) -> Option<DirtyRect> {
     let p0x = x0.floor() as i32;
     let p0y = y0.floor() as i32;
     let p1x = x1.floor() as i32;
     let p1y = y1.floor() as i32;
+    let mut dirty = None;
     bresenham_visit(p0x, p0y, p1x, p1y, |ix, iy| {
-        stamp_square(
-            layer,
-            ix as f64 + 0.5,
-            iy as f64 + 0.5,
-            size,
-            color,
-            eraser,
-            clip,
+        dirty = union_dirty(
+            dirty,
+            stamp_square(
+                layer,
+                ix as f64 + 0.5,
+                iy as f64 + 0.5,
+                size,
+                color,
+                eraser,
+                clip,
+            ),
         );
     });
+    dirty
 }
 
 /// Connected pixels matching `layer[(x,y)]` within `tolerance` (premul RGBA). Does not modify the layer.
@@ -504,8 +652,7 @@ pub fn flood_select_mask(
     let mut max_y = -1i32;
     let start = layer.pixel_premul(x, y);
     let tol = tolerance as i32;
-    let match_start =
-        |p: [u8; 4]| (0..4).all(|i| (p[i] as i32 - start[i] as i32).abs() <= tol);
+    let match_start = |p: [u8; 4]| (0..4).all(|i| (p[i] as i32 - start[i] as i32).abs() <= tol);
     let mut stack: Vec<(u32, u32)> = vec![(x, y)];
     while let Some((cx, cy)) = stack.pop() {
         let idx = (cy * w + cx) as usize;
@@ -649,9 +796,7 @@ pub fn flood_fill(
     }
     let start = layer.pixel_premul(x, y);
     let tol = tolerance as i32;
-    let match_start = |p: [u8; 4]| {
-        (0..4).all(|i| (p[i] as i32 - start[i] as i32).abs() <= tol)
-    };
+    let match_start = |p: [u8; 4]| (0..4).all(|i| (p[i] as i32 - start[i] as i32).abs() <= tol);
     if (0..4).all(|i| (start[i] as i32 - fill_premul[i] as i32).abs() <= tol) {
         return;
     }
@@ -722,12 +867,7 @@ pub fn paste_rect(layer: &mut Layer, x: i32, y: i32, rw: i32, rh: i32, data: &[u
             let sy = y + row;
             if sx >= 0 && sy >= 0 && sx < layer.width as i32 && sy < layer.height as i32 {
                 if i + 4 <= data.len() {
-                    let src = [
-                        data[i],
-                        data[i + 1],
-                        data[i + 2],
-                        data[i + 3],
-                    ];
+                    let src = [data[i], data[i + 1], data[i + 2], data[i + 3]];
                     let li = layer.idx(sx as u32, sy as u32);
                     let mut dst = [
                         layer.pixels[li],
@@ -766,7 +906,7 @@ pub fn draw_rect_outline(
             .max(brush_min_step(radius, hardness))
             .max(radius * 0.22)
             .max(0.75);
-        let falloff = BrushFalloffCache::new(hardness);
+        let mut cache = BrushStampCache::new(radius, hardness, color[3]);
         let mut y = min_y.floor();
         let y1 = max_y.ceil();
         let x0f = min_x;
@@ -780,7 +920,9 @@ pub fn draw_rect_outline(
                 let px = x + 0.5;
                 let py = y + 0.5;
                 if px >= x0f && px <= x1f && py >= y0f && py <= y1f {
-                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff, clip);
+                    let _ = stamp_circle_with_falloff(
+                        layer, px, py, radius, color, eraser, &mut cache, clip,
+                    );
                 }
                 x += step;
             }
@@ -788,52 +930,16 @@ pub fn draw_rect_outline(
         }
     } else {
         stroke_line(
-            layer,
-            min_x,
-            min_y,
-            max_x,
-            min_y,
-            radius,
-            hardness,
-            color,
-            eraser,
-            clip,
+            layer, min_x, min_y, max_x, min_y, radius, hardness, color, eraser, clip,
         );
         stroke_line(
-            layer,
-            max_x,
-            min_y,
-            max_x,
-            max_y,
-            radius,
-            hardness,
-            color,
-            eraser,
-            clip,
+            layer, max_x, min_y, max_x, max_y, radius, hardness, color, eraser, clip,
         );
         stroke_line(
-            layer,
-            max_x,
-            max_y,
-            min_x,
-            max_y,
-            radius,
-            hardness,
-            color,
-            eraser,
-            clip,
+            layer, max_x, max_y, min_x, max_y, radius, hardness, color, eraser, clip,
         );
         stroke_line(
-            layer,
-            min_x,
-            max_y,
-            min_x,
-            min_y,
-            radius,
-            hardness,
-            color,
-            eraser,
-            clip,
+            layer, min_x, max_y, min_x, min_y, radius, hardness, color, eraser, clip,
         );
     }
 }
@@ -889,7 +995,7 @@ pub fn draw_ellipse(
             .max(brush_min_step(radius, hardness))
             .max(radius * 0.18)
             .max(0.75);
-        let falloff = BrushFalloffCache::new(hardness);
+        let mut cache = BrushStampCache::new(radius, hardness, color[3]);
         let y_end = y_max.min(h) as f64;
         let x_end = x_max.min(w) as f64;
         let mut y = y_min.max(0) as f64;
@@ -901,7 +1007,9 @@ pub fn draw_ellipse(
                 let nx = (px - cx) / rx;
                 let ny = (py - cy) / ry;
                 if nx * nx + ny * ny <= 1.0 {
-                    stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff, clip);
+                    let _ = stamp_circle_with_falloff(
+                        layer, px, py, radius, color, eraser, &mut cache, clip,
+                    );
                 }
                 x += step;
             }
@@ -909,12 +1017,13 @@ pub fn draw_ellipse(
         }
     } else {
         let n = ellipse_outline_segment_count(rx, ry, radius, hardness);
-        let falloff = BrushFalloffCache::new(hardness);
+        let mut cache = BrushStampCache::new(radius, hardness, color[3]);
         for i in 0..=n {
             let t = std::f64::consts::TAU * i as f64 / n as f64;
             let px = cx + rx * t.cos();
             let py = cy + ry * t.sin();
-            stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &falloff, clip);
+            let _ =
+                stamp_circle_with_falloff(layer, px, py, radius, color, eraser, &mut cache, clip);
         }
     }
 }

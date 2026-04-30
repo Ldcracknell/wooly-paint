@@ -3,8 +3,9 @@ mod history;
 pub mod layer;
 
 pub use composite::{
-    blend_layer_premul, composite_layers, composite_layers_from_below_into, composite_layers_into,
-    composite_layers_prefix_into, premul_rgba_to_cairo_argb32, premul_to_straight_rgba,
+    blend_layer_premul, composite_layers, composite_layers_from_below_into,
+    composite_layers_from_below_region_into, composite_layers_into, composite_layers_prefix_into,
+    premul_rgba_to_cairo_argb32, premul_rgba_to_cairo_argb32_region, premul_to_straight_rgba,
     premul_to_straight_rgba_into, straight_to_premul,
 };
 pub use history::History;
@@ -351,7 +352,6 @@ impl Document {
         };
     }
 }
-
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
