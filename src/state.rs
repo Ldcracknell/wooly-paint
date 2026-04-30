@@ -124,6 +124,8 @@ pub struct AppState {
     pub floating_pixbuf_key: Option<(usize, usize, i32, i32)>,
     /// While true, composite cache is not used (pixels change every event during brush/pixel/eraser stroke).
     pub brush_stroke_in_progress: bool,
+    /// Distance from the latest stroke sample to the next brush dab, carried across drag events.
+    pub stroke_next_dab_distance: f64,
     /// During brush/pixel/eraser stroke: only paint inside this selection (captured at press; `None` = no clip).
     pub stroke_paint_clip: Option<Selection>,
     /// During brush/pixel/eraser stroke: flattened premul RGBA of layers strictly below
@@ -200,6 +202,7 @@ impl AppState {
             floating_pixbuf_cache: None,
             floating_pixbuf_key: None,
             brush_stroke_in_progress: false,
+            stroke_next_dab_distance: 0.0,
             stroke_paint_clip: None,
             stroke_composite_below: None,
             stroke_composite_active_layer: 0,

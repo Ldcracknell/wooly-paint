@@ -205,7 +205,8 @@ fn brush_stroke_step(radius: f64, hardness: f64) -> f64 {
     let h = hardness.clamp(0.0, 1.0);
     let base = (radius * 0.35).max(0.5);
     let tight = 0.04 + 0.96 * h * h;
-    (base * tight).max(0.05)
+    let soft_cap = 0.18 + 1.6 * h * h;
+    (base * tight).min(soft_cap).max(0.03)
 }
 
 /// Minimum spacing between dab centers: softer brushes need denser dabs, but an absolute floor
@@ -237,8 +238,8 @@ pub fn stroke_line(
     }
     let r = radius.max(0.5);
     let h = hardness.clamp(0.0, 1.0);
-    let mut step = brush_stroke_step(radius, hardness).max(brush_min_step(radius, hardness));
-    step = step.min(r * 0.33).max(0.08);
+    let mut step = brush_stroke_step(radius, hardness);
+    step = step.min(r * 0.33).max(0.05);
     let n_f = (len / step).ceil();
     if !n_f.is_finite() || n_f <= 0.0 {
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
@@ -258,6 +259,46 @@ pub fn stroke_line(
         let y = y0 + dy * t;
         stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff, clip);
     }
+}
+
+pub fn stroke_line_spaced(
+    layer: &mut Layer,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    radius: f64,
+    hardness: f64,
+    color: [u8; 4],
+    eraser: bool,
+    clip: Option<&Selection>,
+    next_dab_distance: &mut f64,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    if !len.is_finite() || len <= 1e-9 {
+        return;
+    }
+
+    let r = radius.max(0.5);
+    let spacing = brush_stroke_step(radius, hardness)
+        .min(r * 0.33)
+        .max(0.05);
+    if !next_dab_distance.is_finite() || *next_dab_distance <= 0.0 {
+        *next_dab_distance = spacing;
+    }
+
+    let falloff = BrushFalloffCache::new(hardness);
+    let mut d = *next_dab_distance;
+    while d <= len {
+        let t = d / len;
+        let x = x0 + dx * t;
+        let y = y0 + dy * t;
+        stamp_circle_with_falloff(layer, x, y, radius, color, eraser, &falloff, clip);
+        d += spacing;
+    }
+    *next_dab_distance = d - len;
 }
 
 pub fn stamp_square(

@@ -8,7 +8,8 @@ use crate::tool_cursors;
 use crate::tools::{
     clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse, draw_rect_outline,
     ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect, region_tight_bbox_or_hint,
-    sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_square, ToolKind,
+    sample_composite_premul, stamp_circle, stamp_square, stroke_line, stroke_line_spaced,
+    stroke_line_square, ToolKind,
 };
 use libadwaita::prelude::*;
 use libadwaita::{Application, ColorScheme};
@@ -2967,31 +2968,40 @@ fn paint_brush_drag_sample(
         *last_sample.borrow_mut() = Some((wx, wy));
         return false;
     };
+    if cx.floor() == lx.floor() && cy.floor() == ly.floor() {
+        *last_sample.borrow_mut() = Some((wx, wy));
+        return false;
+    }
     let eraser = st.tool == ToolKind::Eraser;
     let paint_color = if eraser {
         st.fg
     } else {
         st.active_paint_color()
     };
+    let tool = st.tool;
+    let radius = st.brush_size * 0.5;
+    let hardness = st.brush_hardness;
+    let pixel_size = st.brush_size;
+    let mut next_dab_distance = st.stroke_next_dab_distance;
     let layer = match st.doc.active_layer_mut() {
         Some(l) => l,
         None => return false,
     };
     let clip = st.stroke_paint_clip.as_ref();
-    match st.tool {
+    match tool {
         ToolKind::Brush | ToolKind::Eraser => {
-            let radius = st.brush_size * 0.5;
-            stroke_line(
+            stroke_line_spaced(
                 layer,
                 lx,
                 ly,
                 cx,
                 cy,
                 radius,
-                st.brush_hardness,
+                hardness,
                 paint_color,
                 eraser,
                 clip,
+                &mut next_dab_distance,
             );
         }
         ToolKind::Pixel => {
@@ -3001,7 +3011,7 @@ fn paint_brush_drag_sample(
                 ly,
                 cx,
                 cy,
-                st.brush_size,
+                pixel_size,
                 paint_color,
                 false,
                 clip,
@@ -3009,6 +3019,7 @@ fn paint_brush_drag_sample(
         }
         _ => return false,
     }
+    st.stroke_next_dab_distance = next_dab_distance;
     st.last_doc_pos = Some((cx, cy));
     *last_sample.borrow_mut() = Some((wx, wy));
     st.modified = true;
@@ -3131,6 +3142,7 @@ fn setup_canvas_input(
                 let radius = st.brush_size * 0.5;
                 let hardness = st.brush_hardness;
                 st.brush_stroke_in_progress = true;
+                st.stroke_next_dab_distance = 0.0;
                 st.begin_stroke_undo();
                 st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
@@ -3156,6 +3168,7 @@ fn setup_canvas_input(
                 let color = st.active_paint_color();
                 let size = st.brush_size;
                 st.brush_stroke_in_progress = true;
+                st.stroke_next_dab_distance = 0.0;
                 st.begin_stroke_undo();
                 st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
@@ -3557,6 +3570,7 @@ fn setup_canvas_input(
                 st.commit_stroke_undo();
                 st.clear_stroke_composite_below();
                 st.brush_stroke_in_progress = false;
+                st.stroke_next_dab_distance = 0.0;
                 st.stroke_paint_clip = None;
                 st.last_doc_pos = None;
             }
