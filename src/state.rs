@@ -68,6 +68,13 @@ pub enum ColorSlot {
     Right,
 }
 
+pub struct PendingUndoSnapshot {
+    pub layer_index: usize,
+    pub rect: Option<(i32, i32, i32, i32)>,
+    pub pixels: Vec<u8>,
+    pub full_layer: bool,
+}
+
 pub struct AppState {
     pub doc: Document,
     pub history: History,
@@ -94,7 +101,7 @@ pub struct AppState {
     pub selection: Option<Selection>,
     pub clipboard: Option<(i32, i32, Vec<u8>)>,
     pub floating: Option<FloatingSelection>,
-    pub undo_snapshot: Option<(usize, Vec<u8>)>,
+    pub undo_snapshot: Option<PendingUndoSnapshot>,
     pub last_doc_pos: Option<(f64, f64)>,
     pub drag_start_doc: Option<(f64, f64)>,
     /// Line / rectangle / ellipse drag: `(tool, x0, y0, x1, y1)` in document space (live preview).
@@ -296,19 +303,86 @@ impl AppState {
         ((wx - self.pan_x) / self.zoom, (wy - self.pan_y) / self.zoom)
     }
 
-    pub fn begin_stroke_undo(&mut self) {
+    pub fn begin_full_undo(&mut self) {
         if let Some(layer) = self.doc.active_layer_ref() {
-            self.undo_snapshot = Some((self.doc.active_layer, layer.pixels.clone()));
+            self.undo_snapshot = Some(PendingUndoSnapshot {
+                layer_index: self.doc.active_layer,
+                rect: None,
+                pixels: layer.pixels.clone(),
+                full_layer: true,
+            });
+        }
+    }
+
+    pub fn begin_stroke_undo(&mut self) {
+        if self.doc.active_layer_ref().is_some() {
+            self.undo_snapshot = Some(PendingUndoSnapshot {
+                layer_index: self.doc.active_layer,
+                rect: None,
+                pixels: Vec::new(),
+                full_layer: false,
+            });
+        }
+    }
+
+    pub fn capture_undo_rect(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+        let Some(rect) = rect else {
+            return;
+        };
+        let Some(snapshot) = self.undo_snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.full_layer || snapshot.layer_index != self.doc.active_layer {
+            return;
+        }
+        let Some(layer) = self.doc.layers.get(snapshot.layer_index) else {
+            return;
+        };
+        let Some(rect) = clip_rect_to_layer(layer.width, layer.height, rect) else {
+            return;
+        };
+
+        match snapshot.rect {
+            None => {
+                snapshot.rect = Some(rect);
+                snapshot.pixels = copy_layer_rect(layer, rect);
+            }
+            Some(old) => {
+                let union = union_rect(old, rect);
+                if union == old {
+                    return;
+                }
+                let mut pixels = copy_layer_rect(layer, union);
+                blit_rect_buffer(&snapshot.pixels, old, &mut pixels, union);
+                snapshot.rect = Some(union);
+                snapshot.pixels = pixels;
+            }
         }
     }
 
     pub fn commit_stroke_undo(&mut self) {
-        if let Some((idx, before)) = self.undo_snapshot.take() {
-            if let Some(layer) = self.doc.layers.get(idx) {
-                if layer.pixels != before {
-                    self.history.commit_change(idx, before);
-                    self.modified = true;
-                    self.bump_document_revision();
+        if let Some(snapshot) = self.undo_snapshot.take() {
+            if let Some(layer) = self.doc.layers.get(snapshot.layer_index) {
+                if snapshot.full_layer {
+                    if layer.pixels != snapshot.pixels {
+                        self.history
+                            .commit_change(snapshot.layer_index, snapshot.pixels);
+                        self.modified = true;
+                        self.bump_document_revision();
+                    }
+                } else if let Some((x, y, w, h)) = snapshot.rect {
+                    if layer_rect_differs(layer, (x, y, w, h), &snapshot.pixels) {
+                        self.history.commit_rect_change(
+                            snapshot.layer_index,
+                            x,
+                            y,
+                            w,
+                            h,
+                            snapshot.pixels,
+                        );
+                        self.modified = true;
+                        self.bump_document_revision();
+                    }
                 }
             }
         }
@@ -343,6 +417,81 @@ impl AppState {
         let h = (max_y - min_y).max(1);
         (min_x, min_y, w, h)
     }
+}
+
+fn clip_rect_to_layer(
+    width: u32,
+    height: u32,
+    rect: (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    let (x, y, w, h) = rect;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(width as i32);
+    let y1 = (y + h).min(height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        None
+    } else {
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+}
+
+fn union_rect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let x0 = a.0.min(b.0);
+    let y0 = a.1.min(b.1);
+    let x1 = (a.0 + a.2).max(b.0 + b.2);
+    let y1 = (a.1 + a.3).max(b.1 + b.3);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+fn copy_layer_rect(layer: &crate::document::Layer, rect: (i32, i32, i32, i32)) -> Vec<u8> {
+    let (x, y, w, h) = rect;
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for row in 0..h {
+        let src = layer.idx(x as u32, (y + row) as u32);
+        let dst = (row * w * 4) as usize;
+        let len = (w * 4) as usize;
+        out[dst..dst + len].copy_from_slice(&layer.pixels[src..src + len]);
+    }
+    out
+}
+
+fn blit_rect_buffer(
+    src: &[u8],
+    src_rect: (i32, i32, i32, i32),
+    dst: &mut [u8],
+    dst_rect: (i32, i32, i32, i32),
+) {
+    let (sx, sy, sw, sh) = src_rect;
+    let (dx, dy, dw, _dh) = dst_rect;
+    for row in 0..sh {
+        let src_start = (row * sw * 4) as usize;
+        let dst_col = sx - dx;
+        let dst_row = sy + row - dy;
+        let dst_start = ((dst_row * dw + dst_col) * 4) as usize;
+        let len = (sw * 4) as usize;
+        dst[dst_start..dst_start + len].copy_from_slice(&src[src_start..src_start + len]);
+    }
+}
+
+fn layer_rect_differs(
+    layer: &crate::document::Layer,
+    rect: (i32, i32, i32, i32),
+    before: &[u8],
+) -> bool {
+    let (x, y, w, h) = rect;
+    if before.len() < (w * h * 4) as usize {
+        return false;
+    }
+    for row in 0..h {
+        let src = layer.idx(x as u32, (y + row) as u32);
+        let old = (row * w * 4) as usize;
+        let len = (w * 4) as usize;
+        if layer.pixels[src..src + len] != before[old..old + len] {
+            return true;
+        }
+    }
+    false
 }
 
 impl Default for AppState {

@@ -4,10 +4,11 @@ use crate::document::{
     premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul, Document,
 };
 use crate::palette::{self, PaletteBook};
+use crate::selection::region_mask_outline_segments;
 use crate::state::{AppState, ColorSlot, FloatingDrag, FloatingSelection, Selection};
 use crate::tool_cursors;
 use crate::tools::{
-    clear_rect, clear_region_masked, copy_rect, copy_region_masked, draw_ellipse,
+    clear_rect, clear_region_masked_rect, copy_rect, copy_region_masked, draw_ellipse,
     draw_rect_outline, ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect,
     region_tight_bbox_or_hint, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
     stroke_line_spaced, stroke_line_square, stroke_quadratic_spaced, ToolKind,
@@ -2215,14 +2216,27 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
 
         let st = state.clone();
         let cv = canvas.clone();
+        let opacity_redraw_pending = Rc::new(Cell::new(false));
         op_adj.connect_value_changed(move |a| {
-            let mut g = st.borrow_mut();
-            if let Some(l) = g.doc.layers.get_mut(i) {
-                l.opacity = (a.value() / 100.0) as f32;
-                g.modified = true;
-                g.bump_document_revision();
+            {
+                let mut g = st.borrow_mut();
+                if let Some(l) = g.doc.layers.get_mut(i) {
+                    l.opacity = (a.value() / 100.0) as f32;
+                    g.modified = true;
+                }
             }
-            queue_canvas(&cv);
+            if opacity_redraw_pending.get() {
+                return;
+            }
+            opacity_redraw_pending.set(true);
+            let st_tick = st.clone();
+            let cv_tick = cv.clone();
+            let pending = opacity_redraw_pending.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(33), move || {
+                pending.set(false);
+                st_tick.borrow_mut().bump_document_revision();
+                queue_canvas(&cv_tick);
+            });
         });
 
         let st = state.clone();
@@ -2370,6 +2384,7 @@ fn draw_shape_drag_preview(
     shape_filled: bool,
     brush_size: f64,
     brush_hardness: f64,
+    zoom: f64,
 ) {
     let (r, g, b, a) = straight_fg_to_cairo(fg);
     let lw = brush_size.max(0.5);
@@ -2409,7 +2424,11 @@ fn draw_shape_drag_preview(
             if rx < 0.25 || ry < 0.25 {
                 return;
             }
-            let steps = ellipse_outline_segment_count(rx, ry, brush_size * 0.5, brush_hardness);
+            let final_steps =
+                ellipse_outline_segment_count(rx, ry, brush_size * 0.5, brush_hardness);
+            let screen_perimeter = ellipse_perimeter_screen_estimate(rx, ry, zoom);
+            let preview_steps = (screen_perimeter / 2.0).ceil().clamp(24.0, 720.0) as i32;
+            let steps = final_steps.min(preview_steps).max(8);
             cr.move_to(cx + rx, cy);
             for i in 1..=steps {
                 let t = std::f64::consts::TAU * i as f64 / steps as f64;
@@ -2428,6 +2447,16 @@ fn draw_shape_drag_preview(
         }
         _ => {}
     }
+}
+
+fn ellipse_perimeter_screen_estimate(rx: f64, ry: f64, zoom: f64) -> f64 {
+    let a = (rx * zoom).abs();
+    let b = (ry * zoom).abs();
+    if a < 1e-6 || b < 1e-6 {
+        return 0.0;
+    }
+    let h = ((a - b) / (a + b)).powi(2);
+    std::f64::consts::PI * (a + b) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt()))
 }
 
 fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)) {
@@ -2457,134 +2486,13 @@ fn with_transparency_checker_pattern(f: impl FnOnce(&gtk::cairo::SurfacePattern)
     });
 }
 
-/// Build the magic-wand / region marquee outline using merged axis-aligned segments (same geometry
-/// as per-pixel strokes, far fewer Cairo primitives on large selections).
-fn region_mask_outline_path(cr: &gtk::cairo::Context, mask: &[u8], rw: u32, rh: u32) {
-    let ww = rw as usize;
-    let h = rh as usize;
-    debug_assert_eq!(mask.len(), ww * h);
-
-    for y in 0..h {
-        let mut x = 0usize;
-        while x < ww {
-            let idx = y * ww + x;
-            if mask[idx] == 0 {
-                x += 1;
-                continue;
-            }
-            let top_clear = y == 0 || mask[idx - ww] == 0;
-            if !top_clear {
-                x += 1;
-                continue;
-            }
-            let x0 = x;
-            x += 1;
-            while x < ww {
-                let i2 = y * ww + x;
-                if mask[i2] == 0 {
-                    break;
-                }
-                if !(y == 0 || mask[i2 - ww] == 0) {
-                    break;
-                }
-                x += 1;
-            }
-            cr.move_to(x0 as f64, y as f64);
-            cr.line_to(x as f64, y as f64);
-        }
-    }
-
-    for y in 0..h {
-        let mut x = 0usize;
-        while x < ww {
-            let idx = y * ww + x;
-            if mask[idx] == 0 {
-                x += 1;
-                continue;
-            }
-            let bottom_clear = y + 1 == h || mask[idx + ww] == 0;
-            if !bottom_clear {
-                x += 1;
-                continue;
-            }
-            let x0 = x;
-            x += 1;
-            let y1 = (y + 1) as f64;
-            while x < ww {
-                let i2 = y * ww + x;
-                if mask[i2] == 0 {
-                    break;
-                }
-                if !(y + 1 == h || mask[i2 + ww] == 0) {
-                    break;
-                }
-                x += 1;
-            }
-            cr.move_to(x0 as f64, y1);
-            cr.line_to(x as f64, y1);
-        }
-    }
-
-    for x in 0..ww {
-        let mut y = 0usize;
-        while y < h {
-            let idx = y * ww + x;
-            if mask[idx] == 0 {
-                y += 1;
-                continue;
-            }
-            let left_clear = x == 0 || mask[idx - 1] == 0;
-            if !left_clear {
-                y += 1;
-                continue;
-            }
-            let y0 = y;
-            y += 1;
-            let xf = x as f64;
-            while y < h {
-                let i2 = y * ww + x;
-                if mask[i2] == 0 {
-                    break;
-                }
-                if !(x == 0 || mask[i2 - 1] == 0) {
-                    break;
-                }
-                y += 1;
-            }
-            cr.move_to(xf, y0 as f64);
-            cr.line_to(xf, y as f64);
-        }
-    }
-
-    for x in 0..ww {
-        let mut y = 0usize;
-        while y < h {
-            let idx = y * ww + x;
-            if mask[idx] == 0 {
-                y += 1;
-                continue;
-            }
-            let right_clear = x + 1 == ww || mask[idx + 1] == 0;
-            if !right_clear {
-                y += 1;
-                continue;
-            }
-            let y0 = y;
-            y += 1;
-            let xf = (x + 1) as f64;
-            while y < h {
-                let i2 = y * ww + x;
-                if mask[i2] == 0 {
-                    break;
-                }
-                if !(x + 1 == ww || mask[i2 + 1] == 0) {
-                    break;
-                }
-                y += 1;
-            }
-            cr.move_to(xf, y0 as f64);
-            cr.line_to(xf, y as f64);
-        }
+fn region_outline_segments_path(
+    cr: &gtk::cairo::Context,
+    segments: &[crate::selection::RegionOutlineSegment],
+) {
+    for &(x0, y0, x1, y1) in segments {
+        cr.move_to(x0 as f64, y0 as f64);
+        cr.line_to(x1 as f64, y1 as f64);
     }
 }
 
@@ -2797,21 +2705,33 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
         cr.scale(zoom, zoom);
         cr.rectangle(0.0, 0.0, w as f64, h as f64);
         cr.clip();
-        let lw = 1.0 / zoom.max(0.001);
-        cr.set_line_width(lw);
-        cr.set_antialias(gtk::cairo::Antialias::None);
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.28);
-        for x in 0..=w {
-            let xf = x as f64;
-            cr.move_to(xf, 0.0);
-            cr.line_to(xf, h as f64);
+        if zoom >= 4.0 {
+            let doc_x0 = ((0.0 - pan_x) / zoom).floor().max(0.0) as u32;
+            let doc_y0 = ((0.0 - pan_y) / zoom).floor().max(0.0) as u32;
+            let doc_x1 = ((widget_w as f64 - pan_x) / zoom)
+                .ceil()
+                .min(w as f64)
+                .max(0.0) as u32;
+            let doc_y1 = ((widget_h as f64 - pan_y) / zoom)
+                .ceil()
+                .min(h as f64)
+                .max(0.0) as u32;
+            let lw = 1.0 / zoom.max(0.001);
+            cr.set_line_width(lw);
+            cr.set_antialias(gtk::cairo::Antialias::None);
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.28);
+            for x in doc_x0..=doc_x1 {
+                let xf = x as f64;
+                cr.move_to(xf, doc_y0 as f64);
+                cr.line_to(xf, doc_y1 as f64);
+            }
+            for y in doc_y0..=doc_y1 {
+                let yf = y as f64;
+                cr.move_to(doc_x0 as f64, yf);
+                cr.line_to(doc_x1 as f64, yf);
+            }
+            cr.stroke().unwrap();
         }
-        for y in 0..=h {
-            let yf = y as f64;
-            cr.move_to(0.0, yf);
-            cr.line_to(w as f64, yf);
-        }
-        cr.stroke().unwrap();
         cr.restore().unwrap();
     }
 
@@ -2868,9 +2788,10 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
             let m = floating_image_to_doc_matrix(f);
             cr.transform(m);
             cr.set_source_pixbuf(&pb, 0.0, 0.0);
-            let filt = if (f.scale_x - 1.0).abs() < 1e-6
-                && (f.scale_y - 1.0).abs() < 1e-6
-                && f.angle_deg.rem_euclid(90.0).abs() < 1e-6
+            let filt = if st_fl.floating_drag.is_some()
+                || (f.scale_x - 1.0).abs() < 1e-6
+                    && (f.scale_y - 1.0).abs() < 1e-6
+                    && f.angle_deg.rem_euclid(90.0).abs() < 1e-6
             {
                 gtk::cairo::Filter::Nearest
             } else {
@@ -2930,11 +2851,12 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
                 width: rw,
                 height: rh,
                 mask,
+                outline_segments,
                 ..
             } => {
                 if *rw == w && *rh == h && mask.len() == (w * h) as usize {
                     cr.new_path();
-                    region_mask_outline_path(cr, mask, *rw, *rh);
+                    region_outline_segments_path(cr, outline_segments);
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
                     cr.set_dash(&[6.0, 6.0], 0.0);
                     cr.stroke_preserve().unwrap();
@@ -2962,6 +2884,7 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
             shape_filled,
             brush_size,
             brush_hardness,
+            zoom,
         );
         cr.restore().unwrap();
     }
@@ -3011,6 +2934,50 @@ fn commit_floating(state: &mut AppState) {
     }
 }
 
+fn brush_point_rect(x: f64, y: f64, radius: f64) -> (i32, i32, i32, i32) {
+    let pad = radius.max(0.5) + 2.0;
+    let x0 = (x - pad).floor() as i32;
+    let y0 = (y - pad).floor() as i32;
+    let x1 = (x + pad).ceil() as i32;
+    let y1 = (y + pad).ceil() as i32;
+    (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
+}
+
+fn brush_segment_rect(x0: f64, y0: f64, x1: f64, y1: f64, radius: f64) -> (i32, i32, i32, i32) {
+    let pad = radius.max(0.5) + 2.0;
+    let rx0 = (x0.min(x1) - pad).floor() as i32;
+    let ry0 = (y0.min(y1) - pad).floor() as i32;
+    let rx1 = (x0.max(x1) + pad).ceil() as i32;
+    let ry1 = (y0.max(y1) + pad).ceil() as i32;
+    (rx0, ry0, (rx1 - rx0).max(1), (ry1 - ry0).max(1))
+}
+
+fn brush_quadratic_rect(
+    x0: f64,
+    y0: f64,
+    cx: f64,
+    cy: f64,
+    x1: f64,
+    y1: f64,
+    radius: f64,
+) -> (i32, i32, i32, i32) {
+    let pad = radius.max(0.5) + 2.0;
+    let rx0 = (x0.min(cx).min(x1) - pad).floor() as i32;
+    let ry0 = (y0.min(cy).min(y1) - pad).floor() as i32;
+    let rx1 = (x0.max(cx).max(x1) + pad).ceil() as i32;
+    let ry1 = (y0.max(cy).max(y1) + pad).ceil() as i32;
+    (rx0, ry0, (rx1 - rx0).max(1), (ry1 - ry0).max(1))
+}
+
+fn pixel_line_rect(x0: f64, y0: f64, x1: f64, y1: f64, size: f64) -> (i32, i32, i32, i32) {
+    let pad = size.max(1.0) * 0.5 + 1.0;
+    let rx0 = (x0.min(x1) - pad).floor() as i32;
+    let ry0 = (y0.min(y1) - pad).floor() as i32;
+    let rx1 = (x0.max(x1) + pad).ceil() as i32;
+    let ry1 = (y0.max(y1) + pad).ceil() as i32;
+    (rx0, ry0, (rx1 - rx0).max(1), (ry1 - ry0).max(1))
+}
+
 fn paint_brush_drag_sample(
     st: &mut AppState,
     wx: f64,
@@ -3053,6 +3020,21 @@ fn paint_brush_drag_sample(
         *last_sample.borrow_mut() = Some((wx, wy));
         return false;
     }
+    let undo_rect = match tool {
+        ToolKind::Brush | ToolKind::Eraser => {
+            let (px, py) = smooth_prev.expect("checked");
+            let (sx, sy) = if smooth_started {
+                ((px + lx) * 0.5, (py + ly) * 0.5)
+            } else {
+                (px, py)
+            };
+            let (ex, ey) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
+            brush_quadratic_rect(sx, sy, lx, ly, ex, ey, radius)
+        }
+        ToolKind::Pixel => pixel_line_rect(lx, ly, cx, cy, pixel_size),
+        _ => return false,
+    };
+    st.capture_undo_rect(Some(undo_rect));
     let layer = match st.doc.active_layer_mut() {
         Some(l) => l,
         None => return false,
@@ -3121,6 +3103,7 @@ fn flush_brush_smoothing(st: &mut AppState) -> bool {
         (px, py)
     };
     let mut next_dab_distance = st.stroke_next_dab_distance;
+    st.capture_undo_rect(Some(brush_segment_rect(sx, sy, lx, ly, radius)));
     let layer = match st.doc.active_layer_mut() {
         Some(l) => l,
         None => return false,
@@ -3260,6 +3243,7 @@ fn setup_canvas_input(
                 st.stroke_smooth_prev_doc = None;
                 st.stroke_smooth_started = false;
                 st.begin_stroke_undo();
+                st.capture_undo_rect(Some(brush_point_rect(dx, dy, radius)));
                 st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
@@ -3289,6 +3273,7 @@ fn setup_canvas_input(
                 st.stroke_smooth_prev_doc = None;
                 st.stroke_smooth_started = false;
                 st.begin_stroke_undo();
+                st.capture_undo_rect(Some(brush_point_rect(dx, dy, size * 0.5)));
                 st.capture_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
@@ -3312,7 +3297,7 @@ fn setup_canvas_input(
                 } else {
                     None
                 };
-                st.begin_stroke_undo();
+                st.begin_full_undo();
                 if let Some(layer) = st.doc.active_layer_mut() {
                     let pv = straight_to_premul(&[fg[0], fg[1], fg[2], fg[3]]);
                     let fill = [pv[0], pv[1], pv[2], pv[3]];
@@ -3344,13 +3329,14 @@ fn setup_canvas_input(
                     } = *st;
                     let below = stroke_composite_below.take().expect("stroke below");
                     composite_cache_premul.resize(clen, 0);
-                    composite_layers_from_below_into(
+                    composite_layers_from_below_region_into(
                         composite_cache_premul,
                         cw,
                         ch,
                         &doc.layers,
                         stroke_composite_active_layer,
                         &below,
+                        (xi, yi, 1, 1),
                     );
                     *stroke_composite_below = Some(below);
                     sample_composite_premul(composite_cache_premul, cw, ch, xi, yi)
@@ -3394,11 +3380,13 @@ fn setup_canvas_input(
                     let y = dy.floor().clamp(0.0, dh as f64 - 1.0) as u32;
                     let (mask, wand_bbox) = flood_select_mask(layer, x, y, st.fill_tolerance);
                     if mask.iter().any(|&v| v != 0) {
+                        let outline_segments = region_mask_outline_segments(&mask, dw, dh);
                         st.selection = Some(Selection::Region {
                             width: dw,
                             height: dh,
                             mask,
                             tight_bbox: wand_bbox,
+                            outline_segments,
                         });
                     }
                 }
@@ -3468,10 +3456,10 @@ fn setup_canvas_input(
                                         Some(l) => l,
                                         None => return,
                                     };
-                                    let before = layer.pixels.clone();
                                     let data = copy_rect(layer, sx, sy, sw, sh);
+                                    let before = data.clone();
                                     clear_rect(layer, sx, sy, sw, sh);
-                                    st.history.commit_change(li, before);
+                                    st.history.commit_rect_change(li, sx, sy, sw, sh, before);
                                     st.bump_document_revision();
                                     st.floating = Some(FloatingSelection::new_pasted(
                                         sw, sh, data, sx as f64, sy as f64,
@@ -3489,6 +3477,7 @@ fn setup_canvas_input(
                                     height,
                                     mask,
                                     tight_bbox,
+                                    outline_segments: _,
                                 } => {
                                     if width != st.doc.width
                                         || height != st.doc.height
@@ -3505,10 +3494,10 @@ fn setup_canvas_input(
                                         Some(l) => l,
                                         None => return,
                                     };
-                                    let before = layer.pixels.clone();
                                     let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
-                                    clear_region_masked(layer, &mask);
-                                    st.history.commit_change(li, before);
+                                    let before = copy_rect(layer, bx, by, bw, bh);
+                                    clear_region_masked_rect(layer, &mask, bx, by, bw, bh);
+                                    st.history.commit_rect_change(li, bx, by, bw, bh, before);
                                     st.bump_document_revision();
                                     st.floating = Some(FloatingSelection::new_pasted(
                                         bw, bh, data, bx as f64, by as f64,
@@ -3704,7 +3693,7 @@ fn setup_canvas_input(
                     let filled = st.shape_filled;
                     let r = st.brush_size * 0.5;
                     let h = st.brush_hardness;
-                    st.begin_stroke_undo();
+                    st.begin_full_undo();
                     let layer = match st.doc.active_layer_mut() {
                         Some(l) => l,
                         None => return,
@@ -3828,10 +3817,13 @@ fn cut_selection(state: &SharedState) {
     let Some(layer) = st.doc.layers.get_mut(idx) else {
         return;
     };
-    let before = layer.pixels.clone();
+    let undo_rect;
+    let before;
     match sel {
         Selection::Rect(sx, sy, sw, sh) => {
             let data = copy_rect(layer, sx, sy, sw, sh);
+            before = data.clone();
+            undo_rect = (sx, sy, sw, sh);
             clear_rect(layer, sx, sy, sw, sh);
             st.clipboard = Some((sw, sh, data));
         }
@@ -3840,6 +3832,7 @@ fn cut_selection(state: &SharedState) {
             height,
             mask,
             tight_bbox,
+            outline_segments: _,
         } => {
             if width != layer.width
                 || height != layer.height
@@ -3853,11 +3846,14 @@ fn cut_selection(state: &SharedState) {
                 return;
             };
             let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
-            clear_region_masked(layer, &mask);
+            before = copy_rect(layer, bx, by, bw, bh);
+            undo_rect = (bx, by, bw, bh);
+            clear_region_masked_rect(layer, &mask, bx, by, bw, bh);
             st.clipboard = Some((bw, bh, data));
         }
     }
-    st.history.commit_change(idx, before);
+    let (x, y, w, h) = undo_rect;
+    st.history.commit_rect_change(idx, x, y, w, h, before);
     st.selection = None;
     st.modified = true;
     st.bump_document_revision();
@@ -3872,15 +3868,19 @@ fn erase_selection(state: &SharedState) {
     let Some(layer) = st.doc.layers.get_mut(idx) else {
         return;
     };
-    let before = layer.pixels.clone();
+    let undo_rect;
+    let before;
     match sel {
         Selection::Rect(sx, sy, sw, sh) => {
+            before = copy_rect(layer, sx, sy, sw, sh);
+            undo_rect = (sx, sy, sw, sh);
             clear_rect(layer, sx, sy, sw, sh);
         }
         Selection::Region {
             width,
             height,
             mask,
+            tight_bbox,
             ..
         } => {
             if width != layer.width
@@ -3889,10 +3889,18 @@ fn erase_selection(state: &SharedState) {
             {
                 return;
             }
-            clear_region_masked(layer, &mask);
+            let Some((bx, by, bw, bh)) =
+                region_tight_bbox_or_hint(&mask, width, height, tight_bbox)
+            else {
+                return;
+            };
+            before = copy_rect(layer, bx, by, bw, bh);
+            undo_rect = (bx, by, bw, bh);
+            clear_region_masked_rect(layer, &mask, bx, by, bw, bh);
         }
     }
-    st.history.commit_change(idx, before);
+    let (x, y, w, h) = undo_rect;
+    st.history.commit_rect_change(idx, x, y, w, h, before);
     st.selection = None;
     st.modified = true;
     st.bump_document_revision();
@@ -3916,6 +3924,7 @@ fn copy_selection(state: &SharedState) {
             height,
             mask,
             tight_bbox,
+            outline_segments: _,
         } => {
             if width != layer.width
                 || height != layer.height
@@ -4361,19 +4370,30 @@ fn open_document_from_path(
     canvas: &CanvasCell,
     recent_menu: &gio::Menu,
 ) {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    let result = if ext.as_deref() == Some("ora") {
-        Document::load_ora(path)
-    } else {
-        Document::load_raster_image(path)
-    };
-    match result {
-        Ok(doc) => {
-            let path_buf = path.to_path_buf();
-            let mut g = state.borrow_mut();
+    let path_buf = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let path = path_buf.clone();
+        move || {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let result = if ext.as_deref() == Some("ora") {
+                Document::load_ora(&path)
+            } else {
+                Document::load_raster_image(&path)
+            };
+            let _ = tx.send(result);
+        }
+    });
+    let st = state.clone();
+    let lc = layers_cell.clone();
+    let cv = canvas.clone();
+    let recent_m = recent_menu.clone();
+    glib::idle_add_local(move || match rx.try_recv() {
+        Ok(Ok(doc)) => {
+            let mut g = st.borrow_mut();
             g.doc = doc;
             g.history.clear();
             g.doc.path = Some(path_buf.clone());
@@ -4384,17 +4404,21 @@ fn open_document_from_path(
             g.shape_drag_preview = None;
             g.drag_start_doc = None;
             g.bump_document_revision();
-            crate::settings::record_recent_open(&mut g, path_buf);
+            crate::settings::record_recent_open(&mut g, path_buf.clone());
             drop(g);
-            refresh_recent_files_menu(recent_menu, &state.borrow(), menu_ui_dark());
-            zoom_to_fit(state, canvas);
-            refresh_layers_list(state, layers_cell, canvas);
-            queue_canvas(canvas);
+            refresh_recent_files_menu(&recent_m, &st.borrow(), menu_ui_dark());
+            zoom_to_fit(&st, &cv);
+            refresh_layers_list(&st, &lc, &cv);
+            queue_canvas(&cv);
+            glib::ControlFlow::Break
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Open failed: {e}");
+            glib::ControlFlow::Break
         }
-    }
+        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
 }
 
 fn open_file(
@@ -4457,23 +4481,81 @@ fn open_file(
     });
 }
 
-/// Save to the document's current path. Returns `false` if there is no path or the write fails.
-fn try_save_to_current_path(state: &SharedState) -> bool {
-    let Some(path) = state.borrow().doc.path.clone() else {
-        return false;
+/// Save to the document's current path on a worker thread. Returns `false` if there is no path.
+fn start_save_to_current_path(state: &SharedState, canvas: &CanvasCell) -> bool {
+    let (path, doc) = {
+        let g = state.borrow();
+        let Some(path) = g.doc.path.clone() else {
+            return false;
+        };
+        (path, g.doc.clone())
     };
-    let mut g = state.borrow_mut();
-    let result = match path.extension().and_then(|e| e.to_str()) {
-        Some("ora") => g.doc.save_ora(&path),
-        _ => g.doc.save_png(&path),
-    };
-    if let Err(e) = result {
-        eprintln!("Save failed: {e}");
-        false
-    } else {
-        g.modified = false;
-        true
-    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = match path.extension().and_then(|e| e.to_str()) {
+            Some("ora") => doc.save_ora(&path),
+            _ => doc.save_png(&path),
+        };
+        let _ = tx.send(result);
+    });
+    let st = state.clone();
+    let cv = canvas.clone();
+    glib::idle_add_local(move || match rx.try_recv() {
+        Ok(Ok(())) => {
+            st.borrow_mut().modified = false;
+            queue_canvas(&cv);
+            glib::ControlFlow::Break
+        }
+        Ok(Err(e)) => {
+            eprintln!("Save failed: {e}");
+            glib::ControlFlow::Break
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
+    true
+}
+
+fn save_document_to_path_async(
+    path: PathBuf,
+    state: &SharedState,
+    canvas: &CanvasCell,
+    on_success: Option<Rc<dyn Fn()>>,
+) {
+    let doc = state.borrow().doc.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let result = match path.extension().and_then(|e| e.to_str()) {
+                Some("ora") => doc.save_ora(&path),
+                _ => doc.save_png(&path),
+            };
+            let _ = tx.send(result);
+        }
+    });
+    let st = state.clone();
+    let cv = canvas.clone();
+    glib::idle_add_local(move || match rx.try_recv() {
+        Ok(Ok(())) => {
+            {
+                let mut g = st.borrow_mut();
+                g.doc.path = Some(path.clone());
+                g.modified = false;
+            }
+            if let Some(cb) = &on_success {
+                cb();
+            }
+            queue_canvas(&cv);
+            glib::ControlFlow::Break
+        }
+        Ok(Err(e)) => {
+            eprintln!("Save failed: {e}");
+            glib::ControlFlow::Break
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
 }
 
 fn save_file_as(
@@ -4515,22 +4597,7 @@ fn save_file_as(
                 if path.extension().is_none() {
                     path.set_extension("png");
                 }
-                let mut g = st.borrow_mut();
-                let result = match path.extension().and_then(|e| e.to_str()) {
-                    Some("ora") => g.doc.save_ora(&path),
-                    _ => g.doc.save_png(&path),
-                };
-                if let Err(e) = result {
-                    eprintln!("Save failed: {e}");
-                } else {
-                    g.doc.path = Some(path);
-                    g.modified = false;
-                    if let Some(cb) = &on_ok {
-                        cb();
-                    }
-                }
-                drop(g);
-                queue_canvas(&cv);
+                save_document_to_path_async(path, &st, &cv, on_ok.clone());
             }
         }
     });
@@ -4543,7 +4610,7 @@ fn save_file(
     canvas: &CanvasCell,
 ) {
     if state.borrow().doc.path.is_some() {
-        let _ = try_save_to_current_path(state);
+        let _ = start_save_to_current_path(state, canvas);
     } else {
         save_file_as(window, state, layers_cell, canvas, None);
     }
@@ -6401,10 +6468,14 @@ fn build_ui(app: &Application) {
             None::<&gio::Cancellable>,
             move |response| match response.as_str() {
                 "save" => {
-                    if st.borrow().doc.path.is_some() {
-                        if try_save_to_current_path(&st) {
-                            win.close();
-                        }
+                    if let Some(path) = st.borrow().doc.path.clone() {
+                        let win_done = win.clone();
+                        save_document_to_path_async(
+                            path,
+                            &st,
+                            &cv,
+                            Some(Rc::new(move || win_done.close())),
+                        );
                     } else {
                         let win_done = win.clone();
                         save_file_as(&win, &st, &lc, &cv, Some(Rc::new(move || win_done.close())));

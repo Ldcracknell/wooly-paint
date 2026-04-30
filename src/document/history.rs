@@ -4,9 +4,27 @@ use super::Document;
 const MAX_UNDO_ENTRIES: usize = 64;
 
 #[derive(Clone)]
-pub struct LayerUndoEntry {
-    pub layer_index: usize,
-    pub pixels: Vec<u8>,
+pub enum LayerUndoEntry {
+    Full {
+        layer_index: usize,
+        pixels: Vec<u8>,
+    },
+    Rect {
+        layer_index: usize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        pixels: Vec<u8>,
+    },
+}
+
+impl LayerUndoEntry {
+    fn layer_index(&self) -> usize {
+        match self {
+            Self::Full { layer_index, .. } | Self::Rect { layer_index, .. } => *layer_index,
+        }
+    }
 }
 
 pub struct History {
@@ -33,8 +51,35 @@ impl History {
         if self.undo.len() >= MAX_UNDO_ENTRIES {
             self.undo.remove(0);
         }
-        self.undo.push(LayerUndoEntry {
+        self.undo.push(LayerUndoEntry::Full {
             layer_index,
+            pixels: before,
+        });
+        self.redo.clear();
+    }
+
+    /// `before` is a tight row-major `w * h * 4` premultiplied buffer for document rect `(x,y,w,h)`.
+    pub fn commit_rect_change(
+        &mut self,
+        layer_index: usize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        before: Vec<u8>,
+    ) {
+        if w <= 0 || h <= 0 || before.is_empty() {
+            return;
+        }
+        if self.undo.len() >= MAX_UNDO_ENTRIES {
+            self.undo.remove(0);
+        }
+        self.undo.push(LayerUndoEntry::Rect {
+            layer_index,
+            x,
+            y,
+            w,
+            h,
             pixels: before,
         });
         self.redo.clear();
@@ -52,11 +97,18 @@ impl History {
         let Some(mut entry) = self.undo.pop() else {
             return false;
         };
-        let idx = entry.layer_index;
+        let idx = entry.layer_index();
         let Some(layer) = doc.layers.get_mut(idx) else {
             return false;
         };
-        std::mem::swap(&mut layer.pixels, &mut entry.pixels);
+        match &mut entry {
+            LayerUndoEntry::Full { pixels, .. } => {
+                std::mem::swap(&mut layer.pixels, pixels);
+            }
+            LayerUndoEntry::Rect {
+                x, y, w, h, pixels, ..
+            } => swap_rect_pixels(layer, *x, *y, *w, *h, pixels),
+        }
         self.redo.push(entry);
         true
     }
@@ -65,13 +117,47 @@ impl History {
         let Some(mut entry) = self.redo.pop() else {
             return false;
         };
-        let idx = entry.layer_index;
+        let idx = entry.layer_index();
         let Some(layer) = doc.layers.get_mut(idx) else {
             return false;
         };
-        std::mem::swap(&mut layer.pixels, &mut entry.pixels);
+        match &mut entry {
+            LayerUndoEntry::Full { pixels, .. } => {
+                std::mem::swap(&mut layer.pixels, pixels);
+            }
+            LayerUndoEntry::Rect {
+                x, y, w, h, pixels, ..
+            } => swap_rect_pixels(layer, *x, *y, *w, *h, pixels),
+        }
         self.undo.push(entry);
         true
+    }
+}
+
+fn swap_rect_pixels(
+    layer: &mut crate::document::Layer,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    pixels: &mut [u8],
+) {
+    if w <= 0 || h <= 0 || pixels.len() < (w * h * 4) as usize {
+        return;
+    }
+    for row in 0..h {
+        for col in 0..w {
+            let sx = x + col;
+            let sy = y + row;
+            if sx < 0 || sy < 0 || sx >= layer.width as i32 || sy >= layer.height as i32 {
+                continue;
+            }
+            let pi = ((row * w + col) * 4) as usize;
+            let li = layer.idx(sx as u32, sy as u32);
+            for c in 0..4 {
+                std::mem::swap(&mut layer.pixels[li + c], &mut pixels[pi + c]);
+            }
+        }
     }
 }
 

@@ -16,6 +16,7 @@ use image::{ImageBuffer, RgbaImage};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Document {
     pub width: u32,
     pub height: u32,

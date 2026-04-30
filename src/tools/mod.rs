@@ -759,17 +759,28 @@ pub fn copy_region_masked(
     out
 }
 
-/// Clear premultiplied pixels where `mask` is non-zero (`mask` is document-sized).
-pub fn clear_region_masked(layer: &mut Layer, mask: &[u8]) {
+pub fn clear_region_masked_rect(
+    layer: &mut Layer,
+    mask: &[u8],
+    bx: i32,
+    by: i32,
+    bw: i32,
+    bh: i32,
+) {
     let w = layer.width as usize;
     let h = layer.height as usize;
     let expected = w * h;
-    if mask.len() != expected {
+    if mask.len() != expected || bw <= 0 || bh <= 0 {
         return;
     }
-    for y in 0..h {
-        for x in 0..w {
-            let mi = y * w + x;
+    let x0 = bx.max(0) as usize;
+    let y0 = by.max(0) as usize;
+    let x1 = (bx + bw).min(layer.width as i32).max(0) as usize;
+    let y1 = (by + bh).min(layer.height as i32).max(0) as usize;
+    for y in y0..y1 {
+        let row = y * w;
+        for x in x0..x1 {
+            let mi = row + x;
             if mask[mi] != 0 {
                 let i = mi * 4;
                 layer.pixels[i..i + 4].fill(0);
