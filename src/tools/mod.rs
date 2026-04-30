@@ -217,6 +217,11 @@ fn brush_min_step(radius: f64, hardness: f64) -> f64 {
     (r * (0.07 + 0.93 * h * h)).max(0.12)
 }
 
+fn brush_spacing(radius: f64, hardness: f64) -> f64 {
+    let r = radius.max(0.5);
+    brush_stroke_step(radius, hardness).min(r * 0.33).max(0.05)
+}
+
 pub fn stroke_line(
     layer: &mut Layer,
     x0: f64,
@@ -236,10 +241,8 @@ pub fn stroke_line(
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
         return;
     }
-    let r = radius.max(0.5);
     let h = hardness.clamp(0.0, 1.0);
-    let mut step = brush_stroke_step(radius, hardness);
-    step = step.min(r * 0.33).max(0.05);
+    let step = brush_spacing(radius, hardness);
     let n_f = (len / step).ceil();
     if !n_f.is_finite() || n_f <= 0.0 {
         stamp_circle(layer, x0, y0, radius, hardness, color, eraser, clip);
@@ -281,10 +284,7 @@ pub fn stroke_line_spaced(
         return;
     }
 
-    let r = radius.max(0.5);
-    let spacing = brush_stroke_step(radius, hardness)
-        .min(r * 0.33)
-        .max(0.05);
+    let spacing = brush_spacing(radius, hardness);
     if !next_dab_distance.is_finite() || *next_dab_distance <= 0.0 {
         *next_dab_distance = spacing;
     }
@@ -299,6 +299,73 @@ pub fn stroke_line_spaced(
         d += spacing;
     }
     *next_dab_distance = d - len;
+}
+
+pub fn stroke_quadratic_spaced(
+    layer: &mut Layer,
+    x0: f64,
+    y0: f64,
+    cx: f64,
+    cy: f64,
+    x1: f64,
+    y1: f64,
+    radius: f64,
+    hardness: f64,
+    color: [u8; 4],
+    eraser: bool,
+    clip: Option<&Selection>,
+    next_dab_distance: &mut f64,
+) {
+    let chord = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+    let control_net = ((cx - x0).powi(2) + (cy - y0).powi(2)).sqrt()
+        + ((x1 - cx).powi(2) + (y1 - cy).powi(2)).sqrt();
+    let approx_len = (chord + control_net) * 0.5;
+    if !approx_len.is_finite() || approx_len <= 1e-9 {
+        return;
+    }
+
+    let spacing = brush_spacing(radius, hardness);
+    if !next_dab_distance.is_finite() || *next_dab_distance <= 0.0 {
+        *next_dab_distance = spacing;
+    }
+
+    let subdivisions = (approx_len / (spacing * 0.5)).ceil().clamp(4.0, 4096.0) as usize;
+    let falloff = BrushFalloffCache::new(hardness);
+    let mut remaining = *next_dab_distance;
+    let mut px = x0;
+    let mut py = y0;
+
+    for i in 1..=subdivisions {
+        let t = i as f64 / subdivisions as f64;
+        let mt = 1.0 - t;
+        let qx = mt * mt * x0 + 2.0 * mt * t * cx + t * t * x1;
+        let qy = mt * mt * y0 + 2.0 * mt * t * cy + t * t * y1;
+        let sx = qx - px;
+        let sy = qy - py;
+        let seg_len = (sx * sx + sy * sy).sqrt();
+        if seg_len.is_finite() && seg_len > 1e-9 {
+            let mut d = remaining;
+            while d <= seg_len {
+                let u = d / seg_len;
+                stamp_circle_with_falloff(
+                    layer,
+                    px + sx * u,
+                    py + sy * u,
+                    radius,
+                    color,
+                    eraser,
+                    &falloff,
+                    clip,
+                );
+                d += spacing;
+            }
+            remaining = d - seg_len;
+        }
+        px = qx;
+        py = qy;
+    }
+
+    *next_dab_distance = remaining;
 }
 
 pub fn stamp_square(

@@ -126,6 +126,9 @@ pub struct AppState {
     pub brush_stroke_in_progress: bool,
     /// Distance from the latest stroke sample to the next brush dab, carried across drag events.
     pub stroke_next_dab_distance: f64,
+    /// Previous raw document-space brush sample, used to smooth fast strokes into curves.
+    pub stroke_smooth_prev_doc: Option<(f64, f64)>,
+    pub stroke_smooth_started: bool,
     /// During brush/pixel/eraser stroke: only paint inside this selection (captured at press; `None` = no clip).
     pub stroke_paint_clip: Option<Selection>,
     /// During brush/pixel/eraser stroke: flattened premul RGBA of layers strictly below
@@ -203,6 +206,8 @@ impl AppState {
             floating_pixbuf_key: None,
             brush_stroke_in_progress: false,
             stroke_next_dab_distance: 0.0,
+            stroke_smooth_prev_doc: None,
+            stroke_smooth_started: false,
             stroke_paint_clip: None,
             stroke_composite_below: None,
             stroke_composite_active_layer: 0,
