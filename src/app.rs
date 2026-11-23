@@ -604,9 +604,6 @@ fn install_app_css() {
         label.wp-readable-dim {{
           opacity: 0.92;
         }}
-        scrolledwindow.palette-grid-frame {{
-          border: 1px solid rgba(0, 0, 0, 0.88);
-        }}
         drawingarea.canvas-chrome {{
           background-color: {hex};
         }}
@@ -1284,10 +1281,14 @@ fn picker_gradient_spin_row(
     row
 }
 
-fn push_recent_color(st: &mut AppState, fg: [u8; 4]) {
+fn push_recent_color(st: &mut AppState, fg: [u8; 4]) -> bool {
+    if st.recent_colors.first() == Some(&fg) {
+        return false;
+    }
     st.recent_colors.retain(|c| *c != fg);
     st.recent_colors.insert(0, fg);
     st.recent_colors.truncate(4);
+    true
 }
 
 /// `fill_cell`: use for palette grids — color fills the whole tile and grows with sidebar width.
@@ -3503,6 +3504,7 @@ fn setup_canvas_input(
         }
         let (dx, dy) = st.widget_to_doc(wx, wy);
         let mut eyedrop_updated = false;
+        let mut recent_updated = false;
         let mut start_brush_paint_tick = false;
         let mut title_dirty = false;
         match st.tool {
@@ -3521,6 +3523,9 @@ fn setup_canvas_input(
                 } else {
                     st.active_paint_color()
                 };
+                if !eraser && push_recent_color(&mut st, color) {
+                    recent_updated = true;
+                }
                 let radius = st.brush_size * 0.5;
                 let hardness = st.brush_hardness;
                 st.brush_stroke_in_progress = true;
@@ -3568,6 +3573,9 @@ fn setup_canvas_input(
                     None
                 };
                 let color = st.active_paint_color();
+                if push_recent_color(&mut st, color) {
+                    recent_updated = true;
+                }
                 let size = st.brush_size;
                 st.brush_stroke_in_progress = true;
                 st.stroke_next_dab_distance = 0.0;
@@ -3629,6 +3637,9 @@ fn setup_canvas_input(
                     }
                     if st.commit_stroke_undo() {
                         title_dirty = true;
+                        if push_recent_color(&mut st, fg) {
+                            recent_updated = true;
+                        }
                     }
                 }
             }
@@ -3874,6 +3885,10 @@ fn setup_canvas_input(
                 da.queue_draw();
                 refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &picker_drag);
             }
+        } else if recent_updated {
+            if let Some(ref da) = *cb_drag.borrow() {
+                refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &picker_drag);
+            }
         }
         queue_canvas(&cv_drag);
     });
@@ -3982,12 +3997,16 @@ fn setup_canvas_input(
     let mws_e = move_widget_start.clone();
     let tc_end = title_cell.clone();
     let adb_end = active_drag_btn.clone();
+    let cb_end = color_preview_da_cell.clone();
+    let recent_end = recent_swatches.clone();
+    let picker_end = picker_ui_refresh.clone();
     drag.connect_drag_end(move |_g, ox, oy| {
         if adb_end.replace(0) == 0 {
             return;
         }
         let mut st = st_drag_end.borrow_mut();
         let mut title_dirty = false;
+        let mut recent_updated = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel => {
                 finish_brush_stroke(&mut st, bpt_end.as_ref(), bws_end.as_ref(), lbs_end.as_ref());
@@ -4073,6 +4092,9 @@ fn setup_canvas_input(
                     }
                     if st.commit_stroke_undo() {
                         title_dirty = true;
+                        if push_recent_color(&mut st, color) {
+                            recent_updated = true;
+                        }
                     }
                 }
                 st.drag_start_doc = None;
@@ -4105,6 +4127,11 @@ fn setup_canvas_input(
         drop(st);
         if title_dirty {
             sync_window_title(&st_drag_end, &tc_end);
+        }
+        if recent_updated {
+            if let Some(ref da) = *cb_end.borrow() {
+                refresh_recent_swatch_row(&recent_end, &st_drag_end, da, &picker_end);
+            }
         }
         tool_cursors::sync_canvas_tool_cursor(&cnv3, tool);
         queue_canvas(&cv_drag_end);
@@ -6484,7 +6511,6 @@ fn build_ui(app: &Application) {
         .max_content_height(520)
         .child(&palette_flow)
         .build();
-    palette_scroll.add_css_class("palette-grid-frame");
     color_sidebar.append(&palette_scroll);
 
     color_sidebar.append(&mode_row);
@@ -6586,9 +6612,22 @@ fn build_ui(app: &Application) {
         rev_c.set_reveal_child(!rev_c.reveals_child());
     });
 
+    let st_tl = state.clone();
     let cv_tl = canvas_cell.clone();
     revealer.connect_child_revealed_notify(move |_| {
+        zoom_to_fit(&st_tl, &cv_tl);
         queue_canvas(&cv_tl);
+    });
+
+    // Smoothly refit the canvas during the Layers panel slide transition so it never gets covered.
+    let st_rsz = state.clone();
+    let cv_rsz = canvas_cell.clone();
+    let rev_rsz = revealer.clone();
+    drawing_area.connect_resize(move |_, _, _| {
+        if rev_rsz.is_child_revealed() != rev_rsz.reveals_child() {
+            zoom_to_fit(&st_rsz, &cv_rsz);
+            queue_canvas(&cv_rsz);
+        }
     });
 
     let split = gtk::Box::builder()
