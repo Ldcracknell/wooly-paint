@@ -1,12 +1,18 @@
-use crate::document::{composite_layers_prefix_into, Document, History};
+use crate::document::{
+    composite_layers_prefix_into, Document, History, UndoTile, UNDO_TILE_SIZE,
+};
 use crate::palette::PaletteBook;
-use crate::tools::ToolKind;
-use gdk_pixbuf::Pixbuf;
+use crate::tools::{BrushStampCache, ToolKind};
 use gtk::cairo::ImageSurface;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_FLOATING_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct FloatingSelection {
+    pub id: u64,
     pub w: i32,
     pub h: i32,
     pub data: Vec<u8>,
@@ -18,11 +24,14 @@ pub struct FloatingSelection {
     pub scale_y: f64,
     pub flip_h: bool,
     pub flip_v: bool,
+    /// True when lifted via Move tool (cut pushed an undo entry); false when pasted.
+    pub lifted_from_layer: bool,
 }
 
 impl FloatingSelection {
     pub fn new_pasted(w: i32, h: i32, data: Vec<u8>, x: f64, y: f64) -> Self {
         Self {
+            id: NEXT_FLOATING_ID.fetch_add(1, Ordering::Relaxed),
             w,
             h,
             data,
@@ -33,7 +42,14 @@ impl FloatingSelection {
             scale_y: 1.0,
             flip_h: false,
             flip_v: false,
+            lifted_from_layer: false,
         }
+    }
+
+    pub fn new_lifted(w: i32, h: i32, data: Vec<u8>, x: f64, y: f64) -> Self {
+        let mut f = Self::new_pasted(w, h, data, x, y);
+        f.lifted_from_layer = true;
+        f
     }
 }
 
@@ -70,9 +86,9 @@ pub enum ColorSlot {
 
 pub struct PendingUndoSnapshot {
     pub layer_index: usize,
-    pub rect: Option<(i32, i32, i32, i32)>,
-    pub pixels: Vec<u8>,
-    pub full_layer: bool,
+    pub full_pixels: Option<Vec<u8>>,
+    /// Sparse 64×64 tile snapshots keyed by `(tile_x, tile_y)`.
+    pub tiles: HashMap<(u32, u32), UndoTile>,
 }
 
 pub struct AppState {
@@ -90,6 +106,10 @@ pub struct AppState {
     /// Hue for the SV plane and hue strip, 0..1.
     pub picker_hue: f64,
     pub brush_size: f64,
+    /// Remembered size for non-Pixel tools when toggling to/from Pixel.
+    pub saved_brush_size: f64,
+    /// Remembered size for Pixel tool when toggling to/from other tools.
+    pub saved_pixel_size: f64,
     pub brush_hardness: f64,
     pub fill_tolerance: u8,
     pub shape_filled: bool,
@@ -106,8 +126,6 @@ pub struct AppState {
     pub drag_start_doc: Option<(f64, f64)>,
     /// Line / rectangle / ellipse drag: `(tool, x0, y0, x1, y1)` in document space (live preview).
     pub shape_drag_preview: Option<(ToolKind, f64, f64, f64, f64)>,
-    /// When dragging a floating selection: `(pointer_doc_x - float_x, pointer_doc_y - float_y)`.
-    pub move_grab_doc: Option<(f64, f64)>,
     /// Move / rotate / resize via on-canvas handles (Move tool + floating).
     pub floating_drag: Option<FloatingDrag>,
     pub modified: bool,
@@ -120,16 +138,19 @@ pub struct AppState {
     pub recent_files: Vec<PathBuf>,
     /// Bumped when layer pixels, stack, visibility, opacity, or canvas size change (not selection/pan/zoom).
     pub document_visual_revision: u64,
+    /// Bumped when layers other than the active layer (or stack structure/visibility/opacity/blend/size) change.
+    pub layers_stack_revision: u64,
     /// Cached full-document composite (premultiplied RGBA), valid when `composite_cache_at_revision == document_visual_revision`.
     pub composite_cache_premul: Vec<u8>,
     /// Cairo `ImageSurface` for painting the flattened document (BGRA premul); pixels updated from `composite_cache_premul`.
     pub composite_cache_surface: Option<ImageSurface>,
     pub composite_cache_at_revision: u64,
-    /// Straight RGBA scratch for rebuilding [`Self::floating_pixbuf_cache`].
-    pub floating_straight_scratch: Vec<u8>,
-    pub floating_pixbuf_cache: Option<Pixbuf>,
-    pub floating_pixbuf_key: Option<(usize, usize, i32, i32)>,
-    /// While true, composite cache is not used (pixels change every event during brush/pixel/eraser stroke).
+    /// Cached Cairo `ImageSurface` for the current `FloatingSelection`, keyed by `FloatingSelection::id`.
+    pub floating_surface_cache: Option<ImageSurface>,
+    pub floating_surface_id: Option<u64>,
+    /// Persistent brush falloff + subpixel mask cache across drag events and strokes.
+    pub brush_stamp_cache: BrushStampCache,
+    /// While true, incremental dirty-rect compositing is used during brush/pixel/eraser strokes.
     pub brush_stroke_in_progress: bool,
     /// Distance from the latest stroke sample to the next brush dab, carried across drag events.
     pub stroke_next_dab_distance: f64,
@@ -138,11 +159,13 @@ pub struct AppState {
     pub stroke_smooth_started: bool,
     /// During brush/pixel/eraser stroke: only paint inside this selection (captured at press; `None` = no clip).
     pub stroke_paint_clip: Option<Selection>,
-    /// During brush/pixel/eraser stroke: flattened premul RGBA of layers strictly below
-    /// [`Document::active_layer`] at stroke start. Used to avoid recompositing the full stack each frame.
-    pub stroke_composite_below: Option<Vec<u8>>,
-    pub stroke_composite_active_layer: usize,
-    pub stroke_composite_doc_wh: (u32, u32),
+    /// Reusable cached premul RGBA of layers strictly below `active_layer`.
+    /// Empty when no visible layers exist below `active_layer`.
+    pub below_cache_buf: Vec<u8>,
+    pub below_cache_has_content: bool,
+    pub below_cache_revision: u64,
+    pub below_cache_active_layer: usize,
+    pub below_cache_doc_wh: (u32, u32),
     /// Document-space pixels touched since the last canvas composite update.
     pub stroke_dirty_rect: Option<(i32, i32, i32, i32)>,
 }
@@ -185,7 +208,9 @@ impl AppState {
             picker_target: ColorSlot::Left,
             picker_hue: 0.0,
             brush_size: 8.0,
-            brush_hardness: 0.1,
+            saved_brush_size: 8.0,
+            saved_pixel_size: 1.0,
+            brush_hardness: 0.85,
             fill_tolerance: 32,
             shape_filled: false,
             zoom: 1.0,
@@ -199,7 +224,6 @@ impl AppState {
             last_doc_pos: None,
             drag_start_doc: None,
             shape_drag_preview: None,
-            move_grab_doc: None,
             floating_drag: None,
             modified: false,
             tool_keybinds: Self::default_tool_keybinds(),
@@ -207,59 +231,80 @@ impl AppState {
             palette_book: PaletteBook::new_builtin_only(),
             recent_files: Vec::new(),
             document_visual_revision: 0,
+            layers_stack_revision: 0,
             composite_cache_premul: Vec::new(),
             composite_cache_surface: None,
             composite_cache_at_revision: u64::MAX,
-            floating_straight_scratch: Vec::new(),
-            floating_pixbuf_cache: None,
-            floating_pixbuf_key: None,
+            floating_surface_cache: None,
+            floating_surface_id: None,
+            brush_stamp_cache: BrushStampCache::new(),
             brush_stroke_in_progress: false,
             stroke_next_dab_distance: 0.0,
             stroke_smooth_prev_doc: None,
             stroke_smooth_started: false,
             stroke_paint_clip: None,
-            stroke_composite_below: None,
-            stroke_composite_active_layer: 0,
-            stroke_composite_doc_wh: (0, 0),
+            below_cache_buf: Vec::new(),
+            below_cache_has_content: false,
+            below_cache_revision: u64::MAX,
+            below_cache_active_layer: usize::MAX,
+            below_cache_doc_wh: (0, 0),
             stroke_dirty_rect: None,
         }
     }
 
-    /// Call after [`Self::begin_stroke_undo`] on brush/pixel/eraser press, before mutating the active layer.
-    pub fn capture_stroke_composite_below(&mut self) {
+    /// Ensure the cached composite of layers strictly below `active_layer` is up-to-date.
+    /// Reuses the buffer across strokes and skips allocation/compositing entirely when no visible
+    /// layers exist below `active_layer` (e.g. single-layer or bottom-layer painting).
+    pub fn ensure_stroke_composite_below(&mut self) {
         let w = self.doc.width;
         let h = self.doc.height;
-        let len = (w * h * 4) as usize;
         let active = self.doc.active_layer;
-        let mut v = vec![0u8; len];
-        composite_layers_prefix_into(&mut v, w, h, &self.doc.layers, active);
-        self.stroke_composite_below = Some(v);
-        self.stroke_composite_active_layer = active;
-        self.stroke_composite_doc_wh = (w, h);
+
+        if self.below_cache_revision == self.layers_stack_revision
+            && self.below_cache_active_layer == active
+            && self.below_cache_doc_wh == (w, h)
+        {
+            return;
+        }
+
+        let any_visible_below = self
+            .doc
+            .layers
+            .iter()
+            .take(active)
+            .any(|l| l.visible && l.opacity > 0.0);
+
+        if !any_visible_below {
+            self.below_cache_has_content = false;
+        } else {
+            let len = (w * h * 4) as usize;
+            self.below_cache_buf.resize(len, 0);
+            composite_layers_prefix_into(&mut self.below_cache_buf, w, h, &self.doc.layers, active);
+            self.below_cache_has_content = true;
+        }
+        self.below_cache_revision = self.layers_stack_revision;
+        self.below_cache_active_layer = active;
+        self.below_cache_doc_wh = (w, h);
     }
 
-    pub fn clear_stroke_composite_below(&mut self) {
-        self.stroke_composite_below = None;
-        self.stroke_composite_doc_wh = (0, 0);
-        self.stroke_dirty_rect = None;
-    }
-
-    /// True when incremental stroke compositing matches the current document and active layer.
-    pub fn stroke_composite_below_valid(&self) -> bool {
+    pub fn below_cache_valid(&self) -> bool {
         let (dw, dh) = (self.doc.width, self.doc.height);
-        let expected = (dw * dh * 4) as usize;
-        let Some(buf) = self.stroke_composite_below.as_ref() else {
-            return false;
-        };
-        !buf.is_empty()
-            && buf.len() == expected
-            && self.stroke_composite_doc_wh == (dw, dh)
-            && self.stroke_composite_active_layer == self.doc.active_layer
+        self.below_cache_revision == self.layers_stack_revision
+            && self.below_cache_active_layer == self.doc.active_layer
+            && self.below_cache_doc_wh == (dw, dh)
+            && (!self.below_cache_has_content || self.below_cache_buf.len() == (dw * dh * 4) as usize)
     }
 
-    /// Invalidate composite cache (call after any change that affects flattened pixels or layer stack).
+    /// Invalidate composite cache (call after any change that affects flattened pixels).
     pub fn bump_document_revision(&mut self) {
         self.document_visual_revision = self.document_visual_revision.wrapping_add(1);
+    }
+
+    /// Invalidate both composite cache AND the cached "layers below active" composite
+    /// (call on layer stack edits, visibility/opacity/blend changes, undo/redo, resize, open/new).
+    pub fn bump_stack_revision(&mut self) {
+        self.document_visual_revision = self.document_visual_revision.wrapping_add(1);
+        self.layers_stack_revision = self.layers_stack_revision.wrapping_add(1);
     }
 
     pub fn add_stroke_dirty_rect(&mut self, rect: Option<(i32, i32, i32, i32)>) {
@@ -288,15 +333,17 @@ impl AppState {
 
     /// Drop GPU-adjacent composite caches on application shutdown so heap blocks are freed before exit.
     pub fn release_drawing_caches(&mut self) {
-        self.clear_stroke_composite_below();
+        self.below_cache_buf.clear();
+        self.below_cache_buf.shrink_to_fit();
+        self.below_cache_has_content = false;
+        self.below_cache_revision = u64::MAX;
+        self.stroke_dirty_rect = None;
         self.composite_cache_surface = None;
         self.composite_cache_premul.clear();
         self.composite_cache_premul.shrink_to_fit();
         self.composite_cache_at_revision = u64::MAX;
-        self.floating_straight_scratch.clear();
-        self.floating_straight_scratch.shrink_to_fit();
-        self.floating_pixbuf_cache = None;
-        self.floating_pixbuf_key = None;
+        self.floating_surface_cache = None;
+        self.floating_surface_id = None;
     }
 
     pub fn widget_to_doc(&self, wx: f64, wy: f64) -> (f64, f64) {
@@ -307,9 +354,8 @@ impl AppState {
         if let Some(layer) = self.doc.active_layer_ref() {
             self.undo_snapshot = Some(PendingUndoSnapshot {
                 layer_index: self.doc.active_layer,
-                rect: None,
-                pixels: layer.pixels.clone(),
-                full_layer: true,
+                full_pixels: Some(layer.pixels.clone()),
+                tiles: HashMap::new(),
             });
         }
     }
@@ -318,13 +364,13 @@ impl AppState {
         if self.doc.active_layer_ref().is_some() {
             self.undo_snapshot = Some(PendingUndoSnapshot {
                 layer_index: self.doc.active_layer,
-                rect: None,
-                pixels: Vec::new(),
-                full_layer: false,
+                full_pixels: None,
+                tiles: HashMap::new(),
             });
         }
     }
 
+    /// Snapshot only untouched 64×64 tiles overlapping `rect` (O(newly-touched tiles), zero reallocation).
     pub fn capture_undo_rect(&mut self, rect: Option<(i32, i32, i32, i32)>) {
         let Some(rect) = rect else {
             return;
@@ -332,66 +378,87 @@ impl AppState {
         let Some(snapshot) = self.undo_snapshot.as_mut() else {
             return;
         };
-        if snapshot.full_layer || snapshot.layer_index != self.doc.active_layer {
+        if snapshot.full_pixels.is_some() || snapshot.layer_index != self.doc.active_layer {
             return;
         }
         let Some(layer) = self.doc.layers.get(snapshot.layer_index) else {
             return;
         };
-        let Some(rect) = clip_rect_to_layer(layer.width, layer.height, rect) else {
+        let Some((rx0, ry0, rw, rh)) = clip_rect_to_layer(layer.width, layer.height, rect) else {
             return;
         };
+        let tx0 = (rx0 / UNDO_TILE_SIZE) as u32;
+        let ty0 = (ry0 / UNDO_TILE_SIZE) as u32;
+        let tx1 = ((rx0 + rw - 1) / UNDO_TILE_SIZE) as u32;
+        let ty1 = ((ry0 + rh - 1) / UNDO_TILE_SIZE) as u32;
+        let lw = layer.width as i32;
+        let lh = layer.height as i32;
 
-        match snapshot.rect {
-            None => {
-                snapshot.rect = Some(rect);
-                snapshot.pixels = copy_layer_rect(layer, rect);
-            }
-            Some(old) => {
-                let union = union_rect(old, rect);
-                if union == old {
-                    return;
-                }
-                let mut pixels = copy_layer_rect(layer, union);
-                blit_rect_buffer(&snapshot.pixels, old, &mut pixels, union);
-                snapshot.rect = Some(union);
-                snapshot.pixels = pixels;
+        for ty in ty0..=ty1 {
+            let y = ty as i32 * UNDO_TILE_SIZE;
+            let th = (lh - y).min(UNDO_TILE_SIZE);
+            for tx in tx0..=tx1 {
+                snapshot.tiles.entry((tx, ty)).or_insert_with(|| {
+                    let x = tx as i32 * UNDO_TILE_SIZE;
+                    let tw = (lw - x).min(UNDO_TILE_SIZE);
+                    let pixels = copy_layer_rect(layer, (x, y, tw, th));
+                    UndoTile {
+                        x,
+                        y,
+                        w: tw,
+                        h: th,
+                        pixels,
+                    }
+                });
             }
         }
     }
 
-    pub fn commit_stroke_undo(&mut self) {
-        if let Some(snapshot) = self.undo_snapshot.take() {
-            if let Some(layer) = self.doc.layers.get(snapshot.layer_index) {
-                if snapshot.full_layer {
-                    if layer.pixels != snapshot.pixels {
-                        self.history
-                            .commit_change(snapshot.layer_index, snapshot.pixels);
-                        self.modified = true;
-                        self.bump_document_revision();
-                    }
-                } else if let Some((x, y, w, h)) = snapshot.rect {
-                    if layer_rect_differs(layer, (x, y, w, h), &snapshot.pixels) {
-                        self.history.commit_rect_change(
-                            snapshot.layer_index,
-                            x,
-                            y,
-                            w,
-                            h,
-                            snapshot.pixels,
-                        );
-                        self.modified = true;
-                        self.bump_document_revision();
-                    }
+    /// Commit pending undo snapshot. When `bump_revision` is `false`, caller is responsible for keeping
+    /// the composite cache synchronized (used on brush stroke end after incremental dirty-rect updates).
+    pub fn commit_stroke_undo_with_revision(&mut self, bump_revision: bool) -> bool {
+        let Some(snapshot) = self.undo_snapshot.take() else {
+            return false;
+        };
+        let Some(layer) = self.doc.layers.get(snapshot.layer_index) else {
+            return false;
+        };
+        if let Some(before) = snapshot.full_pixels {
+            if layer.pixels != before {
+                self.history.commit_change(snapshot.layer_index, before);
+                self.modified = true;
+                if bump_revision {
+                    self.bump_document_revision();
                 }
+                return true;
             }
+            return false;
         }
+        let changed_tiles: Vec<UndoTile> = snapshot
+            .tiles
+            .into_values()
+            .filter(|t| layer_rect_differs(layer, (t.x, t.y, t.w, t.h), &t.pixels))
+            .collect();
+        if !changed_tiles.is_empty() {
+            self.history
+                .commit_tiles_change(snapshot.layer_index, changed_tiles);
+            self.modified = true;
+            if bump_revision {
+                self.bump_document_revision();
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn commit_stroke_undo(&mut self) -> bool {
+        self.commit_stroke_undo_with_revision(true)
     }
 
     pub fn undo(&mut self) -> bool {
         if self.history.undo(&mut self.doc) {
             self.modified = true;
-            self.bump_document_revision();
+            self.bump_stack_revision();
             true
         } else {
             false
@@ -401,7 +468,7 @@ impl AppState {
     pub fn redo(&mut self) -> bool {
         if self.history.redo(&mut self.doc) {
             self.modified = true;
-            self.bump_document_revision();
+            self.bump_stack_revision();
             true
         } else {
             false
@@ -436,14 +503,6 @@ fn clip_rect_to_layer(
     }
 }
 
-fn union_rect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
-    let x0 = a.0.min(b.0);
-    let y0 = a.1.min(b.1);
-    let x1 = (a.0 + a.2).max(b.0 + b.2);
-    let y1 = (a.1 + a.3).max(b.1 + b.3);
-    (x0, y0, x1 - x0, y1 - y0)
-}
-
 fn copy_layer_rect(layer: &crate::document::Layer, rect: (i32, i32, i32, i32)) -> Vec<u8> {
     let (x, y, w, h) = rect;
     let mut out = vec![0u8; (w * h * 4) as usize];
@@ -454,24 +513,6 @@ fn copy_layer_rect(layer: &crate::document::Layer, rect: (i32, i32, i32, i32)) -
         out[dst..dst + len].copy_from_slice(&layer.pixels[src..src + len]);
     }
     out
-}
-
-fn blit_rect_buffer(
-    src: &[u8],
-    src_rect: (i32, i32, i32, i32),
-    dst: &mut [u8],
-    dst_rect: (i32, i32, i32, i32),
-) {
-    let (sx, sy, sw, sh) = src_rect;
-    let (dx, dy, dw, _dh) = dst_rect;
-    for row in 0..sh {
-        let src_start = (row * sw * 4) as usize;
-        let dst_col = sx - dx;
-        let dst_row = sy + row - dy;
-        let dst_start = ((dst_row * dw + dst_col) * 4) as usize;
-        let len = (sw * 4) as usize;
-        dst[dst_start..dst_start + len].copy_from_slice(&src[src_start..src_start + len]);
-    }
 }
 
 fn layer_rect_differs(

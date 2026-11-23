@@ -1,7 +1,7 @@
 use crate::document::{
     composite_layers_from_below_into, composite_layers_from_below_region_into,
     composite_layers_into, premul_rgba_to_cairo_argb32, premul_rgba_to_cairo_argb32_region,
-    premul_to_straight_rgba, premul_to_straight_rgba_into, straight_to_premul, Document,
+    premul_to_straight_rgba, straight_to_premul, BlendMode, Document,
 };
 use crate::palette::{self, PaletteBook};
 use crate::selection::region_mask_outline_segments;
@@ -9,13 +9,12 @@ use crate::state::{AppState, ColorSlot, FloatingDrag, FloatingSelection, Selecti
 use crate::tool_cursors;
 use crate::tools::{
     clear_rect, clear_region_masked_rect, copy_rect, copy_region_masked, draw_ellipse,
-    draw_rect_outline, ellipse_outline_segment_count, flood_fill, flood_select_mask, paste_rect,
-    region_tight_bbox_or_hint, sample_composite_premul, stamp_circle, stamp_square, stroke_line,
-    stroke_line_spaced, stroke_line_square, stroke_quadratic_spaced, ToolKind,
+    draw_line_capsule, draw_rect_outline, ellipse_outline_segment_count, flood_fill,
+    flood_select_mask, paste_rect, region_tight_bbox_or_hint, sample_composite_premul,
+    stamp_circle_cached, stamp_square, stroke_line_spaced_cached, stroke_line_square,
+    stroke_quadratic_spaced_cached, ToolKind,
 };
-use gdk_pixbuf::Pixbuf;
 use gtk::gdk;
-use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gdk::prelude::ToplevelExt;
 use gtk::gio;
 #[allow(deprecated)]
@@ -31,19 +30,21 @@ use gtk::prelude::GestureSingleExt;
 use gtk::prelude::ListItemExt;
 use gtk::prelude::MenuModelExt;
 use gtk::prelude::PopoverExt;
-use gtk::prelude::RangeExt;
 use gtk::prelude::ToggleButtonExt;
 use gtk::prelude::WidgetExt;
 use gtk::prelude::WidgetExtManual;
 use libadwaita::prelude::*;
 use libadwaita::{Application, ColorScheme};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type SharedState = Rc<RefCell<AppState>>;
 type CanvasCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type LayersCell = Rc<RefCell<Option<gtk::ListBox>>>;
+type WindowTitleCell = Rc<RefCell<Option<libadwaita::WindowTitle>>>;
 type PickerUiRefresh = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
 fn picker_refresh_call(pr: &PickerUiRefresh) {
@@ -53,10 +54,62 @@ fn picker_refresh_call(pr: &PickerUiRefresh) {
 }
 type ColorPreviewDaCell = Rc<RefCell<Option<gtk::DrawingArea>>>;
 type ToolDdCell = Rc<RefCell<Option<gtk::DropDown>>>;
+
+/// Run `work` on a worker thread and invoke `on_done` on the GTK main loop with zero polling/busy-wait.
+fn spawn_background_task<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    on_done: impl FnOnce(T) + 'static,
+) {
+    static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static CALLBACKS: RefCell<HashMap<u64, Box<dyn FnOnce(Box<dyn std::any::Any>)>>> =
+            RefCell::new(HashMap::new());
+    }
+    let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+    CALLBACKS.with(|map| {
+        map.borrow_mut().insert(
+            id,
+            Box::new(move |val: Box<dyn std::any::Any>| {
+                if let Ok(typed) = val.downcast::<T>() {
+                    on_done(*typed);
+                }
+            }),
+        );
+    });
+    std::thread::spawn(move || {
+        let result = work();
+        glib::MainContext::default().invoke(move || {
+            let cb = CALLBACKS.with(|map| map.borrow_mut().remove(&id));
+            if let Some(cb) = cb {
+                cb(Box::new(result));
+            }
+        });
+    });
+}
+
+fn sync_window_title(state: &SharedState, title_cell: &WindowTitleCell) {
+    let Some(ref wt) = *title_cell.borrow() else {
+        return;
+    };
+    let st = state.borrow();
+    let name = st
+        .doc
+        .path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Untitled");
+    let dot = if st.modified { " •" } else { "" };
+    wt.set_subtitle(&format!(
+        "{name}{dot}  —  {}×{}",
+        st.doc.width, st.doc.height
+    ));
+}
+
 /// Screen-space size for floating handles (corners / edges / rotate knob), in pixels.
 const FLOAT_HANDLE_PX: f64 = 7.0;
-/// Rotation handle sits this many pixels beyond the top edge (document space; scaled by zoom in hit test via radius).
-const FLOAT_ROT_OFFSET_DOC: f64 = 22.0;
+/// Rotation handle sits this many screen pixels beyond the top edge.
+const FLOAT_ROT_OFFSET_PX: f64 = 22.0;
 
 fn floating_image_to_doc_matrix(f: &FloatingSelection) -> gtk::cairo::Matrix {
     let fw = f.w.max(1) as f64;
@@ -158,22 +211,23 @@ fn floating_handle_radius_doc(zoom: f64) -> f64 {
     (FLOAT_HANDLE_PX / zoom.max(0.001)).max(1.0)
 }
 
-fn floating_rotate_handle_doc(f: &FloatingSelection) -> (f64, f64) {
+fn floating_rotate_handle_doc(f: &FloatingSelection, zoom: f64) -> (f64, f64) {
     let m = floating_image_to_doc_matrix(f);
     let fw = f.w.max(1) as f64;
     let top_mid = m.transform_point(fw * 0.5, 0.0);
     let c = floating_transform_center(f);
+    let offset_doc = FLOAT_ROT_OFFSET_PX / zoom.max(0.001);
     let vx = top_mid.0 - c.0;
     let vy = top_mid.1 - c.1;
     let len = (vx * vx + vy * vy).sqrt();
     if len < 1e-6 {
-        return (top_mid.0, top_mid.1 - FLOAT_ROT_OFFSET_DOC);
+        return (top_mid.0, top_mid.1 - offset_doc);
     }
     let ux = vx / len;
     let uy = vy / len;
     (
-        top_mid.0 + ux * FLOAT_ROT_OFFSET_DOC,
-        top_mid.1 + uy * FLOAT_ROT_OFFSET_DOC,
+        top_mid.0 + ux * offset_doc,
+        top_mid.1 + uy * offset_doc,
     )
 }
 
@@ -188,7 +242,7 @@ enum FloatPress {
 
 fn float_press_at(doc_x: f64, doc_y: f64, zoom: f64, f: &FloatingSelection) -> FloatPress {
     let r = floating_handle_radius_doc(zoom);
-    let hr = floating_rotate_handle_doc(f);
+    let hr = floating_rotate_handle_doc(f, zoom);
     if dist_point((doc_x, doc_y), hr) <= r * 1.45 {
         return FloatPress::Rotate;
     }
@@ -374,7 +428,14 @@ fn draw_floating_handles(cr: &gtk::cairo::Context, zoom: f64, f: &FloatingSelect
         let my = (pa.1 + pb.1) * 0.5;
         draw_sq(cr, mx, my);
     }
-    let rh = floating_rotate_handle_doc(f);
+    let top_mid = m.transform_point(fw * 0.5, 0.0);
+    let rh = floating_rotate_handle_doc(f, zoom);
+    cr.set_dash(&[], 0.0);
+    cr.set_line_width(1.0 / zoom.max(0.001));
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+    cr.move_to(top_mid.0, top_mid.1);
+    cr.line_to(rh.0, rh.1);
+    cr.stroke().unwrap();
     cr.arc(rh.0, rh.1, hs * 1.05, 0.0, std::f64::consts::TAU);
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
     cr.fill_preserve().unwrap();
@@ -445,7 +506,15 @@ fn rasterize_floating_to_premul(f: &FloatingSelection) -> Option<(i32, i32, i32,
         cr.translate(-(min_ix as f64), -(min_iy as f64));
         cr.transform(m);
         cr.set_source_surface(&src_surf, 0.0, 0.0).ok()?;
-        cr.source().set_filter(gtk::cairo::Filter::Nearest);
+        let is_axis_aligned = f.angle_deg.rem_euclid(90.0).abs() < 1e-4;
+        let is_integer_scale = (f.scale_x - f.scale_x.round()).abs() < 1e-4
+            && (f.scale_y - f.scale_y.round()).abs() < 1e-4;
+        let filt = if is_axis_aligned && is_integer_scale {
+            gtk::cairo::Filter::Nearest
+        } else {
+            gtk::cairo::Filter::Good
+        };
+        cr.source().set_filter(filt);
         cr.paint().ok()?;
     }
     surf.flush();
@@ -809,29 +878,39 @@ fn rgb_bytes_to_hsv(c: [u8; 4]) -> (f64, f64, f64) {
     (h.rem_euclid(1.0), s, max)
 }
 
-/// (s, v) on the `hh` slice that best matches RGB `c` (for SV square marker position).
+/// Exact O(1) `(s, v)` on the `hh` hue slice that best matches RGB `c` (for SV square marker position).
 fn sv_on_hue_plane_for_rgb(hh: f64, c: [u8; 4]) -> (f64, f64) {
+    let (h_rgb, s_rgb, v_rgb) = rgb_bytes_to_hsv(c);
+    if v_rgb <= 1e-9 || s_rgb <= 1e-9 {
+        return (0.0, v_rgb.clamp(0.0, 1.0));
+    }
+    let dh = (h_rgb - hh.rem_euclid(1.0)).rem_euclid(1.0);
+    if dh < 1e-3 || (1.0 - dh) < 1e-3 {
+        return (s_rgb.clamp(0.0, 1.0), v_rgb.clamp(0.0, 1.0));
+    }
+    // Project C onto span{W=(1,1,1), H=hsv(hh,1,1)} where P = a*W + b*H, v = a+b, s = b/v.
+    let (hr, hg, hb) = hsv_to_rgb01(hh, 1.0, 1.0);
     let tr = c[0] as f64 / 255.0;
     let tg = c[1] as f64 / 255.0;
     let tb = c[2] as f64 / 255.0;
-    let mut best_s = 0.0_f64;
-    let mut best_v = 0.0_f64;
-    let mut best_e = f64::MAX;
-    const N: i32 = 40;
-    for i in 0..=N {
-        let s = i as f64 / N as f64;
-        for j in 0..=N {
-            let v = j as f64 / N as f64;
-            let (r, g, b) = hsv_to_rgb01(hh, s, v);
-            let e = (r - tr).powi(2) + (g - tg).powi(2) + (b - tb).powi(2);
-            if e < best_e {
-                best_e = e;
-                best_s = s;
-                best_v = v;
-            }
-        }
+    let ww = 3.0;
+    let wh = hr + hg + hb;
+    let hh_dot = hr * hr + hg * hg + hb * hb;
+    let wc = tr + tg + tb;
+    let hc = hr * tr + hg * tg + hb * tb;
+    let det = ww * hh_dot - wh * wh;
+    if det.abs() < 1e-9 {
+        return (s_rgb.clamp(0.0, 1.0), v_rgb.clamp(0.0, 1.0));
     }
-    (best_s, best_v)
+    let a = ((hh_dot * wc - wh * hc) / det).max(0.0);
+    let b = ((ww * hc - wh * wc) / det).max(0.0);
+    let v = (a + b).clamp(0.0, 1.0);
+    let s = if v > 1e-9 {
+        (b / (a + b)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (s, v)
 }
 
 fn hsv_to_rgb01(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
@@ -887,7 +966,6 @@ fn apply_sv_pick(
     state: &SharedState,
     sv_area: &gtk::DrawingArea,
     fg_bg: &gtk::DrawingArea,
-    canvas: &CanvasCell,
     picker_refresh: &PickerUiRefresh,
     x: f64,
     y: f64,
@@ -908,7 +986,6 @@ fn apply_sv_pick(
     picker_refresh_call(picker_refresh);
     sv_area.queue_draw();
     fg_bg.queue_draw();
-    queue_canvas(canvas);
 }
 
 fn sync_picker_from_target_color(
@@ -991,28 +1068,34 @@ enum PickerTrackKind {
     Alpha,
 }
 
+thread_local! {
+    static PICKER_CHECKER: RefCell<Option<gtk::cairo::SurfacePattern>> = const { RefCell::new(None) };
+}
+
 fn draw_checker_bg(cr: &gtk::cairo::Context, width: f64, height: f64) {
-    let sz = 5.0_f64;
-    let mut y = 0.0;
-    while y < height {
-        let mut x = 0.0;
-        while x < width {
-            let ix = (x / sz).floor() as i32;
-            let iy = (y / sz).floor() as i32;
-            let light = (ix + iy).rem_euclid(2) == 0;
-            if light {
-                cr.set_source_rgb(0.62, 0.62, 0.62);
-            } else {
-                cr.set_source_rgb(0.38, 0.38, 0.38);
-            }
-            let rw = sz.min(width - x);
-            let rh = sz.min(height - y);
-            cr.rectangle(x, y, rw, rh);
-            let _ = cr.fill();
-            x += sz;
+    PICKER_CHECKER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let surf =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 10, 10).unwrap();
+            let crc = gtk::cairo::Context::new(&surf).unwrap();
+            crc.set_source_rgb(0.62, 0.62, 0.62);
+            crc.paint().unwrap();
+            crc.set_source_rgb(0.38, 0.38, 0.38);
+            crc.rectangle(5.0, 0.0, 5.0, 5.0);
+            crc.rectangle(0.0, 5.0, 5.0, 5.0);
+            crc.fill().unwrap();
+            let p = gtk::cairo::SurfacePattern::create(surf);
+            p.set_extend(gtk::cairo::Extend::Repeat);
+            p.set_filter(gtk::cairo::Filter::Nearest);
+            *slot = Some(p);
         }
-        y += sz;
-    }
+        cr.save().unwrap();
+        let _ = cr.set_source(slot.as_ref().unwrap());
+        cr.rectangle(0.0, 0.0, width, height);
+        let _ = cr.fill();
+        cr.restore().unwrap();
+    });
 }
 
 fn make_picker_track(
@@ -1020,6 +1103,8 @@ fn make_picker_track(
     state: &SharedState,
     adj: &gtk::Adjustment,
     picker_tracks: &Rc<RefCell<Vec<gtk::DrawingArea>>>,
+    picker_refresh: &PickerUiRefresh,
+    fg_bg_da: &gtk::DrawingArea,
 ) -> gtk::DrawingArea {
     let da = gtk::DrawingArea::builder()
         .height_request(22)
@@ -1044,32 +1129,52 @@ fn make_picker_track(
         let g0 = c[1] as f64 / 255.0;
         let b0 = c[2] as f64 / 255.0;
         drop(st_b);
-        if kind != PickerTrackKind::Alpha {
-            let ww_i = ww.max(1);
-            for px in 0..ww_i {
-                let t = (px as f64 + 0.5) / w;
-                let (r, g, b) = match kind {
-                    PickerTrackKind::Hue => hsv_to_rgb01(t, 1.0, 1.0),
-                    PickerTrackKind::Sat => hsv_to_rgb01(hh_pick, t, v0),
-                    PickerTrackKind::Val => hsv_to_rgb01(hh_pick, s0, t),
-                    PickerTrackKind::Red => (t, g0, b0),
-                    PickerTrackKind::Green => (r0, t, b0),
-                    PickerTrackKind::Blue => (r0, g0, t),
-                    PickerTrackKind::Alpha => (0.0, 0.0, 0.0),
-                };
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(px as f64, 0.0, 1.0, h);
-                let _ = cr.fill();
-            }
-        } else {
+
+        if kind == PickerTrackKind::Alpha {
             draw_checker_bg(cr, w, h);
-            let lg = gtk::cairo::LinearGradient::new(0.0, 0.0, w, 0.0);
-            lg.add_color_stop_rgba(0.0, r0, g0, b0, 0.0);
-            lg.add_color_stop_rgba(1.0, r0, g0, b0, 1.0);
-            let _ = cr.set_source(&lg);
-            cr.rectangle(0.0, 0.0, w, h);
-            let _ = cr.fill();
         }
+        let lg = gtk::cairo::LinearGradient::new(0.0, 0.0, w, 0.0);
+        match kind {
+            PickerTrackKind::Hue => {
+                lg.add_color_stop_rgb(0.0, 1.0, 0.0, 0.0);
+                lg.add_color_stop_rgb(1.0 / 6.0, 1.0, 1.0, 0.0);
+                lg.add_color_stop_rgb(2.0 / 6.0, 0.0, 1.0, 0.0);
+                lg.add_color_stop_rgb(3.0 / 6.0, 0.0, 1.0, 1.0);
+                lg.add_color_stop_rgb(4.0 / 6.0, 0.0, 0.0, 1.0);
+                lg.add_color_stop_rgb(5.0 / 6.0, 1.0, 0.0, 1.0);
+                lg.add_color_stop_rgb(1.0, 1.0, 0.0, 0.0);
+            }
+            PickerTrackKind::Sat => {
+                let (r1, g1, b1) = hsv_to_rgb01(hh_pick, 1.0, v0);
+                lg.add_color_stop_rgb(0.0, v0, v0, v0);
+                lg.add_color_stop_rgb(1.0, r1, g1, b1);
+            }
+            PickerTrackKind::Val => {
+                let (r1, g1, b1) = hsv_to_rgb01(hh_pick, s0, 1.0);
+                lg.add_color_stop_rgb(0.0, 0.0, 0.0, 0.0);
+                lg.add_color_stop_rgb(1.0, r1, g1, b1);
+            }
+            PickerTrackKind::Red => {
+                lg.add_color_stop_rgb(0.0, 0.0, g0, b0);
+                lg.add_color_stop_rgb(1.0, 1.0, g0, b0);
+            }
+            PickerTrackKind::Green => {
+                lg.add_color_stop_rgb(0.0, r0, 0.0, b0);
+                lg.add_color_stop_rgb(1.0, r0, 1.0, b0);
+            }
+            PickerTrackKind::Blue => {
+                lg.add_color_stop_rgb(0.0, r0, g0, 0.0);
+                lg.add_color_stop_rgb(1.0, r0, g0, 1.0);
+            }
+            PickerTrackKind::Alpha => {
+                lg.add_color_stop_rgba(0.0, r0, g0, b0, 0.0);
+                lg.add_color_stop_rgba(1.0, r0, g0, b0, 1.0);
+            }
+        }
+        let _ = cr.set_source(&lg);
+        cr.rectangle(0.0, 0.0, w, h);
+        let _ = cr.fill();
+
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.4);
         cr.set_line_width(1.0);
         cr.rectangle(0.5, 0.5, w - 1.0, h - 1.0);
@@ -1082,82 +1187,78 @@ fn make_picker_track(
             ((adj_c.value() - lo) / (hi - lo)).clamp(0.0, 1.0)
         };
         let x = t * w;
-        cr.set_source_rgb(0.06, 0.06, 0.06);
-        cr.move_to(x, 1.0);
-        cr.line_to(x - 5.0, h - 1.0);
-        cr.line_to(x + 5.0, h - 1.0);
+        cr.move_to(x, 1.5);
+        cr.line_to(x - 5.0, h - 1.5);
+        cr.line_to(x + 5.0, h - 1.5);
         cr.close_path();
-        let _ = cr.fill();
+        cr.set_source_rgb(0.06, 0.06, 0.06);
+        let _ = cr.fill_preserve();
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
     });
     picker_tracks.borrow_mut().push(da.clone());
-    wire_picker_track_drag(&da, adj, picker_tracks, state);
+    wire_picker_track_drag(&da, adj, state, picker_refresh, fg_bg_da);
     da
 }
 
 fn wire_picker_track_drag(
     da: &gtk::DrawingArea,
     adj: &gtk::Adjustment,
-    picker_tracks: &Rc<RefCell<Vec<gtk::DrawingArea>>>,
     state: &SharedState,
+    picker_refresh: &PickerUiRefresh,
+    fg_bg_da: &gtk::DrawingArea,
 ) {
-    let painting = Rc::new(Cell::new(false));
-    let gc = gtk::GestureClick::new();
-    gc.set_button(0);
-    let adj_p = adj.clone();
-    let da_p = da.clone();
-    let tracks_p = picker_tracks.clone();
-    let paint_on = painting.clone();
-    let st_press = state.clone();
-    gc.connect_pressed(move |gesture, _, x, _| {
-        paint_on.set(true);
-        {
-            let mut g = st_press.borrow_mut();
-            g.picker_target = picker_target_for_gesture_button(gesture.current_button());
-        }
-        let w = da_p.width() as f64;
+    let apply_x = |da: &gtk::DrawingArea, adj: &gtk::Adjustment, x: f64| {
+        let w = da.width() as f64;
         if w > 1.0 {
             let t = (x / w).clamp(0.0, 1.0);
-            let lo = adj_p.lower();
-            let hi = adj_p.upper();
+            let lo = adj.lower();
+            let hi = adj.upper();
             let mut v = lo + t * (hi - lo);
-            if adj_p.step_increment() >= 1.0 && hi > 1.5 {
+            if adj.step_increment() >= 1.0 && hi > 1.5 {
                 v = v.round();
             }
-            adj_p.set_value(v.clamp(lo, hi));
+            adj.set_value(v.clamp(lo, hi));
         }
-        for tr in tracks_p.borrow().iter() {
-            tr.queue_draw();
-        }
-    });
-    let paint_off = painting.clone();
-    gc.connect_released(move |_, _, _, _| paint_off.set(false));
-    da.add_controller(gc);
+    };
 
-    let motion = gtk::EventControllerMotion::new();
-    let adj_m = adj.clone();
-    let da_m = da.clone();
-    let tracks_m = picker_tracks.clone();
-    let painting_m = painting.clone();
-    motion.connect_motion(move |_ec, x, _| {
-        if !painting_m.get() {
-            return;
+    let drag_start_x = Rc::new(Cell::new(0.0f64));
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(0);
+
+    let adj_b = adj.clone();
+    let da_b = da.clone();
+    let st_b = state.clone();
+    let pr_b = picker_refresh.clone();
+    let fg_b = fg_bg_da.clone();
+    let sx_b = drag_start_x.clone();
+    drag.connect_drag_begin(move |gesture, x, _| {
+        sx_b.set(x);
+        let new_target = picker_target_for_gesture_button(gesture.current_button());
+        let switched = {
+            let mut g = st_b.borrow_mut();
+            let prev = g.picker_target;
+            g.picker_target = new_target;
+            prev != new_target
+        };
+        if switched {
+            // Sync adjustments to the newly targeted slot before mutating this channel
+            // so the other slot's channels aren't overwritten.
+            picker_refresh_call(&pr_b);
+            fg_b.queue_draw();
         }
-        let w = da_m.width() as f64;
-        if w > 1.0 {
-            let t = (x / w).clamp(0.0, 1.0);
-            let lo = adj_m.lower();
-            let hi = adj_m.upper();
-            let mut v = lo + t * (hi - lo);
-            if adj_m.step_increment() >= 1.0 && hi > 1.5 {
-                v = v.round();
-            }
-            adj_m.set_value(v.clamp(lo, hi));
-        }
-        for tr in tracks_m.borrow().iter() {
-            tr.queue_draw();
-        }
+        apply_x(&da_b, &adj_b, x);
     });
-    da.add_controller(motion);
+
+    let adj_u = adj.clone();
+    let da_u = da.clone();
+    let sx_u = drag_start_x.clone();
+    drag.connect_drag_update(move |_, ox, _| {
+        apply_x(&da_u, &adj_u, sx_u.get() + ox);
+    });
+
+    da.add_controller(drag);
 }
 
 fn picker_gradient_spin_row(
@@ -1305,7 +1406,6 @@ struct PaletteSidebar {
     strings: gtk::StringList,
     preview: gtk::DrawingArea,
     recent: gtk::FlowBox,
-    canvas: CanvasCell,
     sv_area: gtk::DrawingArea,
     picker_refresh: PickerUiRefresh,
 }
@@ -1362,7 +1462,6 @@ fn fill_palette_swatches(ps: &PaletteSidebar, state: &SharedState) {
         let btn = swatch_button(col, true);
         let st_pal = state.clone();
         let prev_pal = ps.preview.clone();
-        let cv_pal = ps.canvas.clone();
         let rf_pal = ps.recent.clone();
         let sv = ps.sv_area.clone();
         let pr = ps.picker_refresh.clone();
@@ -1384,8 +1483,7 @@ fn fill_palette_swatches(ps: &PaletteSidebar, state: &SharedState) {
             picker_refresh_call(&pr);
             prev_pal.queue_draw();
             sv.queue_draw();
-            queue_canvas(&cv_pal);
-            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &cv_pal, &pr);
+            refresh_recent_swatch_row(&rf_pal, &st_pal, &prev_pal, &pr);
         });
         btn.add_controller(gc);
         flow.append(&btn);
@@ -1928,7 +2026,6 @@ fn manage_palettes_dialog(
 /// Left-click anywhere swaps primary and secondary. Right-click a square chooses which slot the hue/SV picker edits.
 fn make_fg_bg_selector(
     state: &SharedState,
-    canvas: &CanvasCell,
     sv_da: &gtk::DrawingArea,
     picker_refresh: &PickerUiRefresh,
 ) -> gtk::DrawingArea {
@@ -1978,8 +2075,8 @@ fn make_fg_bg_selector(
     });
 
     let click = gtk::GestureClick::new();
+    click.set_button(0);
     let st = state.clone();
-    let cv = canvas.clone();
     let da_c = da.clone();
     let pr = picker_refresh.clone();
     let sv_c = sv_da.clone();
@@ -2008,7 +2105,6 @@ fn make_fg_bg_selector(
             picker_refresh_call(&pr);
             da_c.queue_draw();
             sv_c.queue_draw();
-            queue_canvas(&cv);
             return;
         }
         if btn == gdk::BUTTON_SECONDARY {
@@ -2038,7 +2134,6 @@ fn refresh_recent_swatch_row(
     flow: &gtk::FlowBox,
     state: &SharedState,
     preview_da: &gtk::DrawingArea,
-    cv: &CanvasCell,
     picker_refresh: &PickerUiRefresh,
 ) {
     while let Some(c) = flow.first_child() {
@@ -2049,25 +2144,36 @@ fn refresh_recent_swatch_row(
         let btn = swatch_button(col, false);
         let st = state.clone();
         let prev = preview_da.clone();
-        let cv2 = cv.clone();
         let flow2 = flow.clone();
         let pr = picker_refresh.clone();
         let gc = gtk::GestureClick::new();
         gc.set_button(0);
         gc.connect_pressed(move |gesture, _, _, _| {
+            let is_secondary = gesture.current_button() == gdk::BUTTON_SECONDARY;
             {
                 let mut g = st.borrow_mut();
-                if gesture.current_button() == gdk::BUTTON_SECONDARY {
+                if is_secondary {
                     g.bg = col;
+                    g.picker_target = ColorSlot::Right;
                 } else {
                     g.fg = col;
+                    g.picker_target = ColorSlot::Left;
                     push_recent_color(&mut g, col);
                 }
             }
             picker_refresh_call(&pr);
             prev.queue_draw();
-            queue_canvas(&cv2);
-            refresh_recent_swatch_row(&flow2, &st, &prev, &cv2, &pr);
+            if !is_secondary {
+                // Defer rebuilding the FlowBox until after this press handler returns so we don't
+                // finalize the active button inside its own gesture callback.
+                let flow_d = flow2.clone();
+                let st_d = st.clone();
+                let prev_d = prev.clone();
+                let pr_d = pr.clone();
+                glib::idle_add_local_once(move || {
+                    refresh_recent_swatch_row(&flow_d, &st_d, &prev_d, &pr_d);
+                });
+            }
         });
         btn.add_controller(gc);
         flow.append(&btn);
@@ -2130,7 +2236,12 @@ fn listbox_row_index(lb: &gtk::ListBox, target: &gtk::ListBoxRow) -> usize {
     0
 }
 
-fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &CanvasCell) {
+fn refresh_layers_list(
+    state: &SharedState,
+    layers_cell: &LayersCell,
+    canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
+) {
     let Some(lb) = layers_cell.borrow().clone() else {
         return;
     };
@@ -2144,12 +2255,13 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             .layers
             .iter()
             .enumerate()
-            .map(|(i, l)| (i, l.name.clone(), l.visible, l.opacity))
+            .map(|(i, l)| (i, l.name.clone(), l.visible, l.opacity, l.blend))
             .collect()
     };
+    let layer_count = layers_info.len();
     let active_layer = state.borrow().doc.active_layer;
 
-    for (i, name, visible, opacity) in layers_info {
+    for (i, name, visible, opacity, blend) in layers_info {
         let outer = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
@@ -2169,11 +2281,20 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             .xalign(0.0)
             .build();
         name_label.add_css_class("heading");
+        let blend_dd = gtk::DropDown::from_strings(&[
+            BlendMode::Normal.as_str(),
+            BlendMode::Multiply.as_str(),
+            BlendMode::Add.as_str(),
+        ]);
+        blend_dd.set_selected(blend.dropdown_index());
+        blend_dd.set_valign(gtk::Align::Center);
+        blend_dd.set_tooltip_text(Some("Blend mode"));
         let vis = gtk::Switch::builder()
             .active(visible)
             .valign(gtk::Align::Center)
             .build();
         top_row.append(&name_label);
+        top_row.append(&blend_dd);
         top_row.append(&vis);
 
         let bot_row = gtk::Box::builder()
@@ -2187,11 +2308,17 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         op_scale.set_digits(0);
         op_scale.set_hexpand(true);
         let up = gtk::Button::from_icon_name("go-up-symbolic");
+        up.set_tooltip_text(Some("Move layer up in list"));
+        up.set_sensitive(i > 0);
         let down = gtk::Button::from_icon_name("go-down-symbolic");
+        down.set_tooltip_text(Some("Move layer down in list"));
+        down.set_sensitive(i + 1 < layer_count);
         let merge = gtk::Button::from_icon_name("object-flip-vertical-symbolic");
         merge.set_tooltip_text(Some("Merge down"));
+        merge.set_sensitive(i > 0);
         let del = gtk::Button::from_icon_name("edit-delete-symbolic");
         del.set_tooltip_text(Some("Delete layer"));
+        del.set_sensitive(layer_count > 1);
         bot_row.append(&op_scale);
         bot_row.append(&up);
         bot_row.append(&down);
@@ -2203,19 +2330,50 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
 
         let st = state.clone();
         let cv = canvas.clone();
-        vis.connect_state_set(move |_sw, active| {
-            let mut g = st.borrow_mut();
-            if let Some(l) = g.doc.layers.get_mut(i) {
-                l.visible = active;
-                g.modified = true;
-                g.bump_document_revision();
+        let tc = title_cell.clone();
+        blend_dd.connect_selected_notify(move |dd| {
+            let new_blend = BlendMode::from_dropdown_index(dd.selected());
+            let changed = {
+                let mut g = st.borrow_mut();
+                if let Some(l) = g.doc.layers.get_mut(i) {
+                    if l.blend != new_blend {
+                        l.blend = new_blend;
+                        g.modified = true;
+                        g.bump_stack_revision();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if changed {
+                sync_window_title(&st, &tc);
+                queue_canvas(&cv);
             }
+        });
+
+        let st = state.clone();
+        let cv = canvas.clone();
+        let tc = title_cell.clone();
+        vis.connect_state_set(move |_sw, active| {
+            {
+                let mut g = st.borrow_mut();
+                if let Some(l) = g.doc.layers.get_mut(i) {
+                    l.visible = active;
+                    g.modified = true;
+                    g.bump_stack_revision();
+                }
+            }
+            sync_window_title(&st, &tc);
             queue_canvas(&cv);
             glib::Propagation::Proceed
         });
 
         let st = state.clone();
         let cv = canvas.clone();
+        let tc = title_cell.clone();
         let opacity_redraw_pending = Rc::new(Cell::new(false));
         op_adj.connect_value_changed(move |a| {
             {
@@ -2231,10 +2389,12 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             opacity_redraw_pending.set(true);
             let st_tick = st.clone();
             let cv_tick = cv.clone();
+            let tc_tick = tc.clone();
             let pending = opacity_redraw_pending.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(33), move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
                 pending.set(false);
-                st_tick.borrow_mut().bump_document_revision();
+                st_tick.borrow_mut().bump_stack_revision();
+                sync_window_title(&st_tick, &tc_tick);
                 queue_canvas(&cv_tick);
             });
         });
@@ -2242,14 +2402,19 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         let st = state.clone();
         let lc2 = layers_cell.clone();
         let cv2 = canvas.clone();
+        let tc2 = title_cell.clone();
         let idx = i;
         up.connect_clicked(move |_| {
             if idx > 0 {
                 let mut g = st.borrow_mut();
+                commit_floating(&mut g);
                 g.doc.move_layer(idx, idx - 1);
-                g.bump_document_revision();
+                g.history.remap_layer_move(idx, idx - 1);
+                g.modified = true;
+                g.bump_stack_revision();
                 drop(g);
-                refresh_layers_list(&st, &lc2, &cv2);
+                sync_window_title(&st, &tc2);
+                refresh_layers_list(&st, &lc2, &cv2, &tc2);
                 queue_canvas(&cv2);
             }
         });
@@ -2257,14 +2422,19 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         let st = state.clone();
         let lc3 = layers_cell.clone();
         let cv3 = canvas.clone();
+        let tc3 = title_cell.clone();
         let idx_d = i;
         down.connect_clicked(move |_| {
             let mut g = st.borrow_mut();
             if idx_d + 1 < g.doc.layers.len() {
+                commit_floating(&mut g);
                 g.doc.move_layer(idx_d, idx_d + 1);
-                g.bump_document_revision();
+                g.history.remap_layer_move(idx_d, idx_d + 1);
+                g.modified = true;
+                g.bump_stack_revision();
                 drop(g);
-                refresh_layers_list(&st, &lc3, &cv3);
+                sync_window_title(&st, &tc3);
+                refresh_layers_list(&st, &lc3, &cv3, &tc3);
                 queue_canvas(&cv3);
             }
         });
@@ -2272,15 +2442,18 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         let st = state.clone();
         let lc4 = layers_cell.clone();
         let cv4 = canvas.clone();
+        let tc4 = title_cell.clone();
         let idx_merge = i;
         merge.connect_clicked(move |_| {
             let mut g = st.borrow_mut();
+            commit_floating(&mut g);
             if g.doc.merge_down(idx_merge) {
                 g.history.clear();
                 g.modified = true;
-                g.bump_document_revision();
+                g.bump_stack_revision();
                 drop(g);
-                refresh_layers_list(&st, &lc4, &cv4);
+                sync_window_title(&st, &tc4);
+                refresh_layers_list(&st, &lc4, &cv4, &tc4);
                 queue_canvas(&cv4);
             }
         });
@@ -2288,6 +2461,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
         let st = state.clone();
         let lc5 = layers_cell.clone();
         let cv5 = canvas.clone();
+        let tc5 = title_cell.clone();
         let idx_del = i;
         del.connect_clicked(move |btn| {
             if st.borrow().doc.layers.len() <= 1 {
@@ -2297,6 +2471,7 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             let st2 = st.clone();
             let lc = lc5.clone();
             let cv = cv5.clone();
+            let tc = tc5.clone();
             let d = libadwaita::Window::builder()
                 .modal(true)
                 .title("Delete layer")
@@ -2334,12 +2509,14 @@ fn refresh_layers_list(state: &SharedState, layers_cell: &LayersCell, canvas: &C
             let dc2 = d.clone();
             confirm.connect_clicked(move |_| {
                 let mut g = st2.borrow_mut();
+                commit_floating(&mut g);
                 if g.doc.remove_layer(idx_del) {
                     g.history.clear();
                     g.modified = true;
-                    g.bump_document_revision();
+                    g.bump_stack_revision();
                     drop(g);
-                    refresh_layers_list(&st2, &lc, &cv);
+                    sync_window_title(&st2, &tc);
+                    refresh_layers_list(&st2, &lc, &cv, &tc);
                     queue_canvas(&cv);
                 }
                 dc2.close();
@@ -2496,6 +2673,80 @@ fn region_outline_segments_path(
     }
 }
 
+/// Incrementally flush any pending `stroke_dirty_rect` into `composite_cache_premul` and
+/// `composite_cache_surface`, keeping the cache synchronized without a full-canvas recomposite.
+fn flush_pending_stroke_composite(st: &mut AppState) -> bool {
+    let w = st.doc.width;
+    let h = st.doc.height;
+    let len = (w * h * 4) as usize;
+    let w_i = w as i32;
+    let h_i = h as i32;
+    let cairo_stride = gtk::cairo::Format::ARgb32
+        .stride_for_width(w)
+        .expect("cairo stride");
+    let surface_ready = st
+        .composite_cache_surface
+        .as_ref()
+        .is_some_and(|s| s.width() == w_i && s.height() == h_i && s.stride() == cairo_stride);
+    let cache_ready = st.composite_cache_premul.len() == len
+        && st.composite_cache_at_revision == st.document_visual_revision
+        && surface_ready;
+    if !cache_ready || !st.below_cache_valid() {
+        return false;
+    }
+    let Some(dirty) = st.take_stroke_dirty_rect() else {
+        return true;
+    };
+    let active = st.below_cache_active_layer;
+    let has_below = st.below_cache_has_content;
+    {
+        let AppState {
+            ref doc,
+            ref mut composite_cache_premul,
+            ref below_cache_buf,
+            ..
+        } = *st;
+        let below_slice = if has_below {
+            Some(below_cache_buf.as_slice())
+        } else {
+            None
+        };
+        composite_layers_from_below_region_into(
+            composite_cache_premul,
+            doc.width,
+            doc.height,
+            &doc.layers,
+            active,
+            below_slice,
+            dirty,
+        );
+    }
+    {
+        let AppState {
+            ref composite_cache_premul,
+            ref mut composite_cache_surface,
+            ref mut composite_cache_at_revision,
+            document_visual_revision,
+            ..
+        } = *st;
+        let surf = composite_cache_surface.as_mut().expect("surface");
+        {
+            let mut data = surf.data().expect("composite surface data");
+            premul_rgba_to_cairo_argb32_region(
+                &mut data,
+                cairo_stride as usize,
+                w,
+                h,
+                composite_cache_premul,
+                dirty,
+            );
+        }
+        surf.mark_dirty();
+        *composite_cache_at_revision = document_visual_revision;
+    }
+    true
+}
+
 fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, widget_h: i32) {
     let (sr, sg, sb) = CANVAS_SURROUND_RGB;
     cr.set_source_rgb(sr, sg, sb);
@@ -2551,87 +2802,39 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
         let cache_ready = st.composite_cache_premul.len() == len
             && st.composite_cache_at_revision == st.document_visual_revision
             && surface_ready;
-        let stroke_dirty = if st.brush_stroke_in_progress {
-            st.take_stroke_dirty_rect()
+        let stroke_handled = if st.brush_stroke_in_progress && cache_ready {
+            flush_pending_stroke_composite(&mut st)
         } else {
-            None
+            false
         };
-        let use_cache = !st.brush_stroke_in_progress && cache_ready;
-        let use_stroke_cache = st.brush_stroke_in_progress && cache_ready && stroke_dirty.is_none();
-        let use_stroke_region = st.brush_stroke_in_progress
-            && cache_ready
-            && stroke_dirty.is_some()
-            && st.stroke_composite_below_valid();
+        let use_cache = (!st.brush_stroke_in_progress && cache_ready) || stroke_handled;
 
-        if use_stroke_region {
-            let dirty = stroke_dirty.expect("checked");
-            let stroke_active = st.stroke_composite_active_layer;
-            let below = st
-                .stroke_composite_below
-                .take()
-                .expect("stroke composite below");
+        if !use_cache {
+            let _ = st.take_stroke_dirty_rect();
+            let use_below = st.brush_stroke_in_progress && st.below_cache_valid();
+            let active = st.below_cache_active_layer;
+            let has_below = st.below_cache_has_content;
             {
                 let AppState {
                     ref doc,
                     ref mut composite_cache_premul,
-                    ..
-                } = *st;
-                composite_layers_from_below_region_into(
-                    composite_cache_premul,
-                    doc.width,
-                    doc.height,
-                    &doc.layers,
-                    stroke_active,
-                    &below,
-                    dirty,
-                );
-            }
-            st.stroke_composite_below = Some(below);
-            {
-                let AppState {
-                    ref composite_cache_premul,
-                    ref mut composite_cache_surface,
-                    ref mut composite_cache_at_revision,
-                    document_visual_revision,
-                    ..
-                } = *st;
-                let surf = composite_cache_surface.as_mut().expect("surface");
-                {
-                    let mut data = surf.data().expect("composite surface data");
-                    premul_rgba_to_cairo_argb32_region(
-                        &mut data,
-                        cairo_stride as usize,
-                        w,
-                        h,
-                        composite_cache_premul,
-                        dirty,
-                    );
-                }
-                surf.mark_dirty();
-                *composite_cache_at_revision = document_visual_revision;
-            }
-        } else if !(use_cache || use_stroke_cache) {
-            let stroke_active = st.stroke_composite_active_layer;
-            let below_temp = if st.brush_stroke_in_progress && st.stroke_composite_below_valid() {
-                st.stroke_composite_below.take()
-            } else {
-                None
-            };
-            {
-                let AppState {
-                    ref doc,
-                    ref mut composite_cache_premul,
+                    ref below_cache_buf,
                     ..
                 } = *st;
                 composite_cache_premul.resize(len, 0);
-                if let Some(ref below) = below_temp {
+                if use_below {
+                    let below_slice = if has_below {
+                        Some(below_cache_buf.as_slice())
+                    } else {
+                        None
+                    };
                     composite_layers_from_below_into(
                         composite_cache_premul,
                         doc.width,
                         doc.height,
                         &doc.layers,
-                        stroke_active,
-                        below,
+                        active,
+                        below_slice,
                     );
                 } else {
                     composite_layers_into(
@@ -2642,7 +2845,6 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
                     );
                 }
             }
-            st.stroke_composite_below = below_temp;
             {
                 let AppState {
                     ref composite_cache_premul,
@@ -2695,7 +2897,12 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
     });
     cr.set_source_surface(composite_surface.as_ref(), 0.0, 0.0)
         .expect("set_source_surface composite");
-    cr.source().set_filter(gtk::cairo::Filter::Nearest);
+    let canvas_filter = if zoom < 1.0 {
+        gtk::cairo::Filter::Bilinear
+    } else {
+        gtk::cairo::Filter::Nearest
+    };
+    cr.source().set_filter(canvas_filter);
     cr.paint().unwrap();
     cr.restore().unwrap();
 
@@ -2735,51 +2942,40 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
         cr.restore().unwrap();
     }
 
-    let floating_pixbuf = {
+    let floating_surface = {
         let mut st = state.borrow_mut();
         if st.floating.is_none() {
-            st.floating_pixbuf_cache = None;
-            st.floating_pixbuf_key = None;
+            st.floating_surface_cache = None;
+            st.floating_surface_id = None;
             None
         } else {
-            let key = {
+            let fid = st.floating.as_ref().unwrap().id;
+            if st.floating_surface_id == Some(fid) && st.floating_surface_cache.is_some() {
+                st.floating_surface_cache.clone()
+            } else {
                 let f = st.floating.as_ref().unwrap();
                 let fw = f.w.max(1);
                 let fh = f.h.max(1);
-                (f.data.as_ptr() as usize, f.data.len(), fw, fh)
-            };
-            let hit = st.floating_pixbuf_key == Some(key) && st.floating_pixbuf_cache.is_some();
-            if hit {
-                st.floating_pixbuf_cache.clone()
-            } else {
-                let f = st.floating.take().unwrap();
-                let fw = f.w.max(1);
-                let fh = f.h.max(1);
-                let fl_len = (fw * fh * 4) as usize;
-                st.floating_straight_scratch.resize(fl_len, 0);
-                premul_to_straight_rgba_into(&mut st.floating_straight_scratch, &f.data);
-                let bytes = glib::Bytes::from_owned(std::mem::replace(
-                    &mut st.floating_straight_scratch,
-                    Vec::new(),
-                ));
-                let pb = Pixbuf::from_bytes(
-                    &bytes,
-                    gdk_pixbuf::Colorspace::Rgb,
-                    true,
-                    8,
-                    fw,
-                    fh,
-                    fw * 4,
-                );
-                st.floating_pixbuf_cache = Some(pb.clone());
-                st.floating_pixbuf_key = Some(key);
-                st.floating = Some(f);
-                Some(pb)
+                let mut surf =
+                    gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, fw, fh)
+                        .expect("floating ImageSurface");
+                let stride = surf.stride() as usize;
+                {
+                    let mut data = surf.data().expect("floating surface data");
+                    premul_rgba_to_cairo_argb32(&mut data, stride, fw as u32, fh as u32, &f.data);
+                }
+                surf.mark_dirty();
+                st.floating_surface_cache = Some(surf.clone());
+                st.floating_surface_id = Some(fid);
+                Some(surf)
             }
         }
     };
 
-    if let Some(pb) = floating_pixbuf {
+    let dash = 6.0 / zoom.max(0.001);
+    let lw = 1.0 / zoom.max(0.001);
+
+    if let Some(surf) = floating_surface {
         let st_fl = state.borrow();
         if let Some(f) = st_fl.floating.as_ref() {
             cr.save().unwrap();
@@ -2787,12 +2983,12 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
             cr.scale(zoom, zoom);
             let m = floating_image_to_doc_matrix(f);
             cr.transform(m);
-            cr.set_source_pixbuf(&pb, 0.0, 0.0);
-            let filt = if st_fl.floating_drag.is_some()
-                || (f.scale_x - 1.0).abs() < 1e-6
-                    && (f.scale_y - 1.0).abs() < 1e-6
-                    && f.angle_deg.rem_euclid(90.0).abs() < 1e-6
-            {
+            cr.set_source_surface(surf.as_ref(), 0.0, 0.0)
+                .expect("set_source_surface floating");
+            let is_axis_aligned = f.angle_deg.rem_euclid(90.0).abs() < 1e-4;
+            let is_integer_scale = (f.scale_x - f.scale_x.round()).abs() < 1e-4
+                && (f.scale_y - f.scale_y.round()).abs() < 1e-4;
+            let filt = if st_fl.floating_drag.is_some() || (is_axis_aligned && is_integer_scale) {
                 gtk::cairo::Filter::Nearest
             } else {
                 gtk::cairo::Filter::Good
@@ -2805,22 +3001,17 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
             cr.save().unwrap();
             cr.translate(pan_x, pan_y);
             cr.scale(zoom, zoom);
-            cr.set_dash(&[6.0, 6.0], 0.0);
-            cr.set_line_width(1.0 / zoom.max(0.001));
+            cr.set_dash(&[dash, dash], 0.0);
+            cr.set_line_width(lw);
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
             cr.move_to(quad[0].0, quad[0].1);
             cr.line_to(quad[1].0, quad[1].1);
             cr.line_to(quad[2].0, quad[2].1);
             cr.line_to(quad[3].0, quad[3].1);
             cr.close_path();
-            cr.stroke().unwrap();
+            cr.stroke_preserve().unwrap();
             cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-            cr.set_dash(&[6.0, 6.0], 6.0);
-            cr.move_to(quad[0].0, quad[0].1);
-            cr.line_to(quad[1].0, quad[1].1);
-            cr.line_to(quad[2].0, quad[2].1);
-            cr.line_to(quad[3].0, quad[3].1);
-            cr.close_path();
+            cr.set_dash(&[dash, dash], dash);
             cr.stroke().unwrap();
             draw_floating_handles(cr, zoom, f);
             cr.restore().unwrap();
@@ -2834,17 +3025,15 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
         cr.save().unwrap();
         cr.translate(pan_x, pan_y);
         cr.scale(zoom, zoom);
-        let lw = 1.0 / zoom.max(0.001);
         cr.set_line_width(lw);
         match sel {
             Selection::Rect(sx, sy, sw, sh) => {
-                cr.set_dash(&[6.0, 6.0], 0.0);
+                cr.set_dash(&[dash, dash], 0.0);
                 cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
                 cr.rectangle(*sx as f64, *sy as f64, *sw as f64, *sh as f64);
-                cr.stroke().unwrap();
+                cr.stroke_preserve().unwrap();
                 cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-                cr.set_dash(&[6.0, 6.0], 6.0);
-                cr.rectangle(*sx as f64, *sy as f64, *sw as f64, *sh as f64);
+                cr.set_dash(&[dash, dash], dash);
                 cr.stroke().unwrap();
             }
             Selection::Region {
@@ -2858,10 +3047,10 @@ fn draw_canvas(state: &SharedState, cr: &gtk::cairo::Context, widget_w: i32, wid
                     cr.new_path();
                     region_outline_segments_path(cr, outline_segments);
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-                    cr.set_dash(&[6.0, 6.0], 0.0);
+                    cr.set_dash(&[dash, dash], 0.0);
                     cr.stroke_preserve().unwrap();
                     cr.set_source_rgba(0.0, 0.0, 0.0, 0.95);
-                    cr.set_dash(&[6.0, 6.0], 6.0);
+                    cr.set_dash(&[dash, dash], dash);
                     cr.stroke().unwrap();
                 }
             }
@@ -2895,7 +3084,8 @@ fn commit_floating(state: &mut AppState) {
         return;
     };
     state.floating_drag = None;
-    state.move_grab_doc = None;
+    state.floating_surface_cache = None;
+    state.floating_surface_id = None;
     let idx = state.doc.active_layer;
     let Some(layer) = state.doc.layers.get_mut(idx) else {
         return;
@@ -2930,7 +3120,27 @@ fn commit_floating(state: &mut AppState) {
     if layer.pixels != before {
         state.history.commit_change(idx, before);
         state.modified = true;
-        state.bump_document_revision();
+        state.bump_stack_revision();
+    }
+}
+
+fn selection_rect_clipped(
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    doc_w: u32,
+    doc_h: u32,
+) -> Option<Selection> {
+    let (rx, ry, rw, rh) = AppState::normalize_rect(x0, y0, x1, y1);
+    let cx0 = rx.max(0);
+    let cy0 = ry.max(0);
+    let cx1 = (rx + rw).min(doc_w as i32);
+    let cy1 = (ry + rh).min(doc_h as i32);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        None
+    } else {
+        Some(Selection::Rect(cx0, cy0, cx1 - cx0, cy1 - cy0))
     }
 }
 
@@ -2997,13 +3207,17 @@ fn paint_brush_drag_sample(
         *last_sample.borrow_mut() = Some((wx, wy));
         return false;
     };
-    if cx.floor() == lx.floor() && cy.floor() == ly.floor() {
+    if st.tool == ToolKind::Pixel && cx.floor() == lx.floor() && cy.floor() == ly.floor() {
+        *last_sample.borrow_mut() = Some((wx, wy));
+        return false;
+    }
+    if (cx - lx).hypot(cy - ly) < 0.25 {
         *last_sample.borrow_mut() = Some((wx, wy));
         return false;
     }
     let eraser = st.tool == ToolKind::Eraser;
     let paint_color = if eraser {
-        st.fg
+        [0, 0, 0, 255]
     } else {
         st.active_paint_color()
     };
@@ -3014,61 +3228,87 @@ fn paint_brush_drag_sample(
     let mut next_dab_distance = st.stroke_next_dab_distance;
     let smooth_prev = st.stroke_smooth_prev_doc;
     let smooth_started = st.stroke_smooth_started;
-    if matches!(tool, ToolKind::Brush | ToolKind::Eraser) && smooth_prev.is_none() {
-        st.stroke_smooth_prev_doc = Some((lx, ly));
-        st.last_doc_pos = Some((cx, cy));
-        *last_sample.borrow_mut() = Some((wx, wy));
-        return false;
-    }
+
     let undo_rect = match tool {
         ToolKind::Brush | ToolKind::Eraser => {
-            let (px, py) = smooth_prev.expect("checked");
-            let (sx, sy) = if smooth_started {
-                ((px + lx) * 0.5, (py + ly) * 0.5)
+            if let Some((px, py)) = smooth_prev {
+                let (sx, sy) = if smooth_started {
+                    ((px + lx) * 0.5, (py + ly) * 0.5)
+                } else {
+                    (px, py)
+                };
+                let (ex, ey) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
+                brush_quadratic_rect(sx, sy, lx, ly, ex, ey, radius)
             } else {
-                (px, py)
-            };
-            let (ex, ey) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
-            brush_quadratic_rect(sx, sy, lx, ly, ex, ey, radius)
+                // First drag update: immediately draw P0 -> midpoint(P0, P1) for zero start lag.
+                let (mx, my) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
+                brush_segment_rect(lx, ly, mx, my, radius)
+            }
         }
         ToolKind::Pixel => pixel_line_rect(lx, ly, cx, cy, pixel_size),
         _ => return false,
     };
     st.capture_undo_rect(Some(undo_rect));
-    let layer = match st.doc.active_layer_mut() {
-        Some(l) => l,
-        None => return false,
-    };
-    let clip = st.stroke_paint_clip.as_ref();
-    let dirty = match tool {
-        ToolKind::Brush | ToolKind::Eraser => {
-            let (px, py) = smooth_prev.expect("checked");
-            let (sx, sy) = if smooth_started {
-                ((px + lx) * 0.5, (py + ly) * 0.5)
-            } else {
-                (px, py)
-            };
-            let (ex, ey) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
-            stroke_quadratic_spaced(
-                layer,
-                sx,
-                sy,
-                lx,
-                ly,
-                ex,
-                ey,
-                radius,
-                hardness,
-                paint_color,
-                eraser,
-                clip,
-                &mut next_dab_distance,
-            )
+
+    let dirty = {
+        let AppState {
+            ref mut doc,
+            ref stroke_paint_clip,
+            ref mut brush_stamp_cache,
+            ..
+        } = *st;
+        let Some(layer) = doc.active_layer_mut() else {
+            return false;
+        };
+        let clip = stroke_paint_clip.as_ref();
+        match tool {
+            ToolKind::Brush | ToolKind::Eraser => {
+                if let Some((px, py)) = smooth_prev {
+                    let (sx, sy) = if smooth_started {
+                        ((px + lx) * 0.5, (py + ly) * 0.5)
+                    } else {
+                        (px, py)
+                    };
+                    let (ex, ey) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
+                    stroke_quadratic_spaced_cached(
+                        layer,
+                        sx,
+                        sy,
+                        lx,
+                        ly,
+                        ex,
+                        ey,
+                        radius,
+                        hardness,
+                        paint_color,
+                        eraser,
+                        clip,
+                        &mut next_dab_distance,
+                        brush_stamp_cache,
+                    )
+                } else {
+                    let (mx, my) = ((lx + cx) * 0.5, (ly + cy) * 0.5);
+                    stroke_line_spaced_cached(
+                        layer,
+                        lx,
+                        ly,
+                        mx,
+                        my,
+                        radius,
+                        hardness,
+                        paint_color,
+                        eraser,
+                        clip,
+                        &mut next_dab_distance,
+                        brush_stamp_cache,
+                    )
+                }
+            }
+            ToolKind::Pixel => {
+                stroke_line_square(layer, lx, ly, cx, cy, pixel_size, paint_color, false, clip)
+            }
+            _ => return false,
         }
-        ToolKind::Pixel => {
-            stroke_line_square(layer, lx, ly, cx, cy, pixel_size, paint_color, false, clip)
-        }
-        _ => return false,
     };
     st.stroke_next_dab_distance = next_dab_distance;
     if matches!(tool, ToolKind::Brush | ToolKind::Eraser) {
@@ -3091,7 +3331,7 @@ fn flush_brush_smoothing(st: &mut AppState) -> bool {
     };
     let eraser = st.tool == ToolKind::Eraser;
     let paint_color = if eraser {
-        st.fg
+        [0, 0, 0, 255]
     } else {
         st.active_paint_color()
     };
@@ -3104,27 +3344,58 @@ fn flush_brush_smoothing(st: &mut AppState) -> bool {
     };
     let mut next_dab_distance = st.stroke_next_dab_distance;
     st.capture_undo_rect(Some(brush_segment_rect(sx, sy, lx, ly, radius)));
-    let layer = match st.doc.active_layer_mut() {
-        Some(l) => l,
-        None => return false,
+    let dirty = {
+        let AppState {
+            ref mut doc,
+            ref stroke_paint_clip,
+            ref mut brush_stamp_cache,
+            ..
+        } = *st;
+        let Some(layer) = doc.active_layer_mut() else {
+            return false;
+        };
+        stroke_line_spaced_cached(
+            layer,
+            sx,
+            sy,
+            lx,
+            ly,
+            radius,
+            hardness,
+            paint_color,
+            eraser,
+            stroke_paint_clip.as_ref(),
+            &mut next_dab_distance,
+            brush_stamp_cache,
+        )
     };
-    let dirty = stroke_line_spaced(
-        layer,
-        sx,
-        sy,
-        lx,
-        ly,
-        radius,
-        hardness,
-        paint_color,
-        eraser,
-        st.stroke_paint_clip.as_ref(),
-        &mut next_dab_distance,
-    );
     st.stroke_next_dab_distance = next_dab_distance;
     st.modified = true;
     st.add_stroke_dirty_rect(dirty);
     true
+}
+
+fn finish_brush_stroke(
+    st: &mut AppState,
+    bpt: &RefCell<Option<gtk::TickCallbackId>>,
+    bws: &RefCell<Option<(f64, f64)>>,
+    lbs: &RefCell<Option<(f64, f64)>>,
+) {
+    remove_brush_paint_tick(bpt);
+    flush_brush_smoothing(st);
+    *bws.borrow_mut() = None;
+    *lbs.borrow_mut() = None;
+    // Flush the remaining dirty rect into the composite cache BEFORE ending the stroke so
+    // mouse-up does NOT force a full-canvas recomposite on the next frame!
+    let cache_synced = flush_pending_stroke_composite(st);
+    st.commit_stroke_undo_with_revision(!cache_synced);
+    st.stroke_dirty_rect = None;
+    st.brush_stroke_in_progress = false;
+    st.stroke_next_dab_distance = 0.0;
+    st.stroke_smooth_prev_doc = None;
+    st.stroke_smooth_started = false;
+    st.stroke_paint_clip = None;
+    st.last_doc_pos = None;
 }
 
 fn remove_brush_paint_tick(slot: &RefCell<Option<gtk::TickCallbackId>>) {
@@ -3152,17 +3423,18 @@ fn install_brush_paint_tick(
     let lbs_c = last_brush_widget.clone();
     let bws_c = brush_widget_start.clone();
     let gesture_c = gesture.clone();
+    let slot_c = tick_slot.clone();
     *tick_slot.borrow_mut() = Some(canvas.add_tick_callback(move |_w, _fc| {
         {
             let st = st_c.borrow();
-            if !st.brush_stroke_in_progress {
-                return ControlFlow::Continue;
-            }
-            if !matches!(
-                st.tool,
-                ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel
-            ) {
-                return ControlFlow::Continue;
+            if !st.brush_stroke_in_progress
+                || !matches!(
+                    st.tool,
+                    ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel
+                )
+            {
+                *slot_c.borrow_mut() = None;
+                return ControlFlow::Break;
             }
         }
         let Some((ox, oy)) = gesture_c.offset() else {
@@ -3190,11 +3462,13 @@ fn setup_canvas_input(
     color_preview_da_cell: &ColorPreviewDaCell,
     recent_swatches: &gtk::FlowBox,
     picker_ui_refresh: &PickerUiRefresh,
+    title_cell: &WindowTitleCell,
 ) {
     let brush_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let last_brush_widget: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
     let brush_paint_tick: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
     let move_widget_start: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+    let active_drag_btn: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
     let drag = gtk::GestureDrag::new();
     drag.set_button(0);
@@ -3209,17 +3483,28 @@ fn setup_canvas_input(
     let cb_drag = color_preview_da_cell.clone();
     let recent_drag = recent_swatches.clone();
     let picker_drag = picker_ui_refresh.clone();
+    let tc_begin = title_cell.clone();
+    let adb_begin = active_drag_btn.clone();
     drag.connect_drag_begin(move |gesture, wx, wy| {
         cnv.grab_focus();
-        let mut st = st_drag_begin.borrow_mut();
         let btn = gesture.current_button();
-        st.pointer_drag_button = if btn == 0 { gdk::BUTTON_PRIMARY } else { btn };
+        let eff_btn = if btn == 0 { gdk::BUTTON_PRIMARY } else { btn };
+        // Ignore middle-mouse (and extra buttons) so middle-click panning never paints or fills.
+        if eff_btn != gdk::BUTTON_PRIMARY && eff_btn != gdk::BUTTON_SECONDARY {
+            adb_begin.set(0);
+            return;
+        }
+        adb_begin.set(eff_btn);
+
+        let mut st = st_drag_begin.borrow_mut();
+        st.pointer_drag_button = eff_btn;
         if st.floating.is_some() && st.tool != ToolKind::Move {
             commit_floating(&mut st);
         }
         let (dx, dy) = st.widget_to_doc(wx, wy);
         let mut eyedrop_updated = false;
         let mut start_brush_paint_tick = false;
+        let mut title_dirty = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser => {
                 if st.doc.active_layer_ref().is_none() {
@@ -3232,7 +3517,7 @@ fn setup_canvas_input(
                 };
                 let eraser = st.tool == ToolKind::Eraser;
                 let color = if eraser {
-                    st.fg
+                    [0, 0, 0, 255]
                 } else {
                     st.active_paint_color()
                 };
@@ -3244,17 +3529,33 @@ fn setup_canvas_input(
                 st.stroke_smooth_started = false;
                 st.begin_stroke_undo();
                 st.capture_undo_rect(Some(brush_point_rect(dx, dy, radius)));
-                st.capture_stroke_composite_below();
+                st.ensure_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
-                let held_clip = st.stroke_paint_clip.take();
-                let clip = held_clip.as_ref();
-                let layer = st.doc.active_layer_mut().expect("checked");
-                let dirty = stamp_circle(layer, dx, dy, radius, hardness, color, eraser, clip);
-                st.stroke_paint_clip = held_clip;
+                let dirty = {
+                    let AppState {
+                        ref mut doc,
+                        ref stroke_paint_clip,
+                        ref mut brush_stamp_cache,
+                        ..
+                    } = *st;
+                    let layer = doc.active_layer_mut().expect("checked");
+                    stamp_circle_cached(
+                        layer,
+                        dx,
+                        dy,
+                        radius,
+                        hardness,
+                        color,
+                        eraser,
+                        stroke_paint_clip.as_ref(),
+                        brush_stamp_cache,
+                    )
+                };
                 st.add_stroke_dirty_rect(dirty);
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
+                title_dirty = true;
                 start_brush_paint_tick = true;
             }
             ToolKind::Pixel => {
@@ -3274,17 +3575,30 @@ fn setup_canvas_input(
                 st.stroke_smooth_started = false;
                 st.begin_stroke_undo();
                 st.capture_undo_rect(Some(brush_point_rect(dx, dy, size * 0.5)));
-                st.capture_stroke_composite_below();
+                st.ensure_stroke_composite_below();
                 st.last_doc_pos = Some((dx, dy));
                 *bws.borrow_mut() = Some((wx, wy));
-                let held_clip = st.stroke_paint_clip.take();
-                let clip = held_clip.as_ref();
-                let layer = st.doc.active_layer_mut().expect("checked");
-                let dirty = stamp_square(layer, dx, dy, size, color, false, clip);
-                st.stroke_paint_clip = held_clip;
+                let dirty = {
+                    let AppState {
+                        ref mut doc,
+                        ref stroke_paint_clip,
+                        ..
+                    } = *st;
+                    let layer = doc.active_layer_mut().expect("checked");
+                    stamp_square(
+                        layer,
+                        dx,
+                        dy,
+                        size,
+                        color,
+                        false,
+                        stroke_paint_clip.as_ref(),
+                    )
+                };
                 st.add_stroke_dirty_rect(dirty);
                 *lbs_begin.borrow_mut() = Some((wx, wy));
                 st.modified = true;
+                title_dirty = true;
                 start_brush_paint_tick = true;
             }
             ToolKind::Fill => {
@@ -3297,21 +3611,26 @@ fn setup_canvas_input(
                 } else {
                     None
                 };
-                st.begin_full_undo();
-                if let Some(layer) = st.doc.active_layer_mut() {
-                    let pv = straight_to_premul(&[fg[0], fg[1], fg[2], fg[3]]);
-                    let fill = [pv[0], pv[1], pv[2], pv[3]];
-                    flood_fill(
-                        layer,
-                        dx.floor().clamp(0.0, dw as f64 - 1.0) as u32,
-                        dy.floor().clamp(0.0, dh as f64 - 1.0) as u32,
-                        fill,
-                        tol,
-                        fill_clip.as_ref(),
-                    );
-                    st.modified = true;
+                let xi = dx.floor() as i32;
+                let yi = dy.floor() as i32;
+                if xi >= 0 && yi >= 0 && xi < dw as i32 && yi < dh as i32 {
+                    st.begin_full_undo();
+                    if let Some(layer) = st.doc.active_layer_mut() {
+                        let pv = straight_to_premul(&[fg[0], fg[1], fg[2], fg[3]]);
+                        let fill = [pv[0], pv[1], pv[2], pv[3]];
+                        let _ = flood_fill(
+                            layer,
+                            xi as u32,
+                            yi as u32,
+                            fill,
+                            tol,
+                            fill_clip.as_ref(),
+                        );
+                    }
+                    if st.commit_stroke_undo() {
+                        title_dirty = true;
+                    }
                 }
-                st.commit_stroke_undo();
             }
             ToolKind::Eyedropper => {
                 let cw = st.doc.width;
@@ -3319,26 +3638,30 @@ fn setup_canvas_input(
                 let clen = (cw * ch * 4) as usize;
                 let xi = dx.floor() as i32;
                 let yi = dy.floor() as i32;
-                let c = if st.brush_stroke_in_progress && st.stroke_composite_below_valid() {
+                let sampled = if st.brush_stroke_in_progress && st.below_cache_valid() {
+                    let active = st.below_cache_active_layer;
+                    let has_below = st.below_cache_has_content;
                     let AppState {
                         ref doc,
                         ref mut composite_cache_premul,
-                        ref mut stroke_composite_below,
-                        stroke_composite_active_layer,
+                        ref below_cache_buf,
                         ..
                     } = *st;
-                    let below = stroke_composite_below.take().expect("stroke below");
                     composite_cache_premul.resize(clen, 0);
+                    let below_slice = if has_below {
+                        Some(below_cache_buf.as_slice())
+                    } else {
+                        None
+                    };
                     composite_layers_from_below_region_into(
                         composite_cache_premul,
                         cw,
                         ch,
                         &doc.layers,
-                        stroke_composite_active_layer,
-                        &below,
+                        active,
+                        below_slice,
                         (xi, yi, 1, 1),
                     );
-                    *stroke_composite_below = Some(below);
                     sample_composite_premul(composite_cache_premul, cw, ch, xi, yi)
                 } else if !st.brush_stroke_in_progress
                     && st.composite_cache_at_revision == st.document_visual_revision
@@ -3355,40 +3678,52 @@ fn setup_canvas_input(
                     composite_layers_into(composite_cache_premul, cw, ch, &doc.layers);
                     sample_composite_premul(composite_cache_premul.as_slice(), cw, ch, xi, yi)
                 };
-                if st.pointer_drag_button == gdk::BUTTON_SECONDARY {
-                    st.bg = c;
-                } else {
-                    st.fg = c;
-                    push_recent_color(&mut st, c);
+                if let Some(c) = sampled {
+                    if st.pointer_drag_button == gdk::BUTTON_SECONDARY {
+                        st.bg = c;
+                        st.picker_target = ColorSlot::Right;
+                    } else {
+                        st.fg = c;
+                        st.picker_target = ColorSlot::Left;
+                        push_recent_color(&mut st, c);
+                    }
+                    let (h, _, _) = rgb_bytes_to_hsv(c);
+                    st.picker_hue = h.rem_euclid(1.0);
+                    eyedrop_updated = true;
                 }
-                let (h, _, _) = rgb_bytes_to_hsv(c);
-                st.picker_hue = h.rem_euclid(1.0);
-                eyedrop_updated = true;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
                 st.shape_drag_preview = None;
                 st.drag_start_doc = Some((dx, dy));
             }
             ToolKind::SelectRect => {
+                st.selection = None;
                 st.drag_start_doc = Some((dx, dy));
             }
             ToolKind::MagicSelect => {
                 let dw = st.doc.width;
                 let dh = st.doc.height;
-                if let Some(layer) = st.doc.active_layer_ref() {
-                    let x = dx.floor().clamp(0.0, dw as f64 - 1.0) as u32;
-                    let y = dy.floor().clamp(0.0, dh as f64 - 1.0) as u32;
-                    let (mask, wand_bbox) = flood_select_mask(layer, x, y, st.fill_tolerance);
-                    if mask.iter().any(|&v| v != 0) {
-                        let outline_segments = region_mask_outline_segments(&mask, dw, dh);
-                        st.selection = Some(Selection::Region {
-                            width: dw,
-                            height: dh,
-                            mask,
-                            tight_bbox: wand_bbox,
-                            outline_segments,
-                        });
+                let xi = dx.floor() as i32;
+                let yi = dy.floor() as i32;
+                if xi >= 0 && yi >= 0 && xi < dw as i32 && yi < dh as i32 {
+                    if let Some(layer) = st.doc.active_layer_ref() {
+                        let (mask, wand_bbox) =
+                            flood_select_mask(layer, xi as u32, yi as u32, st.fill_tolerance);
+                        if wand_bbox.is_some() {
+                            let outline_segments = region_mask_outline_segments(&mask, dw, dh);
+                            st.selection = Some(Selection::Region {
+                                width: dw,
+                                height: dh,
+                                mask,
+                                tight_bbox: wand_bbox,
+                                outline_segments,
+                            });
+                        } else {
+                            st.selection = None;
+                        }
                     }
+                } else {
+                    st.selection = None;
                 }
             }
             ToolKind::Hand => {
@@ -3397,11 +3732,11 @@ fn setup_canvas_input(
             }
             ToolKind::Move => {
                 st.floating_drag = None;
-                st.move_grab_doc = None;
                 if let Some(f) = st.floating.clone() {
                     match float_press_at(dx, dy, st.zoom, &f) {
                         FloatPress::Outside => {
                             commit_floating(&mut st);
+                            title_dirty = true;
                         }
                         FloatPress::Rotate => {
                             let (cx, cy) = floating_transform_center(&f);
@@ -3460,12 +3795,13 @@ fn setup_canvas_input(
                                     let before = data.clone();
                                     clear_rect(layer, sx, sy, sw, sh);
                                     st.history.commit_rect_change(li, sx, sy, sw, sh, before);
-                                    st.bump_document_revision();
-                                    st.floating = Some(FloatingSelection::new_pasted(
+                                    st.bump_stack_revision();
+                                    st.floating = Some(FloatingSelection::new_lifted(
                                         sw, sh, data, sx as f64, sy as f64,
                                     ));
                                     st.selection = None;
                                     st.modified = true;
+                                    title_dirty = true;
                                     st.floating_drag = Some(FloatingDrag::Move {
                                         grab_off_x: dx - sx as f64,
                                         grab_off_y: dy - sy as f64,
@@ -3498,12 +3834,13 @@ fn setup_canvas_input(
                                     let before = copy_rect(layer, bx, by, bw, bh);
                                     clear_region_masked_rect(layer, &mask, bx, by, bw, bh);
                                     st.history.commit_rect_change(li, bx, by, bw, bh, before);
-                                    st.bump_document_revision();
-                                    st.floating = Some(FloatingSelection::new_pasted(
+                                    st.bump_stack_revision();
+                                    st.floating = Some(FloatingSelection::new_lifted(
                                         bw, bh, data, bx as f64, by as f64,
                                     ));
                                     st.selection = None;
                                     st.modified = true;
+                                    title_dirty = true;
                                     st.floating_drag = Some(FloatingDrag::Move {
                                         grab_off_x: dx - bx as f64,
                                         grab_off_y: dy - by as f64,
@@ -3517,6 +3854,9 @@ fn setup_canvas_input(
             }
         }
         drop(st);
+        if title_dirty {
+            sync_window_title(&st_drag_begin, &tc_begin);
+        }
         if start_brush_paint_tick {
             install_brush_paint_tick(
                 &cnv,
@@ -3532,38 +3872,32 @@ fn setup_canvas_input(
             if let Some(ref da) = *cb_drag.borrow() {
                 picker_refresh_call(&picker_drag);
                 da.queue_draw();
-                refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &cv_drag, &picker_drag);
+                refresh_recent_swatch_row(&recent_drag, &st_drag_begin, da, &picker_drag);
             }
         }
         queue_canvas(&cv_drag);
-        cnv.queue_draw();
     });
 
     let st_drag_up = state.clone();
-    let drag_coalesce = Rc::new(RefCell::new(false));
-    let cv_co = canvas_cell.clone();
-    let dco = drag_coalesce.clone();
+    let cv_up = canvas_cell.clone();
     let bws_up = brush_widget_start.clone();
     let lbs_up = last_brush_widget.clone();
     let mws_u = move_widget_start.clone();
+    let adb_up = active_drag_btn.clone();
     drag.connect_drag_update(move |_g, ox, oy| {
+        if adb_up.get() == 0 {
+            return;
+        }
         let mut st = st_drag_up.borrow_mut();
+        let mut needs_draw = true;
         match st.tool {
-            ToolKind::Brush | ToolKind::Eraser => {
+            ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel => {
                 let Some((bx, by)) = *bws_up.borrow() else {
                     return;
                 };
                 let cur_wx = bx + ox;
                 let cur_wy = by + oy;
-                paint_brush_drag_sample(&mut st, cur_wx, cur_wy, &lbs_up);
-            }
-            ToolKind::Pixel => {
-                let Some((bx, by)) = *bws_up.borrow() else {
-                    return;
-                };
-                let cur_wx = bx + ox;
-                let cur_wy = by + oy;
-                paint_brush_drag_sample(&mut st, cur_wx, cur_wy, &lbs_up);
+                needs_draw = paint_brush_drag_sample(&mut st, cur_wx, cur_wy, &lbs_up);
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
                 let Some((x0, y0)) = st.drag_start_doc else {
@@ -3571,22 +3905,21 @@ fn setup_canvas_input(
                 };
                 let start_wx = x0 * st.zoom + st.pan_x;
                 let start_wy = y0 * st.zoom + st.pan_y;
-                let cur_wx = start_wx + ox;
-                let cur_wy = start_wy + oy;
-                let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
+                let (cx, cy) = st.widget_to_doc(start_wx + ox, start_wy + oy);
                 st.shape_drag_preview = Some((st.tool, x0, y0, cx, cy));
             }
             ToolKind::SelectRect => {
                 let Some((x0, y0)) = st.drag_start_doc else {
                     return;
                 };
-                let start_wx = x0 * st.zoom + st.pan_x;
-                let start_wy = y0 * st.zoom + st.pan_y;
-                let cur_wx = start_wx + ox;
-                let cur_wy = start_wy + oy;
-                let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
-                let (rx, ry, rw, rh) = AppState::normalize_rect(x0, y0, cx, cy);
-                st.selection = Some(Selection::Rect(rx, ry, rw, rh));
+                if ox.hypot(oy) < 3.0 {
+                    st.selection = None;
+                } else {
+                    let start_wx = x0 * st.zoom + st.pan_x;
+                    let start_wy = y0 * st.zoom + st.pan_y;
+                    let (cx, cy) = st.widget_to_doc(start_wx + ox, start_wy + oy);
+                    st.selection = selection_rect_clipped(x0, y0, cx, cy, st.doc.width, st.doc.height);
+                }
             }
             ToolKind::Hand => {
                 if let Some((px0, py0)) = *bws_up.borrow() {
@@ -3595,14 +3928,10 @@ fn setup_canvas_input(
                 }
             }
             ToolKind::Move => {
-                let wpress = *mws_u.borrow();
-                let px = st.pan_x;
-                let py = st.pan_y;
-                let z = st.zoom;
-                let Some((wpx, wpy)) = wpress else {
+                let Some((wpx, wpy)) = *mws_u.borrow() else {
                     return;
                 };
-                let (cx, cy) = ((wpx + ox - px) / z, (wpy + oy - py) / z);
+                let (cx, cy) = st.widget_to_doc(wpx + ox, wpy + oy);
                 let drag = st.floating_drag;
                 if let (Some(ref mut f), Some(d)) = (&mut st.floating, drag) {
                     match d {
@@ -3634,20 +3963,13 @@ fn setup_canvas_input(
                     }
                 }
             }
-            _ => {}
+            _ => {
+                needs_draw = false;
+            }
         }
         drop(st);
-        if !*dco.borrow() {
-            *dco.borrow_mut() = true;
-            let cv = cv_co.clone();
-            let flg = dco.clone();
-            glib::idle_add_local_once(move || {
-                *flg.borrow_mut() = false;
-                queue_canvas(&cv);
-                if let Some(ref c) = *cv.borrow() {
-                    c.queue_draw();
-                }
-            });
+        if needs_draw {
+            queue_canvas(&cv_up);
         }
     });
 
@@ -3658,22 +3980,18 @@ fn setup_canvas_input(
     let lbs_end = last_brush_widget.clone();
     let bpt_end = brush_paint_tick.clone();
     let mws_e = move_widget_start.clone();
+    let tc_end = title_cell.clone();
+    let adb_end = active_drag_btn.clone();
     drag.connect_drag_end(move |_g, ox, oy| {
+        if adb_end.replace(0) == 0 {
+            return;
+        }
         let mut st = st_drag_end.borrow_mut();
+        let mut title_dirty = false;
         match st.tool {
             ToolKind::Brush | ToolKind::Eraser | ToolKind::Pixel => {
-                remove_brush_paint_tick(bpt_end.as_ref());
-                flush_brush_smoothing(&mut st);
-                *bws_end.borrow_mut() = None;
-                *lbs_end.borrow_mut() = None;
-                st.commit_stroke_undo();
-                st.clear_stroke_composite_below();
-                st.brush_stroke_in_progress = false;
-                st.stroke_next_dab_distance = 0.0;
-                st.stroke_smooth_prev_doc = None;
-                st.stroke_smooth_started = false;
-                st.stroke_paint_clip = None;
-                st.last_doc_pos = None;
+                finish_brush_stroke(&mut st, bpt_end.as_ref(), bws_end.as_ref(), lbs_end.as_ref());
+                title_dirty = true;
             }
             ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => {
                 st.shape_drag_preview = None;
@@ -3685,48 +4003,91 @@ fn setup_canvas_input(
                     };
                     let start_wx = sx * st.zoom + st.pan_x;
                     let start_wy = sy * st.zoom + st.pan_y;
-                    let cur_wx = start_wx + ox;
-                    let cur_wy = start_wy + oy;
-                    let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
+                    let (cx, cy) = st.widget_to_doc(start_wx + ox, start_wy + oy);
                     let tool = st.tool;
                     let color = st.active_paint_color();
                     let filled = st.shape_filled;
                     let r = st.brush_size * 0.5;
                     let h = st.brush_hardness;
-                    st.begin_full_undo();
-                    let layer = match st.doc.active_layer_mut() {
-                        Some(l) => l,
-                        None => return,
-                    };
-                    let clip = shape_clip.as_ref();
-                    match tool {
-                        ToolKind::Line => {
-                            stroke_line(layer, sx, sy, cx, cy, r, h, color, false, clip);
+                    st.begin_stroke_undo();
+                    st.capture_undo_rect(Some(brush_segment_rect(sx, sy, cx, cy, r)));
+                    {
+                        let AppState {
+                            ref mut doc,
+                            ref mut brush_stamp_cache,
+                            ..
+                        } = *st;
+                        if let Some(layer) = doc.active_layer_mut() {
+                            let clip = shape_clip.as_ref();
+                            match tool {
+                                ToolKind::Line => {
+                                    let _ = draw_line_capsule(
+                                        layer,
+                                        sx,
+                                        sy,
+                                        cx,
+                                        cy,
+                                        r,
+                                        h,
+                                        color,
+                                        false,
+                                        clip,
+                                        brush_stamp_cache,
+                                    );
+                                }
+                                ToolKind::Rect => {
+                                    let _ = draw_rect_outline(
+                                        layer,
+                                        sx,
+                                        sy,
+                                        cx,
+                                        cy,
+                                        r,
+                                        h,
+                                        color,
+                                        filled,
+                                        false,
+                                        clip,
+                                        brush_stamp_cache,
+                                    );
+                                }
+                                ToolKind::Ellipse => {
+                                    let _ = draw_ellipse(
+                                        layer,
+                                        sx,
+                                        sy,
+                                        cx,
+                                        cy,
+                                        r,
+                                        h,
+                                        color,
+                                        filled,
+                                        false,
+                                        clip,
+                                        brush_stamp_cache,
+                                    );
+                                }
+                                _ => {}
+                            }
                         }
-                        ToolKind::Rect => {
-                            draw_rect_outline(
-                                layer, sx, sy, cx, cy, r, h, color, filled, false, clip,
-                            );
-                        }
-                        ToolKind::Ellipse => {
-                            draw_ellipse(layer, sx, sy, cx, cy, r, h, color, filled, false, clip);
-                        }
-                        _ => {}
                     }
-                    st.commit_stroke_undo();
-                    st.modified = true;
+                    if st.commit_stroke_undo() {
+                        title_dirty = true;
+                    }
                 }
                 st.drag_start_doc = None;
             }
             ToolKind::SelectRect => {
                 if let Some((sx, sy)) = st.drag_start_doc {
-                    let start_wx = sx * st.zoom + st.pan_x;
-                    let start_wy = sy * st.zoom + st.pan_y;
-                    let cur_wx = start_wx + ox;
-                    let cur_wy = start_wy + oy;
-                    let (cx, cy) = st.widget_to_doc(cur_wx, cur_wy);
-                    let (rx, ry, rw, rh) = AppState::normalize_rect(sx, sy, cx, cy);
-                    st.selection = Some(Selection::Rect(rx, ry, rw, rh));
+                    if ox.hypot(oy) < 3.0 {
+                        st.selection = None;
+                    } else {
+                        let start_wx = sx * st.zoom + st.pan_x;
+                        let start_wy = sy * st.zoom + st.pan_y;
+                        let (cx, cy) = st.widget_to_doc(start_wx + ox, start_wy + oy);
+                        st.selection =
+                            selection_rect_clipped(sx, sy, cx, cy, st.doc.width, st.doc.height);
+                    }
                 }
                 st.drag_start_doc = None;
             }
@@ -3734,17 +4095,55 @@ fn setup_canvas_input(
                 *bws_end.borrow_mut() = None;
             }
             ToolKind::Move => {
-                st.move_grab_doc = None;
                 st.floating_drag = None;
                 st.drag_start_doc = None;
                 *mws_e.borrow_mut() = None;
             }
             _ => {}
         }
+        let tool = st.tool;
         drop(st);
+        if title_dirty {
+            sync_window_title(&st_drag_end, &tc_end);
+        }
+        tool_cursors::sync_canvas_tool_cursor(&cnv3, tool);
         queue_canvas(&cv_drag_end);
-        tool_cursors::sync_canvas_tool_cursor(&cnv3, st_drag_end.borrow().tool);
-        cnv3.queue_draw();
+    });
+
+    // Clean up if GTK cancels the gesture (focus loss, Alt+Tab, popup) so stroke state & tick never leak.
+    let st_cancel = state.clone();
+    let cv_cancel = canvas_cell.clone();
+    let cnv_cancel = canvas.clone();
+    let bws_cancel = brush_widget_start.clone();
+    let lbs_cancel = last_brush_widget.clone();
+    let bpt_cancel = brush_paint_tick.clone();
+    let mws_cancel = move_widget_start.clone();
+    let adb_cancel = active_drag_btn.clone();
+    let tc_cancel = title_cell.clone();
+    drag.connect_cancel(move |_, _| {
+        if adb_cancel.replace(0) == 0 {
+            return;
+        }
+        let mut st = st_cancel.borrow_mut();
+        if st.brush_stroke_in_progress {
+            finish_brush_stroke(
+                &mut st,
+                bpt_cancel.as_ref(),
+                bws_cancel.as_ref(),
+                lbs_cancel.as_ref(),
+            );
+        }
+        st.shape_drag_preview = None;
+        st.drag_start_doc = None;
+        st.floating_drag = None;
+        *bws_cancel.borrow_mut() = None;
+        *lbs_cancel.borrow_mut() = None;
+        *mws_cancel.borrow_mut() = None;
+        let tool = st.tool;
+        drop(st);
+        sync_window_title(&st_cancel, &tc_cancel);
+        tool_cursors::sync_canvas_tool_cursor(&cnv_cancel, tool);
+        queue_canvas(&cv_cancel);
     });
 
     let motion = gtk::EventControllerMotion::new();
@@ -3808,24 +4207,47 @@ fn setup_canvas_input(
     canvas.add_controller(scroll);
 }
 
-fn cut_selection(state: &SharedState) {
+fn cut_selection(state: &SharedState) -> bool {
     let mut st = state.borrow_mut();
+    if let Some(f) = st.floating.take() {
+        st.floating_drag = None;
+        st.floating_surface_cache = None;
+        st.floating_surface_id = None;
+        let (sw, sh, data) = if f.angle_deg.rem_euclid(360.0).abs() < 1e-6
+            && (f.scale_x - 1.0).abs() < 1e-6
+            && (f.scale_y - 1.0).abs() < 1e-6
+            && !f.flip_h
+            && !f.flip_v
+        {
+            (f.w, f.h, f.data)
+        } else if let Some((_, _, rw, rh, buf)) = rasterize_floating_to_premul(&f) {
+            (rw, rh, buf)
+        } else {
+            (f.w, f.h, f.data)
+        };
+        st.clipboard = Some((sw, sh, data.clone()));
+        st.modified = true;
+        drop(st);
+        write_system_clipboard_premul(sw, sh, &data);
+        return true;
+    }
     let Some(sel) = st.selection.clone() else {
-        return;
+        return false;
     };
     let idx = st.doc.active_layer;
     let Some(layer) = st.doc.layers.get_mut(idx) else {
-        return;
+        return false;
     };
     let undo_rect;
     let before;
+    let clip_tuple;
     match sel {
         Selection::Rect(sx, sy, sw, sh) => {
             let data = copy_rect(layer, sx, sy, sw, sh);
             before = data.clone();
             undo_rect = (sx, sy, sw, sh);
             clear_rect(layer, sx, sy, sw, sh);
-            st.clipboard = Some((sw, sh, data));
+            clip_tuple = (sw, sh, data);
         }
         Selection::Region {
             width,
@@ -3838,35 +4260,47 @@ fn cut_selection(state: &SharedState) {
                 || height != layer.height
                 || mask.len() != (width * height) as usize
             {
-                return;
+                return false;
             }
             let Some((bx, by, bw, bh)) =
                 region_tight_bbox_or_hint(&mask, width, height, tight_bbox)
             else {
-                return;
+                return false;
             };
             let data = copy_region_masked(layer, &mask, bx, by, bw, bh);
             before = copy_rect(layer, bx, by, bw, bh);
             undo_rect = (bx, by, bw, bh);
             clear_region_masked_rect(layer, &mask, bx, by, bw, bh);
-            st.clipboard = Some((bw, bh, data));
+            clip_tuple = (bw, bh, data);
         }
     }
+    let (cw, ch, cdata) = clip_tuple;
+    st.clipboard = Some((cw, ch, cdata.clone()));
     let (x, y, w, h) = undo_rect;
     st.history.commit_rect_change(idx, x, y, w, h, before);
     st.selection = None;
     st.modified = true;
-    st.bump_document_revision();
+    st.bump_stack_revision();
+    drop(st);
+    write_system_clipboard_premul(cw, ch, &cdata);
+    true
 }
 
-fn erase_selection(state: &SharedState) {
+fn erase_selection(state: &SharedState) -> bool {
     let mut st = state.borrow_mut();
+    if st.floating.take().is_some() {
+        st.floating_drag = None;
+        st.floating_surface_cache = None;
+        st.floating_surface_id = None;
+        st.modified = true;
+        return true;
+    }
     let Some(sel) = st.selection.clone() else {
-        return;
+        return false;
     };
     let idx = st.doc.active_layer;
     let Some(layer) = st.doc.layers.get_mut(idx) else {
-        return;
+        return false;
     };
     let undo_rect;
     let before;
@@ -3887,12 +4321,12 @@ fn erase_selection(state: &SharedState) {
                 || height != layer.height
                 || mask.len() != (width * height) as usize
             {
-                return;
+                return false;
             }
             let Some((bx, by, bw, bh)) =
                 region_tight_bbox_or_hint(&mask, width, height, tight_bbox)
             else {
-                return;
+                return false;
             };
             before = copy_rect(layer, bx, by, bw, bh);
             undo_rect = (bx, by, bw, bh);
@@ -3903,11 +4337,48 @@ fn erase_selection(state: &SharedState) {
     st.history.commit_rect_change(idx, x, y, w, h, before);
     st.selection = None;
     st.modified = true;
-    st.bump_document_revision();
+    st.bump_stack_revision();
+    true
+}
+
+fn write_system_clipboard_premul(sw: i32, sh: i32, data: &[u8]) {
+    if sw <= 0 || sh <= 0 {
+        return;
+    }
+    let straight = premul_to_straight_rgba(data);
+    let bytes = glib::Bytes::from_owned(straight);
+    let texture = gdk::MemoryTexture::new(
+        sw,
+        sh,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        (sw * 4) as usize,
+    );
+    if let Some(display) = gdk::Display::default() {
+        display.clipboard().set_texture(&texture);
+    }
 }
 
 fn copy_selection(state: &SharedState) {
     let mut st = state.borrow_mut();
+    if let Some(ref f) = st.floating {
+        let (sw, sh, data) = if f.angle_deg.rem_euclid(360.0).abs() < 1e-6
+            && (f.scale_x - 1.0).abs() < 1e-6
+            && (f.scale_y - 1.0).abs() < 1e-6
+            && !f.flip_h
+            && !f.flip_v
+        {
+            (f.w, f.h, f.data.clone())
+        } else if let Some((_, _, rw, rh, buf)) = rasterize_floating_to_premul(f) {
+            (rw, rh, buf)
+        } else {
+            (f.w, f.h, f.data.clone())
+        };
+        st.clipboard = Some((sw, sh, data.clone()));
+        drop(st);
+        write_system_clipboard_premul(sw, sh, &data);
+        return;
+    }
     let Some(sel) = st.selection.clone() else {
         return;
     };
@@ -3942,19 +4413,8 @@ fn copy_selection(state: &SharedState) {
         }
     };
     st.clipboard = Some((sw, sh, data.clone()));
-
-    let straight = premul_to_straight_rgba(&data);
-    let bytes = glib::Bytes::from_owned(straight);
-    let texture = gdk::MemoryTexture::new(
-        sw,
-        sh,
-        gdk::MemoryFormat::R8g8b8a8,
-        &bytes,
-        (sw * 4) as usize,
-    );
-    if let Some(display) = gdk::Display::default() {
-        display.clipboard().set_texture(&texture);
-    }
+    drop(st);
+    write_system_clipboard_premul(sw, sh, &data);
 }
 
 fn paste_clipboard_center(state: &SharedState, tool_dd_cell: &ToolDdCell) {
@@ -4011,6 +4471,7 @@ fn show_paste_oversize_dialog(
     tool_dd_cell: &ToolDdCell,
     canvas_cell: &CanvasCell,
     layers_cell: &LayersCell,
+    title_cell: &WindowTitleCell,
     img_w: u32,
     img_h: u32,
     premul_data: Vec<u8>,
@@ -4076,6 +4537,7 @@ fn show_paste_oversize_dialog(
     let td = tool_dd_cell.clone();
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
+    let tc = title_cell.clone();
     let dw = d.clone();
     expand.connect_clicked(move |_| {
         {
@@ -4084,11 +4546,13 @@ fn show_paste_oversize_dialog(
             let new_h = s.doc.height.max(img_h);
             s.doc.resize_canvas(new_w, new_h);
             s.history.clear();
-            s.bump_document_revision();
+            s.modified = true;
+            s.bump_stack_revision();
         }
         paste_image_data(&st, &td, img_w, img_h, (*data).clone());
+        sync_window_title(&st, &tc);
         zoom_to_fit(&st, &cv);
-        refresh_layers_list(&st, &lc, &cv);
+        refresh_layers_list(&st, &lc, &cv, &tc);
         queue_canvas(&cv);
         dw.close();
     });
@@ -4102,6 +4566,7 @@ fn try_paste_system_clipboard(
     tool_dd_cell: &ToolDdCell,
     canvas_cell: &CanvasCell,
     layers_cell: &LayersCell,
+    title_cell: &WindowTitleCell,
 ) {
     let Some(display) = gdk::Display::default() else {
         paste_clipboard_center(state, tool_dd_cell);
@@ -4115,6 +4580,7 @@ fn try_paste_system_clipboard(
     let td = tool_dd_cell.clone();
     let cv = canvas_cell.clone();
     let lc = layers_cell.clone();
+    let tc = title_cell.clone();
 
     clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| match result {
         Ok(Some(texture)) => {
@@ -4129,7 +4595,7 @@ fn try_paste_system_clipboard(
                     let doc_h = st.borrow().doc.height;
 
                     if iw > doc_w || ih > doc_h {
-                        show_paste_oversize_dialog(&win, &st, &td, &cv, &lc, iw, ih, premul);
+                        show_paste_oversize_dialog(&win, &st, &td, &cv, &lc, &tc, iw, ih, premul);
                     } else {
                         paste_image_data(&st, &td, iw, ih, premul);
                         queue_canvas(&cv);
@@ -4364,61 +4830,62 @@ fn refresh_recent_files_menu(menu: &gio::Menu, state: &AppState, ui_dark: bool) 
 }
 
 fn open_document_from_path(
+    window: &libadwaita::ApplicationWindow,
     path: &Path,
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
     recent_menu: &gio::Menu,
+    title_cell: &WindowTitleCell,
 ) {
     let path_buf = path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn({
-        let path = path_buf.clone();
-        move || {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase());
-            let result = if ext.as_deref() == Some("ora") {
-                Document::load_ora(&path)
-            } else {
-                Document::load_raster_image(&path)
-            };
-            let _ = tx.send(result);
-        }
-    });
+    let path_work = path_buf.clone();
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
     let recent_m = recent_menu.clone();
-    glib::idle_add_local(move || match rx.try_recv() {
-        Ok(Ok(doc)) => {
-            let mut g = st.borrow_mut();
-            g.doc = doc;
-            g.history.clear();
-            g.doc.path = Some(path_buf.clone());
-            g.modified = false;
-            g.selection = None;
-            g.floating = None;
-            g.floating_drag = None;
-            g.shape_drag_preview = None;
-            g.drag_start_doc = None;
-            g.bump_document_revision();
-            crate::settings::record_recent_open(&mut g, path_buf.clone());
-            drop(g);
-            refresh_recent_files_menu(&recent_m, &st.borrow(), menu_ui_dark());
-            zoom_to_fit(&st, &cv);
-            refresh_layers_list(&st, &lc, &cv);
-            queue_canvas(&cv);
-            glib::ControlFlow::Break
-        }
-        Ok(Err(e)) => {
-            eprintln!("Open failed: {e}");
-            glib::ControlFlow::Break
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-    });
+    let tc = title_cell.clone();
+    let win = window.clone();
+    spawn_background_task(
+        move || {
+            let is_ora = path_work
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("ora"));
+            if is_ora {
+                Document::load_ora(&path_work)
+            } else {
+                Document::load_raster_image(&path_work)
+            }
+        },
+        move |res| match res {
+            Ok(doc) => {
+                let mut g = st.borrow_mut();
+                g.doc = doc;
+                g.history.clear();
+                g.doc.path = Some(path_buf.clone());
+                g.modified = false;
+                g.selection = None;
+                g.floating = None;
+                g.floating_drag = None;
+                g.floating_surface_cache = None;
+                g.floating_surface_id = None;
+                g.shape_drag_preview = None;
+                g.drag_start_doc = None;
+                g.bump_stack_revision();
+                crate::settings::record_recent_open(&mut g, path_buf.clone());
+                drop(g);
+                refresh_recent_files_menu(&recent_m, &st.borrow(), menu_ui_dark());
+                sync_window_title(&st, &tc);
+                zoom_to_fit(&st, &cv);
+                refresh_layers_list(&st, &lc, &cv, &tc);
+                queue_canvas(&cv);
+            }
+            Err(e) => {
+                show_simple_alert(&win, "Open failed", &format!("{e:#}"));
+            }
+        },
+    );
 }
 
 fn open_file(
@@ -4427,6 +4894,7 @@ fn open_file(
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
     recent_menu: &gio::Menu,
+    title_cell: &WindowTitleCell,
 ) {
     let all_filter = gtk::FileFilter::new();
     all_filter.set_name(Some("All supported images"));
@@ -4472,17 +4940,36 @@ fn open_file(
     let lc = layers_cell.clone();
     let cv = canvas.clone();
     let recent_m = recent_menu.clone();
+    let tc = title_cell.clone();
+    let win = window.clone();
     dlg.open(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
             if let Some(path) = file.path() {
-                open_document_from_path(&path, &st, &lc, &cv, &recent_m);
+                open_document_from_path(&win, &path, &st, &lc, &cv, &recent_m, &tc);
             }
         }
     });
 }
 
+fn save_doc_to_path_sync(doc: &Document, path: &Path) -> anyhow::Result<()> {
+    let is_ora = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ora"));
+    if is_ora {
+        doc.save_ora(path)
+    } else {
+        doc.save_raster_image(path)
+    }
+}
+
 /// Save to the document's current path on a worker thread. Returns `false` if there is no path.
-fn start_save_to_current_path(state: &SharedState, canvas: &CanvasCell) -> bool {
+fn start_save_to_current_path(
+    window: &libadwaita::ApplicationWindow,
+    state: &SharedState,
+    canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
+) -> bool {
     let (path, doc) = {
         let g = state.borrow();
         let Some(path) = g.doc.path.clone() else {
@@ -4490,79 +4977,67 @@ fn start_save_to_current_path(state: &SharedState, canvas: &CanvasCell) -> bool 
         };
         (path, g.doc.clone())
     };
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = match path.extension().and_then(|e| e.to_str()) {
-            Some("ora") => doc.save_ora(&path),
-            _ => doc.save_png(&path),
-        };
-        let _ = tx.send(result);
-    });
     let st = state.clone();
     let cv = canvas.clone();
-    glib::idle_add_local(move || match rx.try_recv() {
-        Ok(Ok(())) => {
-            st.borrow_mut().modified = false;
-            queue_canvas(&cv);
-            glib::ControlFlow::Break
-        }
-        Ok(Err(e)) => {
-            eprintln!("Save failed: {e}");
-            glib::ControlFlow::Break
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-    });
+    let tc = title_cell.clone();
+    let win = window.clone();
+    spawn_background_task(
+        move || save_doc_to_path_sync(&doc, &path),
+        move |res| match res {
+            Ok(()) => {
+                st.borrow_mut().modified = false;
+                sync_window_title(&st, &tc);
+                queue_canvas(&cv);
+            }
+            Err(e) => {
+                show_simple_alert(&win, "Save failed", &format!("{e:#}"));
+            }
+        },
+    );
     true
 }
 
 fn save_document_to_path_async(
+    window: &libadwaita::ApplicationWindow,
     path: PathBuf,
     state: &SharedState,
     canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
     on_success: Option<Rc<dyn Fn()>>,
 ) {
     let doc = state.borrow().doc.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn({
-        let path = path.clone();
-        move || {
-            let result = match path.extension().and_then(|e| e.to_str()) {
-                Some("ora") => doc.save_ora(&path),
-                _ => doc.save_png(&path),
-            };
-            let _ = tx.send(result);
-        }
-    });
+    let path_work = path.clone();
     let st = state.clone();
     let cv = canvas.clone();
-    glib::idle_add_local(move || match rx.try_recv() {
-        Ok(Ok(())) => {
-            {
-                let mut g = st.borrow_mut();
-                g.doc.path = Some(path.clone());
-                g.modified = false;
+    let tc = title_cell.clone();
+    let win = window.clone();
+    spawn_background_task(
+        move || save_doc_to_path_sync(&doc, &path_work),
+        move |res| match res {
+            Ok(()) => {
+                {
+                    let mut g = st.borrow_mut();
+                    g.doc.path = Some(path.clone());
+                    g.modified = false;
+                }
+                sync_window_title(&st, &tc);
+                if let Some(cb) = &on_success {
+                    cb();
+                }
+                queue_canvas(&cv);
             }
-            if let Some(cb) = &on_success {
-                cb();
+            Err(e) => {
+                show_simple_alert(&win, "Save failed", &format!("{e:#}"));
             }
-            queue_canvas(&cv);
-            glib::ControlFlow::Break
-        }
-        Ok(Err(e)) => {
-            eprintln!("Save failed: {e}");
-            glib::ControlFlow::Break
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-    });
+        },
+    );
 }
 
 fn save_file_as(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
-    layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
     on_success: Option<Rc<dyn Fn()>>,
 ) {
     let png_filter = gtk::FileFilter::new();
@@ -4571,14 +5046,28 @@ fn save_file_as(
     let ora_filter = gtk::FileFilter::new();
     ora_filter.set_name(Some("OpenRaster (*.ora)"));
     ora_filter.add_pattern("*.ora");
+    let jpeg_filter = gtk::FileFilter::new();
+    jpeg_filter.set_name(Some("JPEG image (*.jpg)"));
+    jpeg_filter.add_pattern("*.jpg");
+    jpeg_filter.add_pattern("*.jpeg");
 
     let filters = gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&png_filter);
     filters.append(&ora_filter);
+    filters.append(&jpeg_filter);
 
-    let initial_folder = {
+    let (initial_folder, initial_name) = {
         let g = state.borrow();
-        file_dialog_initial_folder(g.doc.path.as_deref(), &g.recent_files)
+        let folder = file_dialog_initial_folder(g.doc.path.as_deref(), &g.recent_files);
+        let name = g
+            .doc
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "untitled.png".to_string());
+        (folder, name)
     };
     let dlg = gtk::FileDialog::builder()
         .title("Save image")
@@ -4586,10 +5075,12 @@ fn save_file_as(
         .filters(&filters)
         .default_filter(&png_filter)
         .initial_folder(&initial_folder)
+        .initial_name(&initial_name)
         .build();
     let st = state.clone();
     let cv = canvas.clone();
-    let _lc = layers_cell.clone();
+    let tc = title_cell.clone();
+    let win = window.clone();
     let on_ok = on_success.clone();
     dlg.save(Some(window), None::<&gio::Cancellable>, move |res| {
         if let Ok(file) = res {
@@ -4597,7 +5088,7 @@ fn save_file_as(
                 if path.extension().is_none() {
                     path.set_extension("png");
                 }
-                save_document_to_path_async(path, &st, &cv, on_ok.clone());
+                save_document_to_path_async(&win, path, &st, &cv, &tc, on_ok.clone());
             }
         }
     });
@@ -4606,13 +5097,13 @@ fn save_file_as(
 fn save_file(
     window: &libadwaita::ApplicationWindow,
     state: &SharedState,
-    layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
 ) {
     if state.borrow().doc.path.is_some() {
-        let _ = start_save_to_current_path(state, canvas);
+        let _ = start_save_to_current_path(window, state, canvas, title_cell);
     } else {
-        save_file_as(window, state, layers_cell, canvas, None);
+        save_file_as(window, state, canvas, title_cell, None);
     }
 }
 
@@ -4621,6 +5112,7 @@ fn new_document_dialog(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
 ) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
@@ -4649,6 +5141,7 @@ fn new_document_dialog(
     bx.append(&h_spin);
 
     let ok = gtk::Button::with_label("Create");
+    ok.add_css_class("suggested-action");
     let cancel = gtk::Button::with_label("Cancel");
     let btn_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -4664,6 +5157,7 @@ fn new_document_dialog(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let dw = d.clone();
     ok.connect_clicked(move |_| {
         let w = w_adj.value() as u32;
@@ -4674,13 +5168,16 @@ fn new_document_dialog(
         g.selection = None;
         g.floating = None;
         g.floating_drag = None;
+        g.floating_surface_cache = None;
+        g.floating_surface_id = None;
         g.shape_drag_preview = None;
         g.drag_start_doc = None;
         g.modified = false;
-        g.bump_document_revision();
+        g.bump_stack_revision();
         drop(g);
+        sync_window_title(&st, &tc);
         zoom_to_fit(&st, &cv);
-        refresh_layers_list(&st, &lc, &cv);
+        refresh_layers_list(&st, &lc, &cv, &tc);
         queue_canvas(&cv);
         dw.close();
     });
@@ -4696,12 +5193,14 @@ fn refresh_after_canvas_change(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
     zoom_fit: bool,
 ) {
     if zoom_fit {
         zoom_to_fit(state, canvas);
     }
-    refresh_layers_list(state, layers_cell, canvas);
+    sync_window_title(state, title_cell);
+    refresh_layers_list(state, layers_cell, canvas, title_cell);
     queue_canvas(canvas);
 }
 
@@ -4711,10 +5210,9 @@ fn finalize_canvas_geometry_change(g: &mut AppState) {
     g.shape_drag_preview = None;
     g.drag_start_doc = None;
     g.last_doc_pos = None;
-    g.move_grab_doc = None;
     g.floating_drag = None;
     g.modified = true;
-    g.bump_document_revision();
+    g.bump_stack_revision();
 }
 
 fn canvas_resize_dialog(
@@ -4722,6 +5220,7 @@ fn canvas_resize_dialog(
     state: &SharedState,
     layers_cell: &LayersCell,
     canvas: &CanvasCell,
+    title_cell: &WindowTitleCell,
 ) {
     let d = libadwaita::Window::builder()
         .transient_for(window)
@@ -4770,6 +5269,7 @@ fn canvas_resize_dialog(
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let dw = d.clone();
     ok.connect_clicked(move |_| {
         let nw = w_adj.value() as u32;
@@ -4783,9 +5283,9 @@ fn canvas_resize_dialog(
         }
         drop(g);
         if resized {
-            refresh_after_canvas_change(&st, &lc, &cv, true);
+            refresh_after_canvas_change(&st, &lc, &cv, &tc, true);
         } else {
-            refresh_layers_list(&st, &lc, &cv);
+            refresh_layers_list(&st, &lc, &cv, &tc);
             queue_canvas(&cv);
         }
         dw.close();
@@ -5020,6 +5520,17 @@ fn keybinds_dialog(
     d.present();
 }
 
+fn window_focus_is_editable(window: &libadwaita::ApplicationWindow) -> bool {
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {
+        return false;
+    };
+    focus.is::<gtk::Editable>()
+        || focus.is::<gtk::Text>()
+        || focus.is::<gtk::Entry>()
+        || focus.is::<gtk::SpinButton>()
+        || focus.is::<gtk::TextView>()
+}
+
 fn build_ui(app: &Application) {
     let window = libadwaita::ApplicationWindow::builder()
         .application(app)
@@ -5039,14 +5550,11 @@ fn build_ui(app: &Application) {
     let recent_files_menu = Rc::new(gio::Menu::new());
     refresh_recent_files_menu(&recent_files_menu, &state.borrow(), menu_ui_dark());
 
-    let st_shutdown = state.clone();
-    app.connect_shutdown(move |_| {
-        crate::settings::persist(&st_shutdown.borrow());
-    });
     let canvas_cell: CanvasCell = Rc::new(RefCell::new(None));
     let layers_cell: LayersCell = Rc::new(RefCell::new(None));
     let color_preview_da_cell: ColorPreviewDaCell = Rc::new(RefCell::new(None));
     let tool_dd_cell: ToolDdCell = Rc::new(RefCell::new(None));
+    let title_cell: WindowTitleCell = Rc::new(RefCell::new(None));
 
     let drawing_area = gtk::DrawingArea::new();
     drawing_area.add_css_class("canvas-chrome");
@@ -5060,8 +5568,6 @@ fn build_ui(app: &Application) {
     drawing_area.set_draw_func(move |_area, cr, w, h| {
         draw_canvas(&st_draw, cr, w, h);
     });
-
-    let tick_slot: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
 
     let recent_colors_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -5128,38 +5634,44 @@ fn build_ui(app: &Application) {
             };
             (st.picker_hue, c)
         };
-        let w = w as i32;
-        let h = h as i32;
-        if w <= 0 || h <= 0 {
-            return;
-        }
-        for py in 0..h {
-            let v = 1.0 - (py as f64 + 0.5) / h as f64;
-            for px in 0..w {
-                let s = (px as f64 + 0.5) / w as f64;
-                let (r, g, b) = hsv_to_rgb01(hh, s, v);
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(px as f64, py as f64, 1.0, 1.0);
-                let _ = cr.fill();
-            }
-        }
         let wf = w as f64;
         let hf = h as f64;
+        if wf <= 0.0 || hf <= 0.0 {
+            return;
+        }
+        // Exact HSV SV plane in 2 Cairo linear gradients:
+        // 1) Horizontal: white (s=0) -> pure hue (s=1)
+        // 2) Vertical overlay: transparent black (v=1) -> opaque black (v=0)
+        let (hr, hg, hb) = hsv_to_rgb01(hh, 1.0, 1.0);
+        let hgrad = gtk::cairo::LinearGradient::new(0.0, 0.0, wf, 0.0);
+        hgrad.add_color_stop_rgb(0.0, 1.0, 1.0, 1.0);
+        hgrad.add_color_stop_rgb(1.0, hr, hg, hb);
+        let _ = cr.set_source(&hgrad);
+        cr.rectangle(0.0, 0.0, wf, hf);
+        let _ = cr.fill();
+
+        let vgrad = gtk::cairo::LinearGradient::new(0.0, 0.0, 0.0, hf);
+        vgrad.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.0);
+        vgrad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 1.0);
+        let _ = cr.set_source(&vgrad);
+        cr.rectangle(0.0, 0.0, wf, hf);
+        let _ = cr.fill();
+
         let (ms, mv) = sv_on_hue_plane_for_rgb(hh, c);
         let cx = (ms * wf).clamp(0.0, wf);
         let cy = ((1.0 - mv) * hf).clamp(0.0, hf);
         const PI: f64 = std::f64::consts::PI;
         let rad = 3.5;
-        cr.set_line_width(1.0);
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
-        cr.arc(cx, cy, rad + 0.5, 0.0, 2.0 * PI);
+        cr.set_line_width(1.25);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.65);
+        cr.arc(cx, cy, rad + 0.75, 0.0, 2.0 * PI);
         let _ = cr.stroke();
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
         cr.arc(cx, cy, rad, 0.0, 2.0 * PI);
         let _ = cr.stroke();
     });
 
-    let fg_bg_da = make_fg_bg_selector(&state, &canvas_cell, &sv_da, &picker_ui_refresh);
+    let fg_bg_da = make_fg_bg_selector(&state, &sv_da, &picker_ui_refresh);
     *color_preview_da_cell.borrow_mut() = Some(fg_bg_da.clone());
 
     let da_h = make_picker_track(
@@ -5167,32 +5679,56 @@ fn build_ui(app: &Application) {
         &state,
         &picker_hue_adj,
         &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
     );
     let da_s = make_picker_track(
         PickerTrackKind::Sat,
         &state,
         &picker_sat_adj,
         &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
     );
     let da_v = make_picker_track(
         PickerTrackKind::Val,
         &state,
         &picker_val_adj,
         &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
     );
-    let da_r = make_picker_track(PickerTrackKind::Red, &state, &picker_r_adj, &picker_tracks);
+    let da_r = make_picker_track(
+        PickerTrackKind::Red,
+        &state,
+        &picker_r_adj,
+        &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
+    );
     let da_g = make_picker_track(
         PickerTrackKind::Green,
         &state,
         &picker_g_adj,
         &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
     );
-    let da_b = make_picker_track(PickerTrackKind::Blue, &state, &picker_b_adj, &picker_tracks);
+    let da_b = make_picker_track(
+        PickerTrackKind::Blue,
+        &state,
+        &picker_b_adj,
+        &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
+    );
     let da_a = make_picker_track(
         PickerTrackKind::Alpha,
         &state,
         &picker_a_adj,
         &picker_tracks,
+        &picker_ui_refresh,
+        &fg_bg_da,
     );
 
     let spin_h = gtk::SpinButton::new(Some(&picker_hue_adj), 1.0, 0);
@@ -5278,441 +5814,6 @@ fn build_ui(app: &Application) {
         val_core.set_value((adj.value() / 100.0).clamp(0.0, 1.0));
     });
 
-    let st_hue = state.clone();
-    let sv_hue = sv_da.clone();
-    let fg_hue = fg_bg_da.clone();
-    let cv_hue = canvas_cell.clone();
-    let sup_hue = hue_suppress.clone();
-    let ps_hue = picker_suppress.clone();
-    let hue_adj_h = picker_hue_adj.clone();
-    let sat_h = picker_sat_adj.clone();
-    let val_h = picker_val_adj.clone();
-    let rh = picker_r_adj.clone();
-    let gh = picker_g_adj.clone();
-    let bh = picker_b_adj.clone();
-    let ah = picker_a_adj.clone();
-    let sd_h = picker_s_disp_adj.clone();
-    let vd_h = picker_v_disp_adj.clone();
-    let tr_h = picker_tracks.clone();
-    let hex_h = hex_entry.clone();
-    picker_hue_adj.connect_value_changed(move |adj| {
-        if sup_hue.get() {
-            return;
-        }
-        let mut g = st_hue.borrow_mut();
-        g.picker_hue = adj.value() / 360.0;
-        let slot = g.picker_target;
-        let s = sat_h.value().clamp(0.0, 1.0);
-        let v = val_h.value().clamp(0.0, 1.0);
-        let rgb = hsv_to_rgb01(g.picker_hue, s, v);
-        let a = ah.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(&mut g, slot, rgb, a);
-        drop(g);
-        sync_picker_from_target_color(
-            &st_hue,
-            sup_hue.as_ref(),
-            ps_hue.as_ref(),
-            &hue_adj_h,
-            &sat_h,
-            &val_h,
-            &rh,
-            &gh,
-            &bh,
-            &ah,
-            &sd_h,
-            &vd_h,
-            &hex_h,
-            &tr_h,
-            &sv_hue,
-        );
-        fg_hue.queue_draw();
-        queue_canvas(&cv_hue);
-    });
-
-    let st_s = state.clone();
-    let ps_s = picker_suppress.clone();
-    let sup_s = hue_suppress.clone();
-    let sv_s = sv_da.clone();
-    let fg_s = fg_bg_da.clone();
-    let cv_s = canvas_cell.clone();
-    let sat_a = picker_sat_adj.clone();
-    let val_a = picker_val_adj.clone();
-    let hue_a = picker_hue_adj.clone();
-    let r_s = picker_r_adj.clone();
-    let g_s = picker_g_adj.clone();
-    let b_s = picker_b_adj.clone();
-    let a_s = picker_a_adj.clone();
-    let sd_s = picker_s_disp_adj.clone();
-    let vd_s = picker_v_disp_adj.clone();
-    let tr_s = picker_tracks.clone();
-    let hex_s = hex_entry.clone();
-    picker_sat_adj.connect_value_changed(move |adj| {
-        if ps_s.get() {
-            return;
-        }
-        let mut g = st_s.borrow_mut();
-        let h = g.picker_hue;
-        let slot = g.picker_target;
-        let s = adj.value().clamp(0.0, 1.0);
-        let v = val_a.value().clamp(0.0, 1.0);
-        let rgb = hsv_to_rgb01(h, s, v);
-        let a = a_s.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(&mut g, slot, rgb, a);
-        drop(g);
-        sync_picker_from_target_color(
-            &st_s,
-            sup_s.as_ref(),
-            ps_s.as_ref(),
-            &hue_a,
-            &sat_a,
-            &val_a,
-            &r_s,
-            &g_s,
-            &b_s,
-            &a_s,
-            &sd_s,
-            &vd_s,
-            &hex_s,
-            &tr_s,
-            &sv_s,
-        );
-        fg_s.queue_draw();
-        queue_canvas(&cv_s);
-    });
-
-    let st_v = state.clone();
-    let ps_v = picker_suppress.clone();
-    let sup_v = hue_suppress.clone();
-    let sv_v = sv_da.clone();
-    let fg_v = fg_bg_da.clone();
-    let cv_v = canvas_cell.clone();
-    let sat_av = picker_sat_adj.clone();
-    let val_av = picker_val_adj.clone();
-    let hue_av = picker_hue_adj.clone();
-    let r_v = picker_r_adj.clone();
-    let g_v = picker_g_adj.clone();
-    let b_v = picker_b_adj.clone();
-    let a_v = picker_a_adj.clone();
-    let sd_v = picker_s_disp_adj.clone();
-    let vd_v = picker_v_disp_adj.clone();
-    let tr_v = picker_tracks.clone();
-    let hex_v = hex_entry.clone();
-    picker_val_adj.connect_value_changed(move |adj| {
-        if ps_v.get() {
-            return;
-        }
-        let mut g = st_v.borrow_mut();
-        let h = g.picker_hue;
-        let slot = g.picker_target;
-        let s = sat_av.value().clamp(0.0, 1.0);
-        let v = adj.value().clamp(0.0, 1.0);
-        let rgb = hsv_to_rgb01(h, s, v);
-        let a = a_v.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(&mut g, slot, rgb, a);
-        drop(g);
-        sync_picker_from_target_color(
-            &st_v,
-            sup_v.as_ref(),
-            ps_v.as_ref(),
-            &hue_av,
-            &sat_av,
-            &val_av,
-            &r_v,
-            &g_v,
-            &b_v,
-            &a_v,
-            &sd_v,
-            &vd_v,
-            &hex_v,
-            &tr_v,
-            &sv_v,
-        );
-        fg_v.queue_draw();
-        queue_canvas(&cv_v);
-    });
-
-    let st_r = state.clone();
-    let ps_r = picker_suppress.clone();
-    let sup_r = hue_suppress.clone();
-    let sv_r = sv_da.clone();
-    let fg_r = fg_bg_da.clone();
-    let cv_r = canvas_cell.clone();
-    let r_ar = picker_r_adj.clone();
-    let g_ar = picker_g_adj.clone();
-    let b_ar = picker_b_adj.clone();
-    let sat_ar = picker_sat_adj.clone();
-    let val_ar = picker_val_adj.clone();
-    let hue_ar = picker_hue_adj.clone();
-    let a_r = picker_a_adj.clone();
-    let sd_r = picker_s_disp_adj.clone();
-    let vd_r = picker_v_disp_adj.clone();
-    let tr_r = picker_tracks.clone();
-    let hex_r = hex_entry.clone();
-    picker_r_adj.connect_value_changed(move |adj| {
-        if ps_r.get() {
-            return;
-        }
-        let mut g = st_r.borrow_mut();
-        let slot = g.picker_target;
-        let r = adj.value().round().clamp(0.0, 255.0) as u8;
-        let gg = g_ar.value().round().clamp(0.0, 255.0) as u8;
-        let bb = b_ar.value().round().clamp(0.0, 255.0) as u8;
-        let aa = a_r.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(
-            &mut g,
-            slot,
-            (r as f64 / 255.0, gg as f64 / 255.0, bb as f64 / 255.0),
-            aa,
-        );
-        drop(g);
-        sync_picker_from_target_color(
-            &st_r,
-            sup_r.as_ref(),
-            ps_r.as_ref(),
-            &hue_ar,
-            &sat_ar,
-            &val_ar,
-            &r_ar,
-            &g_ar,
-            &b_ar,
-            &a_r,
-            &sd_r,
-            &vd_r,
-            &hex_r,
-            &tr_r,
-            &sv_r,
-        );
-        fg_r.queue_draw();
-        queue_canvas(&cv_r);
-    });
-
-    let st_g = state.clone();
-    let ps_g = picker_suppress.clone();
-    let sup_g = hue_suppress.clone();
-    let sv_gm = sv_da.clone();
-    let fg_g = fg_bg_da.clone();
-    let cv_g = canvas_cell.clone();
-    let r_ag = picker_r_adj.clone();
-    let g_ag = picker_g_adj.clone();
-    let b_ag = picker_b_adj.clone();
-    let sat_ag = picker_sat_adj.clone();
-    let val_ag = picker_val_adj.clone();
-    let hue_ag = picker_hue_adj.clone();
-    let a_g = picker_a_adj.clone();
-    let sd_g = picker_s_disp_adj.clone();
-    let vd_g = picker_v_disp_adj.clone();
-    let tr_g = picker_tracks.clone();
-    let hex_g = hex_entry.clone();
-    picker_g_adj.connect_value_changed(move |adj| {
-        if ps_g.get() {
-            return;
-        }
-        let mut g = st_g.borrow_mut();
-        let slot = g.picker_target;
-        let r = r_ag.value().round().clamp(0.0, 255.0) as u8;
-        let gg = adj.value().round().clamp(0.0, 255.0) as u8;
-        let bb = b_ag.value().round().clamp(0.0, 255.0) as u8;
-        let aa = a_g.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(
-            &mut g,
-            slot,
-            (r as f64 / 255.0, gg as f64 / 255.0, bb as f64 / 255.0),
-            aa,
-        );
-        drop(g);
-        sync_picker_from_target_color(
-            &st_g,
-            sup_g.as_ref(),
-            ps_g.as_ref(),
-            &hue_ag,
-            &sat_ag,
-            &val_ag,
-            &r_ag,
-            &g_ag,
-            &b_ag,
-            &a_g,
-            &sd_g,
-            &vd_g,
-            &hex_g,
-            &tr_g,
-            &sv_gm,
-        );
-        fg_g.queue_draw();
-        queue_canvas(&cv_g);
-    });
-
-    let st_b = state.clone();
-    let ps_b = picker_suppress.clone();
-    let sup_b = hue_suppress.clone();
-    let sv_b = sv_da.clone();
-    let fg_b = fg_bg_da.clone();
-    let cv_b = canvas_cell.clone();
-    let r_ab = picker_r_adj.clone();
-    let g_ab = picker_g_adj.clone();
-    let b_ab = picker_b_adj.clone();
-    let sat_ab = picker_sat_adj.clone();
-    let val_ab = picker_val_adj.clone();
-    let hue_ab = picker_hue_adj.clone();
-    let a_b = picker_a_adj.clone();
-    let sd_b = picker_s_disp_adj.clone();
-    let vd_b = picker_v_disp_adj.clone();
-    let tr_b = picker_tracks.clone();
-    let hex_b = hex_entry.clone();
-    picker_b_adj.connect_value_changed(move |adj| {
-        if ps_b.get() {
-            return;
-        }
-        let mut g = st_b.borrow_mut();
-        let slot = g.picker_target;
-        let r = r_ab.value().round().clamp(0.0, 255.0) as u8;
-        let gg = g_ab.value().round().clamp(0.0, 255.0) as u8;
-        let bb = adj.value().round().clamp(0.0, 255.0) as u8;
-        let aa = a_b.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(
-            &mut g,
-            slot,
-            (r as f64 / 255.0, gg as f64 / 255.0, bb as f64 / 255.0),
-            aa,
-        );
-        drop(g);
-        sync_picker_from_target_color(
-            &st_b,
-            sup_b.as_ref(),
-            ps_b.as_ref(),
-            &hue_ab,
-            &sat_ab,
-            &val_ab,
-            &r_ab,
-            &g_ab,
-            &b_ab,
-            &a_b,
-            &sd_b,
-            &vd_b,
-            &hex_b,
-            &tr_b,
-            &sv_b,
-        );
-        fg_b.queue_draw();
-        queue_canvas(&cv_b);
-    });
-
-    let st_alph = state.clone();
-    let ps_alph = picker_suppress.clone();
-    let sup_alph = hue_suppress.clone();
-    let sv_alph = sv_da.clone();
-    let fg_alph = fg_bg_da.clone();
-    let cv_alph = canvas_cell.clone();
-    let hue_alph = picker_hue_adj.clone();
-    let sat_alph = picker_sat_adj.clone();
-    let val_alph = picker_val_adj.clone();
-    let r_alph = picker_r_adj.clone();
-    let g_alph = picker_g_adj.clone();
-    let b_alph = picker_b_adj.clone();
-    let a_alph = picker_a_adj.clone();
-    let sd_alph = picker_s_disp_adj.clone();
-    let vd_alph = picker_v_disp_adj.clone();
-    let tr_alph = picker_tracks.clone();
-    let hex_alph = hex_entry.clone();
-    picker_a_adj.connect_value_changed(move |adj| {
-        if ps_alph.get() {
-            return;
-        }
-        let mut g = st_alph.borrow_mut();
-        let slot = g.picker_target;
-        let (r0, g0, b0) = match slot {
-            ColorSlot::Left => (g.fg[0], g.fg[1], g.fg[2]),
-            ColorSlot::Right => (g.bg[0], g.bg[1], g.bg[2]),
-        };
-        let rgb = (r0 as f64 / 255.0, g0 as f64 / 255.0, b0 as f64 / 255.0);
-        let aa = adj.value().round().clamp(0.0, 255.0) as u8;
-        write_slot_rgb_a(&mut g, slot, rgb, aa);
-        drop(g);
-        sync_picker_from_target_color(
-            &st_alph,
-            sup_alph.as_ref(),
-            ps_alph.as_ref(),
-            &hue_alph,
-            &sat_alph,
-            &val_alph,
-            &r_alph,
-            &g_alph,
-            &b_alph,
-            &a_alph,
-            &sd_alph,
-            &vd_alph,
-            &hex_alph,
-            &tr_alph,
-            &sv_alph,
-        );
-        fg_alph.queue_draw();
-        queue_canvas(&cv_alph);
-    });
-
-    let st_hex = state.clone();
-    let sup_hex = hue_suppress.clone();
-    let ps_hex = picker_suppress.clone();
-    let sv_hex = sv_da.clone();
-    let fg_hex = fg_bg_da.clone();
-    let cv_hex = canvas_cell.clone();
-    let ha = picker_hue_adj.clone();
-    let sa = picker_sat_adj.clone();
-    let va = picker_val_adj.clone();
-    let ra = picker_r_adj.clone();
-    let ga = picker_g_adj.clone();
-    let ba = picker_b_adj.clone();
-    let aa_hex = picker_a_adj.clone();
-    let sd_hex = picker_s_disp_adj.clone();
-    let vd_hex = picker_v_disp_adj.clone();
-    let tr_hex = picker_tracks.clone();
-    let hex_e = hex_entry.clone();
-    hex_entry.connect_activate(move |e| {
-        let t = e.text().to_string();
-        let trimmed = t.trim();
-        let Some(mut rgba) = palette::parse_hex_color_input(trimmed) else {
-            return;
-        };
-        let hex_digits: String = trimmed
-            .trim_start_matches('#')
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-        let use_parsed_alpha = hex_digits.len() == 8;
-        let mut g = st_hex.borrow_mut();
-        let slot = g.picker_target;
-        if !use_parsed_alpha {
-            rgba[3] = aa_hex.value().round().clamp(0.0, 255.0) as u8;
-        }
-        match slot {
-            ColorSlot::Left => {
-                g.fg = rgba;
-                push_recent_color(&mut g, rgba);
-            }
-            ColorSlot::Right => g.bg = rgba,
-        }
-        let (h, _, _) = rgb_bytes_to_hsv(rgba);
-        g.picker_hue = h.rem_euclid(1.0);
-        drop(g);
-        sync_picker_from_target_color(
-            &st_hex,
-            sup_hex.as_ref(),
-            ps_hex.as_ref(),
-            &ha,
-            &sa,
-            &va,
-            &ra,
-            &ga,
-            &ba,
-            &aa_hex,
-            &sd_hex,
-            &vd_hex,
-            &hex_e,
-            &tr_hex,
-            &sv_hex,
-        );
-        fg_hex.queue_draw();
-        queue_canvas(&cv_hex);
-    });
-
     let st_ref = state.clone();
     let sup_ref = hue_suppress.clone();
     let ps_ref = picker_suppress.clone();
@@ -5747,50 +5848,258 @@ fn build_ui(app: &Application) {
             &sv_ref,
         );
     }));
+
+    let st_hue = state.clone();
+    let fg_hue = fg_bg_da.clone();
+    let sup_hue = hue_suppress.clone();
+    let sat_h = picker_sat_adj.clone();
+    let val_h = picker_val_adj.clone();
+    let pr_hue = picker_ui_refresh.clone();
+    picker_hue_adj.connect_value_changed(move |adj| {
+        if sup_hue.get() {
+            return;
+        }
+        let mut g = st_hue.borrow_mut();
+        g.picker_hue = adj.value() / 360.0;
+        let slot = g.picker_target;
+        let a = match slot {
+            ColorSlot::Left => g.fg[3],
+            ColorSlot::Right => g.bg[3],
+        };
+        let s = sat_h.value().clamp(0.0, 1.0);
+        let v = val_h.value().clamp(0.0, 1.0);
+        let rgb = hsv_to_rgb01(g.picker_hue, s, v);
+        write_slot_rgb_a(&mut g, slot, rgb, a);
+        drop(g);
+        picker_refresh_call(&pr_hue);
+        fg_hue.queue_draw();
+    });
+
+    let st_s = state.clone();
+    let ps_s = picker_suppress.clone();
+    let fg_s = fg_bg_da.clone();
+    let val_a = picker_val_adj.clone();
+    let pr_s = picker_ui_refresh.clone();
+    picker_sat_adj.connect_value_changed(move |adj| {
+        if ps_s.get() {
+            return;
+        }
+        let mut g = st_s.borrow_mut();
+        let h = g.picker_hue;
+        let slot = g.picker_target;
+        let a = match slot {
+            ColorSlot::Left => g.fg[3],
+            ColorSlot::Right => g.bg[3],
+        };
+        let s = adj.value().clamp(0.0, 1.0);
+        let v = val_a.value().clamp(0.0, 1.0);
+        let rgb = hsv_to_rgb01(h, s, v);
+        write_slot_rgb_a(&mut g, slot, rgb, a);
+        drop(g);
+        picker_refresh_call(&pr_s);
+        fg_s.queue_draw();
+    });
+
+    let st_v = state.clone();
+    let ps_v = picker_suppress.clone();
+    let fg_v = fg_bg_da.clone();
+    let sat_av = picker_sat_adj.clone();
+    let pr_v = picker_ui_refresh.clone();
+    picker_val_adj.connect_value_changed(move |adj| {
+        if ps_v.get() {
+            return;
+        }
+        let mut g = st_v.borrow_mut();
+        let h = g.picker_hue;
+        let slot = g.picker_target;
+        let a = match slot {
+            ColorSlot::Left => g.fg[3],
+            ColorSlot::Right => g.bg[3],
+        };
+        let s = sat_av.value().clamp(0.0, 1.0);
+        let v = adj.value().clamp(0.0, 1.0);
+        let rgb = hsv_to_rgb01(h, s, v);
+        write_slot_rgb_a(&mut g, slot, rgb, a);
+        drop(g);
+        picker_refresh_call(&pr_v);
+        fg_v.queue_draw();
+    });
+
+    let st_r = state.clone();
+    let ps_r = picker_suppress.clone();
+    let fg_r = fg_bg_da.clone();
+    let pr_r = picker_ui_refresh.clone();
+    picker_r_adj.connect_value_changed(move |adj| {
+        if ps_r.get() {
+            return;
+        }
+        let mut g = st_r.borrow_mut();
+        let slot = g.picker_target;
+        let cur = match slot {
+            ColorSlot::Left => g.fg,
+            ColorSlot::Right => g.bg,
+        };
+        let r = adj.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (r as f64 / 255.0, cur[1] as f64 / 255.0, cur[2] as f64 / 255.0),
+            cur[3],
+        );
+        drop(g);
+        picker_refresh_call(&pr_r);
+        fg_r.queue_draw();
+    });
+
+    let st_g = state.clone();
+    let ps_g = picker_suppress.clone();
+    let fg_g = fg_bg_da.clone();
+    let pr_g = picker_ui_refresh.clone();
+    picker_g_adj.connect_value_changed(move |adj| {
+        if ps_g.get() {
+            return;
+        }
+        let mut g = st_g.borrow_mut();
+        let slot = g.picker_target;
+        let cur = match slot {
+            ColorSlot::Left => g.fg,
+            ColorSlot::Right => g.bg,
+        };
+        let gg = adj.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (cur[0] as f64 / 255.0, gg as f64 / 255.0, cur[2] as f64 / 255.0),
+            cur[3],
+        );
+        drop(g);
+        picker_refresh_call(&pr_g);
+        fg_g.queue_draw();
+    });
+
+    let st_b = state.clone();
+    let ps_b = picker_suppress.clone();
+    let fg_b = fg_bg_da.clone();
+    let pr_b = picker_ui_refresh.clone();
+    picker_b_adj.connect_value_changed(move |adj| {
+        if ps_b.get() {
+            return;
+        }
+        let mut g = st_b.borrow_mut();
+        let slot = g.picker_target;
+        let cur = match slot {
+            ColorSlot::Left => g.fg,
+            ColorSlot::Right => g.bg,
+        };
+        let bb = adj.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (cur[0] as f64 / 255.0, cur[1] as f64 / 255.0, bb as f64 / 255.0),
+            cur[3],
+        );
+        drop(g);
+        picker_refresh_call(&pr_b);
+        fg_b.queue_draw();
+    });
+
+    let st_alph = state.clone();
+    let ps_alph = picker_suppress.clone();
+    let fg_alph = fg_bg_da.clone();
+    let pr_alph = picker_ui_refresh.clone();
+    picker_a_adj.connect_value_changed(move |adj| {
+        if ps_alph.get() {
+            return;
+        }
+        let mut g = st_alph.borrow_mut();
+        let slot = g.picker_target;
+        let cur = match slot {
+            ColorSlot::Left => g.fg,
+            ColorSlot::Right => g.bg,
+        };
+        let aa = adj.value().round().clamp(0.0, 255.0) as u8;
+        write_slot_rgb_a(
+            &mut g,
+            slot,
+            (cur[0] as f64 / 255.0, cur[1] as f64 / 255.0, cur[2] as f64 / 255.0),
+            aa,
+        );
+        drop(g);
+        picker_refresh_call(&pr_alph);
+        fg_alph.queue_draw();
+    });
+
+    let st_hex = state.clone();
+    let fg_hex = fg_bg_da.clone();
+    let pr_hex = picker_ui_refresh.clone();
+    let rf_hex = recent_colors_flow.clone();
+    let cv_hex_focus = canvas_cell.clone();
+    hex_entry.connect_activate(move |e| {
+        let t = e.text().to_string();
+        let trimmed = t.trim();
+        let Some(mut rgba) = palette::parse_hex_color_input(trimmed) else {
+            return;
+        };
+        let hex_digits: String = trimmed
+            .trim_start_matches('#')
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        let use_parsed_alpha = hex_digits.len() == 8 || hex_digits.len() == 4;
+        let mut g = st_hex.borrow_mut();
+        let slot = g.picker_target;
+        if !use_parsed_alpha {
+            rgba[3] = match slot {
+                ColorSlot::Left => g.fg[3],
+                ColorSlot::Right => g.bg[3],
+            };
+        }
+        match slot {
+            ColorSlot::Left => {
+                g.fg = rgba;
+                push_recent_color(&mut g, rgba);
+            }
+            ColorSlot::Right => g.bg = rgba,
+        }
+        let (h, _, _) = rgb_bytes_to_hsv(rgba);
+        g.picker_hue = h.rem_euclid(1.0);
+        drop(g);
+        picker_refresh_call(&pr_hex);
+        fg_hex.queue_draw();
+        refresh_recent_swatch_row(&rf_hex, &st_hex, &fg_hex, &pr_hex);
+        if let Some(ref da) = *cv_hex_focus.borrow() {
+            da.grab_focus();
+        }
+    });
+
     picker_refresh_call(&picker_ui_refresh);
 
-    let sv_painting = Rc::new(Cell::new(false));
-    let sv_g = gtk::GestureClick::new();
-    sv_g.set_button(0);
-    let sv_paint_on = sv_painting.clone();
+    let sv_drag_start = Rc::new(Cell::new((0.0f64, 0.0f64)));
+    let sv_drag = gtk::GestureDrag::new();
+    sv_drag.set_button(0);
     let st_press = state.clone();
     let sv_press = sv_da.clone();
     let fg_press = fg_bg_da.clone();
-    let cv_press = canvas_cell.clone();
     let pr_press = picker_ui_refresh.clone();
-    sv_g.connect_pressed(move |gesture, _, x, y| {
-        sv_paint_on.set(true);
+    let sds_b = sv_drag_start.clone();
+    sv_drag.connect_drag_begin(move |gesture, x, y| {
+        sds_b.set((x, y));
         {
             let mut g = st_press.borrow_mut();
             g.picker_target = picker_target_for_gesture_button(gesture.current_button());
         }
-        apply_sv_pick(&st_press, &sv_press, &fg_press, &cv_press, &pr_press, x, y);
+        apply_sv_pick(&st_press, &sv_press, &fg_press, &pr_press, x, y);
     });
-    let sv_paint_m = sv_painting.clone();
     let st_m = state.clone();
     let sv_m = sv_da.clone();
     let fg_m = fg_bg_da.clone();
-    let cv_m = canvas_cell.clone();
     let pr_m = picker_ui_refresh.clone();
-    let sv_motion = gtk::EventControllerMotion::new();
-    sv_motion.connect_motion(move |ec, x, y| {
-        if !sv_paint_m.get() {
-            return;
-        }
-        let buttons = ec.current_event_state();
-        if !buttons.contains(gdk::ModifierType::BUTTON1_MASK)
-            && !buttons.contains(gdk::ModifierType::BUTTON3_MASK)
-        {
-            return;
-        }
-        apply_sv_pick(&st_m, &sv_m, &fg_m, &cv_m, &pr_m, x, y);
+    let sds_u = sv_drag_start.clone();
+    sv_drag.connect_drag_update(move |_, ox, oy| {
+        let (sx, sy) = sds_u.get();
+        apply_sv_pick(&st_m, &sv_m, &fg_m, &pr_m, sx + ox, sy + oy);
     });
-    let sv_paint_off = sv_painting.clone();
-    sv_g.connect_released(move |_, _, _, _| {
-        sv_paint_off.set(false);
-    });
-    sv_da.add_controller(sv_g);
-    sv_da.add_controller(sv_motion);
+    sv_da.add_controller(sv_drag);
 
     tool_cursors::sync_canvas_tool_cursor(&drawing_area, state.borrow().tool);
 
@@ -5803,19 +6112,24 @@ fn build_ui(app: &Application) {
 
     let st_sel = state.clone();
     let cv_sel = canvas_cell.clone();
+    let tc_sel = title_cell.clone();
     layers_list.connect_row_selected(move |lb, row| {
         let Some(row) = row else { return };
         let idx = listbox_row_index(lb, row);
         let mut g = st_sel.borrow_mut();
-        g.doc.active_layer = idx;
-        if matches!(g.selection, Some(Selection::Region { .. })) {
-            g.selection = None;
+        if g.doc.active_layer != idx {
+            commit_floating(&mut g);
+            g.doc.active_layer = idx;
+            if matches!(g.selection, Some(Selection::Region { .. })) {
+                g.selection = None;
+            }
+            drop(g);
+            sync_window_title(&st_sel, &tc_sel);
+            queue_canvas(&cv_sel);
         }
-        drop(g);
-        queue_canvas(&cv_sel);
     });
 
-    refresh_layers_list(&state, &layers_cell, &canvas_cell);
+    refresh_layers_list(&state, &layers_cell, &canvas_cell, &title_cell);
 
     let layers_sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -5833,13 +6147,17 @@ fn build_ui(app: &Application) {
     let st_al = state.clone();
     let lc_al = layers_cell.clone();
     let cv_al = canvas_cell.clone();
+    let tc_al = title_cell.clone();
     add_layer_btn.connect_clicked(move |_| {
         let mut g = st_al.borrow_mut();
+        commit_floating(&mut g);
         g.doc.add_layer();
         g.history.clear();
-        g.bump_document_revision();
+        g.modified = true;
+        g.bump_stack_revision();
         drop(g);
-        refresh_layers_list(&st_al, &lc_al, &cv_al);
+        sync_window_title(&st_al, &tc_al);
+        refresh_layers_list(&st_al, &lc_al, &cv_al, &tc_al);
         queue_canvas(&cv_al);
     });
     layers_sidebar.append(&add_layer_btn);
@@ -5891,21 +6209,16 @@ fn build_ui(app: &Application) {
     });
     size_spin.add_controller(size_key);
 
-    // Gtk/Adwaita often maps the adjustment *maximum* to the visual left for horizontal scales.
-    // Invert the range (min on the right) and map `hardness = (min+max) - value` so **screen right**
-    // = 100% hard and **screen left** = 10%. Default value 1.0 → thumb on the left (10% hardness).
-    // LTR keeps left/right unmirrored for RTL desktops.
-    let hard_adj = gtk::Adjustment::new(1.0, 0.1, 1.0, 0.01, 0.1, 0.0);
-    hard_adj.set_value(1.1 - state.borrow().brush_hardness);
+    // 0.0 (left) = softest airbrush, 1.0 (right) = crisp hard brush.
+    let hard_adj = gtk::Adjustment::new(state.borrow().brush_hardness, 0.0, 1.0, 0.01, 0.1, 0.0);
     let hard_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&hard_adj));
     hard_scale.set_direction(gtk::TextDirection::Ltr);
-    hard_scale.set_inverted(true);
     hard_scale.set_hexpand(false);
     hard_scale.set_width_request(120);
     hard_scale.set_halign(gtk::Align::Start);
     let st_h = state.clone();
     hard_adj.connect_value_changed(move |a| {
-        st_h.borrow_mut().brush_hardness = 1.1 - a.value();
+        st_h.borrow_mut().brush_hardness = a.value().clamp(0.0, 1.0);
     });
 
     let tol_adj = gtk::Adjustment::new(32.0, 0.0, 255.0, 1.0, 16.0, 0.0);
@@ -5993,6 +6306,7 @@ fn build_ui(app: &Application) {
     let cv_dd = canvas_cell.clone();
     let sa_dd = size_adj_cell.clone();
     let da_dd = drawing_area.clone();
+    let tc_dd = title_cell.clone();
     let sep_after_tool_c = sep_after_tool.clone();
     let size_lbl_c = size_lbl.clone();
     let size_spin_c = size_spin.clone();
@@ -6022,16 +6336,26 @@ fn build_ui(app: &Application) {
             _ => ToolKind::Brush,
         };
         let cur = g.tool;
+        let mut committed = false;
         if g.floating.is_some() && cur != ToolKind::Move {
             commit_floating(&mut g);
+            committed = true;
         }
+        let target_size = if cur == ToolKind::Pixel && prev != ToolKind::Pixel {
+            g.saved_brush_size = g.brush_size;
+            Some(g.saved_pixel_size)
+        } else if prev == ToolKind::Pixel && cur != ToolKind::Pixel {
+            g.saved_pixel_size = g.brush_size;
+            Some(g.saved_brush_size)
+        } else {
+            None
+        };
         drop(g);
-        if let Some(ref adj) = *sa_dd.borrow() {
-            if cur == ToolKind::Pixel && prev != ToolKind::Pixel {
-                adj.set_value(1.0);
-            } else if prev == ToolKind::Pixel && cur != ToolKind::Pixel {
-                adj.set_value(8.0);
-            }
+        if let (Some(sz), Some(ref adj)) = (target_size, sa_dd.borrow().as_ref()) {
+            adj.set_value(sz);
+        }
+        if committed {
+            sync_window_title(&st_dd, &tc_dd);
         }
         tool_cursors::sync_canvas_tool_cursor(&da_dd, cur);
         sync_tool_options_visibility(
@@ -6180,7 +6504,6 @@ fn build_ui(app: &Application) {
         strings: palette_strings.clone(),
         preview: fg_bg_da.clone(),
         recent: recent_colors_flow.clone(),
-        canvas: canvas_cell.clone(),
         sv_area: sv_da.clone(),
         picker_refresh: picker_ui_refresh.clone(),
     };
@@ -6228,7 +6551,6 @@ fn build_ui(app: &Application) {
         &recent_colors_flow,
         &state,
         &fg_bg_da,
-        &canvas_cell,
         &picker_ui_refresh,
     );
 
@@ -6239,6 +6561,7 @@ fn build_ui(app: &Application) {
         &color_preview_da_cell,
         &recent_colors_flow,
         &picker_ui_refresh,
+        &title_cell,
     );
 
     let editor = gtk::Box::builder()
@@ -6263,10 +6586,8 @@ fn build_ui(app: &Application) {
         rev_c.set_reveal_child(!rev_c.reveals_child());
     });
 
-    let st_tl = state.clone();
     let cv_tl = canvas_cell.clone();
     revealer.connect_child_revealed_notify(move |_| {
-        zoom_to_fit(&st_tl, &cv_tl);
         queue_canvas(&cv_tl);
     });
 
@@ -6285,6 +6606,7 @@ fn build_ui(app: &Application) {
         &canvas_cell,
         &tool_dd_cell,
         &tool_strings,
+        &title_cell,
         recent_files_menu.clone(),
         palette_sidebar.clone(),
     );
@@ -6314,6 +6636,8 @@ fn build_ui(app: &Application) {
     let window_title = libadwaita::WindowTitle::new("Wooly Paint", "");
     window_title.set_valign(gtk::Align::Center);
     header.set_title_widget(Some(&window_title));
+    *title_cell.borrow_mut() = Some(window_title);
+    sync_window_title(&state, &title_cell);
 
     let toolbar_view = libadwaita::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -6327,72 +6651,166 @@ fn build_ui(app: &Application) {
     let cv_k = canvas_cell.clone();
     let win_k = window.clone();
     let td_k = tool_dd_cell.clone();
+    let tc_k = title_cell.clone();
+    let sa_k = size_adj_cell.clone();
     let recent_k = recent_files_menu.clone();
     key.connect_key_pressed(move |_c, keyval, _code, state_m| {
         let ctrl = state_m.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = state_m.contains(gdk::ModifierType::SHIFT_MASK);
+        let alt = state_m.contains(gdk::ModifierType::ALT_MASK);
+        let editing_text = window_focus_is_editable(&win_k);
         match keyval {
             gdk::Key::z | gdk::Key::Z if ctrl && shift => {
-                if st_k.borrow_mut().redo() {
+                let changed = {
+                    let mut st = st_k.borrow_mut();
+                    if st.floating.is_some() {
+                        commit_floating(&mut st);
+                    }
+                    st.redo()
+                };
+                if changed {
+                    sync_window_title(&st_k, &tc_k);
                     queue_canvas(&cv_k);
                 }
                 glib::Propagation::Stop
             }
             gdk::Key::z | gdk::Key::Z if ctrl => {
-                if st_k.borrow_mut().undo() {
+                let changed = {
+                    let mut st = st_k.borrow_mut();
+                    if let Some(f) = st.floating.take() {
+                        st.floating_drag = None;
+                        st.floating_surface_cache = None;
+                        st.floating_surface_id = None;
+                        if f.lifted_from_layer {
+                            st.undo();
+                        }
+                        true
+                    } else {
+                        st.undo()
+                    }
+                };
+                if changed {
+                    sync_window_title(&st_k, &tc_k);
                     queue_canvas(&cv_k);
                 }
                 glib::Propagation::Stop
             }
             gdk::Key::y | gdk::Key::Y if ctrl => {
-                if st_k.borrow_mut().redo() {
+                let changed = {
+                    let mut st = st_k.borrow_mut();
+                    if st.floating.is_some() {
+                        commit_floating(&mut st);
+                    }
+                    st.redo()
+                };
+                if changed {
+                    sync_window_title(&st_k, &tc_k);
                     queue_canvas(&cv_k);
                 }
                 glib::Propagation::Stop
             }
             gdk::Key::o | gdk::Key::O if ctrl => {
-                open_file(&win_k, &st_k, &lc_k, &cv_k, &recent_k);
+                open_file(&win_k, &st_k, &lc_k, &cv_k, &recent_k, &tc_k);
+                glib::Propagation::Stop
+            }
+            gdk::Key::s | gdk::Key::S if ctrl && shift => {
+                save_file_as(&win_k, &st_k, &cv_k, &tc_k, None);
                 glib::Propagation::Stop
             }
             gdk::Key::s | gdk::Key::S if ctrl => {
-                save_file(&win_k, &st_k, &lc_k, &cv_k);
+                save_file(&win_k, &st_k, &cv_k, &tc_k);
                 glib::Propagation::Stop
             }
             gdk::Key::n | gdk::Key::N if ctrl => {
-                new_document_dialog(&win_k, &st_k, &lc_k, &cv_k);
+                new_document_dialog(&win_k, &st_k, &lc_k, &cv_k, &tc_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::x | gdk::Key::X if ctrl => {
-                cut_selection(&st_k);
+            gdk::Key::a | gdk::Key::A if ctrl && !editing_text => {
+                let mut st = st_k.borrow_mut();
+                commit_floating(&mut st);
+                let w = st.doc.width as i32;
+                let h = st.doc.height as i32;
+                st.selection = Some(Selection::Rect(0, 0, w, h));
+                drop(st);
+                sync_window_title(&st_k, &tc_k);
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::c | gdk::Key::C if ctrl => {
+            gdk::Key::d | gdk::Key::D if ctrl => {
+                let mut st = st_k.borrow_mut();
+                commit_floating(&mut st);
+                st.selection = None;
+                drop(st);
+                sync_window_title(&st_k, &tc_k);
+                queue_canvas(&cv_k);
+                glib::Propagation::Stop
+            }
+            gdk::Key::x | gdk::Key::X if ctrl && !editing_text => {
+                if cut_selection(&st_k) {
+                    sync_window_title(&st_k, &tc_k);
+                    queue_canvas(&cv_k);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::c | gdk::Key::C if ctrl && !editing_text => {
                 copy_selection(&st_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::v | gdk::Key::V if ctrl => {
-                try_paste_system_clipboard(&win_k, &st_k, &td_k, &cv_k, &lc_k);
+            gdk::Key::v | gdk::Key::V if ctrl && !editing_text => {
+                try_paste_system_clipboard(&win_k, &st_k, &td_k, &cv_k, &lc_k, &tc_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::plus | gdk::Key::equal if ctrl => {
+            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add if ctrl => {
                 zoom_step(&st_k, &cv_k, 1.25);
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::minus if ctrl => {
+            gdk::Key::minus | gdk::Key::KP_Subtract if ctrl => {
                 zoom_step(&st_k, &cv_k, 1.0 / 1.25);
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::_0 if ctrl => {
+            gdk::Key::_0 | gdk::Key::KP_0 if ctrl => {
                 zoom_to_fit(&st_k, &cv_k);
                 queue_canvas(&cv_k);
                 glib::Propagation::Stop
             }
-            gdk::Key::Delete | gdk::Key::BackSpace if !ctrl => {
-                if st_k.borrow().selection.is_some() {
-                    erase_selection(&st_k);
+            gdk::Key::Escape if !ctrl && !alt && !editing_text => {
+                let mut st = st_k.borrow_mut();
+                let mut changed = false;
+                if st.shape_drag_preview.take().is_some() {
+                    st.drag_start_doc = None;
+                    changed = true;
+                } else if st.floating.is_some() {
+                    commit_floating(&mut st);
+                    changed = true;
+                } else if st.selection.take().is_some() {
+                    changed = true;
+                }
+                drop(st);
+                if changed {
+                    sync_window_title(&st_k, &tc_k);
+                    queue_canvas(&cv_k);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            gdk::Key::Return | gdk::Key::KP_Enter if !ctrl && !alt && !editing_text => {
+                let mut st = st_k.borrow_mut();
+                if st.floating.is_some() {
+                    commit_floating(&mut st);
+                    drop(st);
+                    sync_window_title(&st_k, &tc_k);
+                    queue_canvas(&cv_k);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            gdk::Key::Delete | gdk::Key::BackSpace if !ctrl && !editing_text => {
+                if erase_selection(&st_k) {
+                    sync_window_title(&st_k, &tc_k);
                     queue_canvas(&cv_k);
                     glib::Propagation::Stop
                 } else {
@@ -6400,7 +6818,7 @@ fn build_ui(app: &Application) {
                 }
             }
             _ => {
-                if !ctrl {
+                if !ctrl && !alt && !editing_text {
                     if let Some(ch) = keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
                         let st_ref = st_k.borrow();
                         let tool = st_ref
@@ -6416,6 +6834,21 @@ fn build_ui(app: &Application) {
                             queue_canvas(&cv_k);
                             return glib::Propagation::Stop;
                         }
+                        if ch == '[' || ch == ']' {
+                            if let Some(ref adj) = *sa_k.borrow() {
+                                let cur = adj.value();
+                                let step = if cur >= 32.0 {
+                                    4.0
+                                } else if cur >= 10.0 {
+                                    2.0
+                                } else {
+                                    1.0
+                                };
+                                let next = if ch == '[' { cur - step } else { cur + step };
+                                adj.set_value(next.clamp(adj.lower(), adj.upper()));
+                                return glib::Propagation::Stop;
+                            }
+                        }
                     }
                 }
                 glib::Propagation::Proceed
@@ -6427,19 +6860,16 @@ fn build_ui(app: &Application) {
     let st_shutdown = state.clone();
     let da_shutdown = drawing_area.clone();
     let preview_shutdown = fg_bg_da.clone();
-    let tick_shutdown = tick_slot.clone();
     app.connect_shutdown(move |_app| {
-        if let Some(h) = tick_shutdown.borrow_mut().take() {
-            h.remove();
-        }
+        crate::settings::persist(&st_shutdown.borrow());
         da_shutdown.unset_draw_func();
         preview_shutdown.unset_draw_func();
         st_shutdown.borrow_mut().release_drawing_caches();
     });
 
     let st_close = state.clone();
-    let lc_close = layers_cell.clone();
     let cv_close = canvas_cell.clone();
+    let tc_close = title_cell.clone();
     window.connect_close_request(move |win| {
         if !st_close.borrow().modified {
             return glib::Propagation::Proceed;
@@ -6461,8 +6891,8 @@ fn build_ui(app: &Application) {
         let win_parent = win.clone();
         let win = win.clone();
         let st = st_close.clone();
-        let lc = lc_close.clone();
         let cv = cv_close.clone();
+        let tc = tc_close.clone();
         dlg.choose(
             Some(&win_parent),
             None::<&gio::Cancellable>,
@@ -6471,14 +6901,22 @@ fn build_ui(app: &Application) {
                     if let Some(path) = st.borrow().doc.path.clone() {
                         let win_done = win.clone();
                         save_document_to_path_async(
+                            &win,
                             path,
                             &st,
                             &cv,
+                            &tc,
                             Some(Rc::new(move || win_done.close())),
                         );
                     } else {
                         let win_done = win.clone();
-                        save_file_as(&win, &st, &lc, &cv, Some(Rc::new(move || win_done.close())));
+                        save_file_as(
+                            &win,
+                            &st,
+                            &cv,
+                            &tc,
+                            Some(Rc::new(move || win_done.close())),
+                        );
                     }
                 }
                 "discard" => {
@@ -6802,34 +7240,39 @@ fn register_window_menu_actions(
     canvas: &CanvasCell,
     tool_dd_cell: &ToolDdCell,
     tool_strings: &gtk::StringList,
+    title_cell: &WindowTitleCell,
     recent_menu: Rc<gio::Menu>,
     palette_sidebar: PaletteSidebar,
 ) {
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let w = window.clone();
 
     let new_act = gio::SimpleAction::new("new", None);
     new_act.connect_activate(move |_, _| {
-        new_document_dialog(&w, &st, &lc, &cv);
+        new_document_dialog(&w, &st, &lc, &cv, &tc);
     });
     app_add_action(window, &new_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let w = window.clone();
     let recent_open = recent_menu.clone();
     let open_act = gio::SimpleAction::new("open", None);
     open_act.connect_activate(move |_, _| {
-        open_file(&w, &st, &lc, &cv, &recent_open);
+        open_file(&w, &st, &lc, &cv, &recent_open, &tc);
     });
     app_add_action(window, &open_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
+    let w_rec = window.clone();
     let recent_pick = recent_menu.clone();
     let open_recent_act = gio::SimpleAction::new("open_recent", Some(glib::VariantTy::STRING));
     open_recent_act.connect_activate(move |_, param| {
@@ -6839,43 +7282,45 @@ fn register_window_menu_actions(
         let Some(s) = p.get::<String>() else {
             return;
         };
-        open_document_from_path(Path::new(&s), &st, &lc, &cv, &recent_pick);
+        open_document_from_path(&w_rec, Path::new(&s), &st, &lc, &cv, &recent_pick, &tc);
     });
     app_add_action(window, &open_recent_act);
 
     let st = state.clone();
-    let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let w = window.clone();
     let save_act = gio::SimpleAction::new("save", None);
     save_act.connect_activate(move |_, _| {
-        save_file(&w, &st, &lc, &cv);
+        save_file(&w, &st, &cv, &tc);
     });
     app_add_action(window, &save_act);
 
     let st = state.clone();
-    let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let w = window.clone();
     let save_as_act = gio::SimpleAction::new("save_as", None);
     save_as_act.connect_activate(move |_, _| {
-        save_file_as(&w, &st, &lc, &cv, None);
+        save_file_as(&w, &st, &cv, &tc, None);
     });
     app_add_action(window, &save_as_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let w = window.clone();
     let canvas_resize_act = gio::SimpleAction::new("canvas_resize", None);
     canvas_resize_act.connect_activate(move |_, _| {
-        canvas_resize_dialog(&w, &st, &lc, &cv);
+        canvas_resize_dialog(&w, &st, &lc, &cv, &tc);
     });
     app_add_action(window, &canvas_resize_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let canvas_flip_x_act = gio::SimpleAction::new("canvas_flip_x", None);
     canvas_flip_x_act.connect_activate(move |_, _| {
         let mut g = st.borrow_mut();
@@ -6883,13 +7328,14 @@ fn register_window_menu_actions(
         g.doc.flip_x();
         finalize_canvas_geometry_change(&mut g);
         drop(g);
-        refresh_after_canvas_change(&st, &lc, &cv, false);
+        refresh_after_canvas_change(&st, &lc, &cv, &tc, false);
     });
     app_add_action(window, &canvas_flip_x_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let canvas_flip_y_act = gio::SimpleAction::new("canvas_flip_y", None);
     canvas_flip_y_act.connect_activate(move |_, _| {
         let mut g = st.borrow_mut();
@@ -6897,13 +7343,14 @@ fn register_window_menu_actions(
         g.doc.flip_y();
         finalize_canvas_geometry_change(&mut g);
         drop(g);
-        refresh_after_canvas_change(&st, &lc, &cv, false);
+        refresh_after_canvas_change(&st, &lc, &cv, &tc, false);
     });
     app_add_action(window, &canvas_flip_y_act);
 
     let st = state.clone();
     let lc = layers_cell.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let canvas_rotate_act = gio::SimpleAction::new("canvas_rotate_cw", None);
     canvas_rotate_act.connect_activate(move |_, _| {
         let mut g = st.borrow_mut();
@@ -6911,7 +7358,7 @@ fn register_window_menu_actions(
         g.doc.rotate_90_cw();
         finalize_canvas_geometry_change(&mut g);
         drop(g);
-        refresh_after_canvas_change(&st, &lc, &cv, true);
+        refresh_after_canvas_change(&st, &lc, &cv, &tc, true);
     });
     app_add_action(window, &canvas_rotate_act);
 
@@ -6930,9 +7377,11 @@ fn register_window_menu_actions(
 
     let st = state.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let undo_act = gio::SimpleAction::new("undo", None);
     undo_act.connect_activate(move |_, _| {
         if st.borrow_mut().undo() {
+            sync_window_title(&st, &tc);
             queue_canvas(&cv);
         }
     });
@@ -6940,9 +7389,11 @@ fn register_window_menu_actions(
 
     let st = state.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let redo_act = gio::SimpleAction::new("redo", None);
     redo_act.connect_activate(move |_, _| {
         if st.borrow_mut().redo() {
+            sync_window_title(&st, &tc);
             queue_canvas(&cv);
         }
     });
@@ -6950,10 +7401,13 @@ fn register_window_menu_actions(
 
     let st = state.clone();
     let cv = canvas.clone();
+    let tc = title_cell.clone();
     let cut_act = gio::SimpleAction::new("cut", None);
     cut_act.connect_activate(move |_, _| {
-        cut_selection(&st);
-        queue_canvas(&cv);
+        if cut_selection(&st) {
+            sync_window_title(&st, &tc);
+            queue_canvas(&cv);
+        }
     });
     app_add_action(window, &cut_act);
 
@@ -6968,10 +7422,11 @@ fn register_window_menu_actions(
     let cv = canvas.clone();
     let td_p = tool_dd_cell.clone();
     let lc_p = layers_cell.clone();
+    let tc_p = title_cell.clone();
     let w_p = window.clone();
     let paste_act = gio::SimpleAction::new("paste", None);
     paste_act.connect_activate(move |_, _| {
-        try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p);
+        try_paste_system_clipboard(&w_p, &st, &td_p, &cv, &lc_p, &tc_p);
     });
     app_add_action(window, &paste_act);
 

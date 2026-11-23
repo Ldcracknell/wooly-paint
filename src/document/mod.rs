@@ -1,4 +1,4 @@
-mod composite;
+pub(crate) mod composite;
 mod history;
 pub mod layer;
 
@@ -6,13 +6,13 @@ pub use composite::{
     blend_layer_premul, composite_layers, composite_layers_from_below_into,
     composite_layers_from_below_region_into, composite_layers_into, composite_layers_prefix_into,
     premul_rgba_to_cairo_argb32, premul_rgba_to_cairo_argb32_region, premul_to_straight_rgba,
-    premul_to_straight_rgba_into, straight_to_premul,
+    straight_to_premul,
 };
-pub use history::History;
+pub use history::{History, UndoTile, UNDO_TILE_SIZE};
 pub use layer::{BlendMode, Layer};
 
 use anyhow::{Context, Result};
-use image::{ImageBuffer, RgbaImage};
+use image::{ImageBuffer, RgbImage, RgbaImage};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -68,8 +68,28 @@ impl Document {
         })
     }
 
-    pub fn save_png(&self, path: &Path) -> Result<()> {
+    /// Save flattened composite to PNG, JPEG (flattened onto white RGB), WebP, BMP, or GIF.
+    pub fn save_raster_image(&self, path: &Path) -> Result<()> {
         let comp = self.composite();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("jpg" | "jpeg" | "jpe")) {
+            // JPEG has no alpha channel; composite premultiplied RGBA over opaque white.
+            let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
+            for px in comp.chunks_exact(4) {
+                let inv_a = 255u32 - px[3] as u32;
+                rgb.push((px[0] as u32 + inv_a).min(255) as u8);
+                rgb.push((px[1] as u32 + inv_a).min(255) as u8);
+                rgb.push((px[2] as u32 + inv_a).min(255) as u8);
+            }
+            let buf: RgbImage = ImageBuffer::from_raw(self.width, self.height, rgb)
+                .context("buffer size mismatch")?;
+            buf.save(path)
+                .with_context(|| format!("save {}", path.display()))?;
+            return Ok(());
+        }
         let straight = premul_to_straight_rgba(&comp);
         let buf: RgbaImage = ImageBuffer::from_raw(self.width, self.height, straight)
             .context("buffer size mismatch")?;
@@ -241,10 +261,11 @@ impl Document {
         if index == 0 || self.layers.len() <= 1 || index >= self.layers.len() {
             return false;
         }
-        let top = self.layers[index].clone();
-        let dst = &mut self.layers[index - 1];
-        blend_layer_premul(&mut dst.pixels, &top.pixels, top.opacity, top.blend);
-        self.layers.remove(index);
+        let top = self.layers.remove(index);
+        if top.visible && top.opacity > 0.0 {
+            let dst = &mut self.layers[index - 1];
+            blend_layer_premul(&mut dst.pixels, &top.pixels, top.opacity, top.blend);
+        }
         if self.active_layer == index {
             self.active_layer = index - 1;
         } else if self.active_layer >= self.layers.len() {
@@ -361,6 +382,14 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 fn make_thumbnail(img: &RgbaImage, max_size: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
     if w <= max_size && h <= max_size {
@@ -383,11 +412,14 @@ struct OraLayerEntry {
 }
 
 fn parse_image_dims(xml: &str) -> Result<(u32, u32)> {
-    let w: u32 = extract_attr(xml, "w")
+    let start = xml.find("<image").context("missing <image> tag")?;
+    let end = start + xml[start..].find('>').context("unterminated <image> tag")? + 1;
+    let tag = &xml[start..end];
+    let w: u32 = extract_attr(tag, "w")
         .context("missing image width")?
         .parse()
         .context("invalid image width")?;
-    let h: u32 = extract_attr(xml, "h")
+    let h: u32 = extract_attr(tag, "h")
         .context("missing image height")?
         .parse()
         .context("invalid image height")?;
@@ -395,21 +427,44 @@ fn parse_image_dims(xml: &str) -> Result<(u32, u32)> {
 }
 
 fn extract_attr(tag_region: &str, attr: &str) -> Option<String> {
-    let pat = format!("{attr}=\"");
-    let start = tag_region.find(&pat)? + pat.len();
-    let end = start + tag_region[start..].find('"')?;
-    Some(tag_region[start..end].to_string())
+    let bytes = tag_region.as_bytes();
+    let attr_bytes = attr.as_bytes();
+    let mut i = 0usize;
+    while i + attr_bytes.len() + 2 <= bytes.len() {
+        let preceded_by_ws = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if preceded_by_ws
+            && &bytes[i..i + attr_bytes.len()] == attr_bytes
+            && bytes[i + attr_bytes.len()] == b'='
+        {
+            let q = bytes[i + attr_bytes.len() + 1];
+            if q == b'"' || q == b'\'' {
+                let start = i + attr_bytes.len() + 2;
+                if let Some(rel_end) = tag_region[start..].find(q as char) {
+                    return Some(xml_unescape(&tag_region[start..start + rel_end]));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_layer_entries(xml: &str) -> Vec<OraLayerEntry> {
     let mut entries = Vec::new();
     let mut pos = 0;
-    while let Some(idx) = xml[pos..].find("<layer ") {
+    while let Some(idx) = xml[pos..].find("<layer") {
         let start = pos + idx;
-        let Some(close) = xml[start..].find("/>") else {
+        let after_name = start + 6;
+        if after_name >= xml.len()
+            || !xml.as_bytes()[after_name].is_ascii_whitespace()
+        {
+            pos = after_name;
+            continue;
+        }
+        let Some(close) = xml[start..].find('>') else {
             break;
         };
-        let tag = &xml[start..start + close + 2];
+        let tag = &xml[start..start + close + 1];
 
         let src = extract_attr(tag, "src").unwrap_or_default();
         let name = extract_attr(tag, "name").unwrap_or_else(|| "Layer".into());
@@ -430,7 +485,35 @@ fn parse_layer_entries(xml: &str) -> Vec<OraLayerEntry> {
             .unwrap_or(0);
 
         entries.push(OraLayerEntry { name, src, opacity, visible, blend, x, y });
-        pos = start + close + 2;
+        pos = start + close + 1;
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_down_respects_hidden_layer() {
+        let mut doc = Document::new(2, 2);
+        doc.add_layer();
+        doc.layers[1].pixels.copy_from_slice(&[0, 0, 0, 255].repeat(4));
+        doc.layers[1].visible = false;
+        assert!(doc.merge_down(1));
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn ora_attr_parsing_handles_entities_and_word_boundaries() {
+        let xml = r#"<image version="0.0.3" max="999" w="320" h="240"><stack><layer name="A &amp; &quot;B&quot;" src="data/layer0.png" x="12" y="34" opacity="0.5" visibility="visible" composite-op="svg:multiply"/></stack></image>"#;
+        assert_eq!(parse_image_dims(xml).unwrap(), (320, 240));
+        let entries = parse_layer_entries(xml);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "A & \"B\"");
+        assert_eq!(entries[0].x, 12);
+        assert_eq!(entries[0].y, 34);
+        assert_eq!(entries[0].blend, BlendMode::Multiply);
+    }
 }

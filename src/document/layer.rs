@@ -14,6 +14,22 @@ impl BlendMode {
         }
     }
 
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Add => 2,
+        }
+    }
+
+    pub fn from_dropdown_index(idx: u32) -> Self {
+        match idx {
+            1 => BlendMode::Multiply,
+            2 => BlendMode::Add,
+            _ => BlendMode::Normal,
+        }
+    }
+
     pub fn ora_composite_op(self) -> &'static str {
         match self {
             BlendMode::Normal => "svg:src-over",
