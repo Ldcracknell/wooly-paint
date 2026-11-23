@@ -2,6 +2,7 @@
 this was made mainly with cursor's composer 2 \
 (and a bit of 4.6 at the start before i ran out of usage) \
 (also now some 5.5, starting release 1.2.1) \
+(and gemini 4 neon, starting release 1.2.2) \
 (i have not read a single line of code) \
 this is also barely tested on anything but arch. i tried it for like 2 minutes total on windows ig
 
