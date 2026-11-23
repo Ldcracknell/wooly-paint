@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Package a portable zip for Windows (run in MSYS2 MinGW64 after `cargo build --release`).
+# Package a portable zip for Windows (run in MSYS2 UCRT64 after `cargo build --release`).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+PREFIX="${MINGW_PREFIX:-/ucrt64}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 EXE="${TARGET_DIR}/release/wooly-paint.exe"
 if [[ ! -f "$EXE" ]]; then
@@ -19,7 +20,7 @@ cp "$EXE" "$EXEDIR/"
 cp packaging/windows-portable.txt "$EXEDIR/README.txt"
 cp src/assets/icon.ico "$EXEDIR/" 2>/dev/null || true
 
-# Pull in every MinGW64 DLL reachable from the exe (iterative closure).
+# Pull in every MSYS2 runtime DLL reachable from the exe (iterative closure).
 round=0
 while [[ $round -lt 40 ]]; do
   round=$((round + 1))
@@ -33,7 +34,7 @@ while [[ $round -lt 40 ]]; do
       [[ -f "$EXEDIR/$base" ]] && continue
       cp "$lib" "$EXEDIR/"
       changed=1
-    done < <(ldd "$f" 2>/dev/null | awk '/=> \/mingw64\// {print $3}')
+    done < <(ldd "$f" 2>/dev/null | awk -v pfx="${PREFIX}/" '$2 == "=>" && index($3, pfx) == 1 {print $3}')
   done
   shopt -u nullglob
   [[ $changed -eq 0 ]] && break
@@ -42,16 +43,16 @@ done
 # GTK / Adwaita data (schemas, themes, loaders).
 mkdir -p "$EXEDIR/share" "$EXEDIR/lib"
 for d in glib-2.0 libadwaita-1 gtk-4.0; do
-  if [[ -d "/mingw64/share/$d" ]]; then
-    cp -a "/mingw64/share/$d" "$EXEDIR/share/"
+  if [[ -d "${PREFIX}/share/$d" ]]; then
+    cp -a "${PREFIX}/share/$d" "$EXEDIR/share/"
   fi
 done
-if [[ -d /mingw64/share/icons/Adwaita ]]; then
+if [[ -d "${PREFIX}/share/icons/Adwaita" ]]; then
   mkdir -p "$EXEDIR/share/icons"
-  cp -a /mingw64/share/icons/Adwaita "$EXEDIR/share/icons/"
+  cp -a "${PREFIX}/share/icons/Adwaita" "$EXEDIR/share/icons/"
 fi
-if [[ -d /mingw64/lib/gdk-pixbuf-2.0 ]]; then
-  cp -a /mingw64/lib/gdk-pixbuf-2.0 "$EXEDIR/lib/"
+if [[ -d "${PREFIX}/lib/gdk-pixbuf-2.0" ]]; then
+  cp -a "${PREFIX}/lib/gdk-pixbuf-2.0" "$EXEDIR/lib/"
 fi
 
 cat > "$EXEDIR/run-wooly-paint.cmd" <<'EOF'
@@ -71,8 +72,8 @@ EOF
 
 if command -v zip >/dev/null 2>&1; then
   (cd dist && zip -r -q "${NAME}.zip" "$NAME")
-elif [[ -x /mingw64/bin/zip.exe ]]; then
-  (cd dist && /mingw64/bin/zip.exe -r -q "${NAME}.zip" "$NAME")
+elif [[ -x "${PREFIX}/bin/zip.exe" ]]; then
+  (cd dist && "${PREFIX}/bin/zip.exe" -r -q "${NAME}.zip" "$NAME")
 else
   echo "zip not found; leaving unpacked dir $EXEDIR" >&2
   exit 1
